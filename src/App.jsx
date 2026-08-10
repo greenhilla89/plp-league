@@ -1,0 +1,4807 @@
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import {
+  Trophy, Lock, Unlock, CheckCircle2, Clock, Search, Plus, Send,
+  AlertCircle, Users, BarChart3, Settings2, X, Crown, Medal,
+  Eye, EyeOff, ShieldCheck, Loader2, Trash2, Calendar, Sparkles,
+  UserCircle2, Camera, MapPin, Cake, Shirt, Mail, KeyRound, LogOut,
+  TrendingUp, ArrowLeft, Target, Flame, Award, Archive, History, Landmark,
+  Upload,
+} from "lucide-react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+} from "recharts";
+
+// The site mark: a scattered cluster of navy rings around a solid red
+// center, rendered as plain SVG (no embedded image asset needed).
+function Logo({ className }) {
+  const rings = [
+    [50.6, 37.9, 2.4], [60.1, 59.9, 3.7], [36.6, 49.3, 3.6], [65.3, 37.6, 3.0],
+    [42.3, 68.4, 4.2], [43.4, 31.1, 2.4], [73.2, 56.8, 2.7], [31.1, 59.1, 5.0],
+    [60.0, 29.8, 4.4], [57.1, 73.8, 2.4], [28.2, 39.8, 4.5], [76.3, 42.7, 4.2],
+    [35.1, 74.2, 4.9], [43.7, 19.7, 4.2], [71.2, 72.4, 4.7], [19.9, 46.9, 2.6],
+    [74.3, 29.3, 2.7], [53.1, 83.1, 4.5], [27.7, 22.1, 5.2], [83.2, 56.5, 4.2],
+    [20.5, 71.1, 5.1], [58.3, 11.6, 4.5], [65.4, 81.1, 4.4], [12.3, 33.8, 3.2],
+    [85.4, 35.8, 2.3], [38.5, 87.6, 2.6], [40.1, 13.7, 2.6], [85.5, 67.2, 5.2],
+    [12.3, 60.6, 4.1], [77.6, 14.9, 5.1], [58.1, 90.9, 3.4], [17.8, 17.1, 2.7],
+    [91.8, 43.1, 3.0], [18.7, 82.1, 3.1],
+  ];
+  return (
+    <svg viewBox="0 0 100 100" className={className} aria-label="PLP">
+      <circle cx="50" cy="50" r="48" fill="#F3F6EF" />
+      {rings.map(([cx, cy, r], i) => (
+        <circle key={i} cx={cx} cy={cy} r={r} fill="none" stroke="#1B2A63" strokeWidth={r * 0.32} />
+      ))}
+      <circle cx="50" cy="50" r="9" fill="#C0392B" />
+    </svg>
+  );
+}
+
+/* ============================================================================
+   PLP 2026-27 — multi-division football prediction game
+
+   Originally built as a Claude artifact; now a standalone site backed by a
+   Supabase database (see storageAdapter.js). The storage interface is
+   unchanged, so everything below reads and writes exactly as it always did.
+
+   DATA MODEL (persisted via window.storage, shared across everyone who
+   opens this site — see footer note):
+
+   {
+     adminPin: string,                 // lightweight shared gate, NOT real auth
+     leagues: {
+       league1: { name, participants: [{id,name}], matchdays: [MatchDay] },
+       league2: { name, participants: [{id,name}], matchdays: [MatchDay] },
+     },
+     predictions: {
+       "<matchId>__<participantId>": { home: number, away: number, submittedAt }
+     }
+   }
+
+   MatchDay = {
+     id, label,
+     releaseAt: ISO string | null,   // when OTHER people's picks become visible
+     locked: boolean,                // predictions closed (e.g. at kickoff)
+     scoring: { resultPoints, homeGoalPoints, awayGoalPoints, marginPoints },
+     matches: [{ id, home, away, kickoff: ISO string, outcome: {home,away}|null }]
+   }
+
+   SCORING — four independent components per match, each checked against the
+   entered outcome:
+     resultPoints     (default 3) — predicted result (home win / away win /
+                        draw) matches the actual result.
+     homeGoalPoints   (default 1) — predicted home team's goals exactly.
+     awayGoalPoints   (default 1) — predicted away team's goals exactly.
+     marginPoints     (default 1) — predicted goal difference (home − away)
+                        exactly matches the actual goal difference. Since a
+                        matching difference always implies the same result,
+                        this point only ever lands alongside resultPoints.
+   Maximum per match = 3 + 1 + 1 + 1 = 6, earned in full only for an exact
+   scoreline.
+   ========================================================================== */
+
+const STORAGE_KEY = "forecast-room-state-v2"; // legacy single-blob key — only ever read once, to migrate old saves
+const SNAPSHOTS_KEY = "plp-2026-27-snapshots-v1"; // rotating automatic backups, stored separately so they don't nest inside themselves
+// Everything used to live in one blob under STORAGE_KEY. Splitting it means:
+// (a) no single key grows unboundedly as photos/predictions/history
+//     accumulate over a season, and (b) a photo upload, a fixture edit, and
+//     a prediction submission no longer all fight over the exact same key at
+//     once — each only touches its own slice.
+const CORE_KEY = "plp-2026-27-core-v1"; // admin PIN, export timestamp, league names/matchdays/fixture pools/scoring
+const ACCOUNTS_KEY = "plp-2026-27-accounts-v1"; // email/salt/hash/participant links
+const ROSTER_KEY = "plp-2026-27-roster-v1"; // participant names/codes/bios/etc — everything except photos
+const PHOTOS_KEY = "plp-2026-27-photos-v1"; // profile photos only, kept separate since they're the biggest payloads
+const BADGES_KEY = "plp-2026-27-badges-v1"; // admin-assigned team-crest badges — separate from self-uploaded profile photos
+const HISTORY_KEY = "plp-2026-27-history-page-v1"; // the free-text History page + its images, isolated since images can be large
+const PREDICTIONS_KEY = "plp-2026-27-predictions-v1"; // the highest-frequency write in the app, isolated on its own
+const SEASON_ARCHIVES_KEY = "plp-2026-27-season-archives-v1"; // past seasons — grows slowly but can get large, so it's isolated too
+const DEFAULT_MAX_PARTICIPANTS = 20; // fallback cap when a league doesn't specify its own
+const DEFAULT_MIN_PARTICIPANTS = 2; // fallback floor when a league doesn't specify its own — the lowest a round-robin schedule needs
+const SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000; // take a new automatic snapshot at most once per 24h
+const MAX_SNAPSHOTS = 7; // keep a rolling week of daily snapshots
+const EXPORT_REMINDER_MS = 72 * 60 * 60 * 1000; // nudge admin to download a manual backup every 72h
+
+// The four possible division "slots" this app supports. Not every slot has
+// to be used — each league also carries its own `enabled` flag (see
+// DivisionsCard) — but the key/default name/default cap are fixed here so
+// the rest of the app has a stable, ordered list to iterate over. Premier
+// League is always enabled and can't be turned off; the others are
+// optional and their participant cap is admin-editable (Championship
+// defaults to 24 since that was specified as its ceiling, but any of
+// these can be changed).
+const LEAGUE_DEFS = [
+  { key: "league1", defaultName: "PLP Premier League", defaultMaxParticipants: 20, defaultMinParticipants: 4, alwaysEnabled: true },
+  { key: "league2", defaultName: "PLP Championship", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false },
+  { key: "league3", defaultName: "PLP League One", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false },
+  { key: "league4", defaultName: "PLP League Two", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false },
+];
+
+function enabledLeagueKeys(data) {
+  return LEAGUE_DEFS.map((d) => d.key).filter((key) => data.leagues[key]?.enabled);
+}
+
+function emptyLeagueSlot(name, maxParticipants, minParticipants) {
+  return {
+    name,
+    enabled: false,
+    maxParticipants,
+    minParticipants: minParticipants ?? DEFAULT_MIN_PARTICIPANTS,
+    h2hSchedule: [],
+    participants: [],
+    matchdays: [],
+    fixturePool: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Seed data
+// ---------------------------------------------------------------------------
+function seedData() {
+  const league1ParticipantIds = ["l1p1", "l1p2", "l1p3", "l1p4", "l1p5", "l1p6"];
+  const league2ParticipantIds = ["l2p1", "l2p2", "l2p3", "l2p4", "l2p5"];
+  const league1Schedule = generateRoundRobinSchedule(league1ParticipantIds);
+  const league2Schedule = generateRoundRobinSchedule(league2ParticipantIds);
+
+  return {
+  adminPin: "2210",
+  lastManualExportAt: null,
+  seasonLabel: "2026-27",
+  seasonArchives: [], // past seasons, archived in full when the admin ends one — see endSeason() below
+  legacyHonours: [], // manually-entered honours from before this app existed — see HonoursView below
+  historyPage: {
+    text: "The story of this competition starts here — Admin can write the full history in Admin > History and add photos alongside it.",
+    images: [],
+  },
+  accounts: {}, // keyed by lowercased email — see hashPassword()/randomSaltHex() below
+  leagues: {
+    league1: {
+      name: "PLP Premier League",
+      enabled: true,
+      maxParticipants: 20,
+      minParticipants: 4,
+      h2hSchedule: league1Schedule,
+      participants: [
+        { id: "l1p1", name: "Amara", code: randomInviteCode() },
+        { id: "l1p2", name: "Kenji", code: randomInviteCode() },
+        { id: "l1p3", name: "Priya", code: randomInviteCode() },
+        { id: "l1p4", name: "Lucas", code: randomInviteCode() },
+        { id: "l1p5", name: "Nadia", code: randomInviteCode() },
+        { id: "l1p6", name: "Oskar", code: randomInviteCode() },
+      ],
+      matchdays: [
+        {
+          id: "l1md1",
+          label: "Matchday 1",
+          blog: "What a matchday to kick things off! Northgate United came out swinging, Millbrook and Sterling played out a cagey stalemate, and Copper Vale ran riot at Hartley Town. Plenty of upsets in the predictions to talk about at the water cooler.",
+          draft: false,
+          resultsPublished: true,
+          releaseAt: "2026-07-20T18:00:00Z", // in the past — already revealed
+          locked: true,
+          scoring: { resultPoints: 3, homeGoalPoints: 1, awayGoalPoints: 1, marginPoints: 1 },
+          pairings: league1Schedule[0] ?? null,
+          freeMatchIndex: null,
+          customMatches: {},
+          matches: [
+            { id: "l1m1", home: "Northgate United", away: "Ashford Rovers", kickoff: "2026-07-19T15:00:00Z", outcome: { home: 2, away: 1 } },
+            { id: "l1m2", home: "Millbrook City", away: "Sterling Athletic", kickoff: "2026-07-19T17:30:00Z", outcome: { home: 0, away: 0 } },
+            { id: "l1m3", home: "Hartley Town", away: "Copper Vale FC", kickoff: "2026-07-19T19:45:00Z", outcome: { home: 1, away: 3 } },
+          ],
+        },
+        {
+          id: "l1md2",
+          label: "Matchday 2",
+          blog: "Big rematches this round — Northgate host Millbrook looking to bounce back, while Sterling and Copper Vale face off again after that thriller. Get your predictions in before kickoff!",
+          draft: false,
+          resultsPublished: false,
+          releaseAt: "2026-08-05T18:00:00Z", // in the future — still hidden
+          locked: false,
+          scoring: { resultPoints: 3, homeGoalPoints: 1, awayGoalPoints: 1, marginPoints: 1 },
+          pairings: league1Schedule[1] ?? null,
+          freeMatchIndex: 2,
+          customMatches: {},
+          matches: [
+            { id: "l1m4", home: "Northgate United", away: "Millbrook City", kickoff: "2026-08-02T15:00:00Z", outcome: null },
+            { id: "l1m5", home: "Ashford Rovers", away: "Hartley Town", kickoff: "2026-08-02T17:30:00Z", outcome: null },
+            { id: "l1m6", home: "Sterling Athletic", away: "Copper Vale FC", kickoff: "2026-08-02T19:45:00Z", outcome: null },
+          ],
+        },
+      ],
+      fixturePool: [
+        { id: "l1f1", home: "Northgate United", away: "Hartley Town", kickoff: "2026-08-16T15:00:00Z" },
+        { id: "l1f2", home: "Copper Vale FC", away: "Millbrook City", kickoff: "2026-08-16T15:00:00Z" },
+        { id: "l1f3", home: "Sterling Athletic", away: "Ashford Rovers", kickoff: "2026-08-16T17:30:00Z" },
+        { id: "l1f4", home: "Ashford Rovers", away: "Copper Vale FC", kickoff: "2026-08-23T15:00:00Z" },
+        { id: "l1f5", home: "Millbrook City", away: "Northgate United", kickoff: "2026-08-23T15:00:00Z" },
+        { id: "l1f6", home: "Hartley Town", away: "Sterling Athletic", kickoff: "2026-08-23T17:30:00Z" },
+      ],
+    },
+    league2: {
+      name: "PLP Championship",
+      enabled: true,
+      maxParticipants: 24,
+      minParticipants: 2,
+      h2hSchedule: league2Schedule,
+      participants: [
+        { id: "l2p1", name: "Elin", code: randomInviteCode() },
+        { id: "l2p2", name: "Marco", code: randomInviteCode() },
+        { id: "l2p3", name: "Zainab", code: randomInviteCode() },
+        { id: "l2p4", name: "Devon", code: randomInviteCode() },
+        { id: "l2p5", name: "Ravi", code: randomInviteCode() },
+      ],
+      matchdays: [
+        {
+          id: "l2md1",
+          label: "Matchday 1",
+          blog: "A tight opening round in the Championship — Ironbridge and Westhaven shared the points, Fenwick edged past Castlemoor, and Dunmore snuck past Briar City on the road.",
+          draft: false,
+          resultsPublished: true,
+          releaseAt: "2026-07-20T18:00:00Z",
+          locked: true,
+          scoring: { resultPoints: 3, homeGoalPoints: 1, awayGoalPoints: 1, marginPoints: 1 },
+          pairings: league2Schedule[0] ?? null,
+          freeMatchIndex: null,
+          customMatches: {},
+          matches: [
+            { id: "l2m1", home: "Ironbridge FC", away: "Westhaven United", kickoff: "2026-07-19T15:00:00Z", outcome: { home: 1, away: 1 } },
+            { id: "l2m2", home: "Fenwick Town", away: "Castlemoor Athletic", kickoff: "2026-07-19T17:30:00Z", outcome: { home: 2, away: 0 } },
+            { id: "l2m3", home: "Briar City", away: "Dunmore Rovers", kickoff: "2026-07-19T19:45:00Z", outcome: { home: 0, away: 1 } },
+          ],
+        },
+        {
+          id: "l2md2",
+          label: "Matchday 2",
+          blog: "Round two in the Championship. Westhaven and Fenwick will want to build on their form, and Dunmore travel to Ironbridge fresh off a win. Should be a good one.",
+          draft: false,
+          resultsPublished: false,
+          releaseAt: "2026-08-05T18:00:00Z",
+          locked: false,
+          scoring: { resultPoints: 3, homeGoalPoints: 1, awayGoalPoints: 1, marginPoints: 1 },
+          pairings: league2Schedule[1] ?? null,
+          freeMatchIndex: 2,
+          customMatches: {},
+          matches: [
+            { id: "l2m4", home: "Westhaven United", away: "Fenwick Town", kickoff: "2026-08-02T15:00:00Z", outcome: null },
+            { id: "l2m5", home: "Castlemoor Athletic", away: "Briar City", kickoff: "2026-08-02T17:30:00Z", outcome: null },
+            { id: "l2m6", home: "Dunmore Rovers", away: "Ironbridge FC", kickoff: "2026-08-02T19:45:00Z", outcome: null },
+          ],
+        },
+      ],
+      fixturePool: [
+        { id: "l2f1", home: "Ironbridge FC", away: "Fenwick Town", kickoff: "2026-08-16T15:00:00Z" },
+        { id: "l2f2", home: "Dunmore Rovers", away: "Castlemoor Athletic", kickoff: "2026-08-16T15:00:00Z" },
+        { id: "l2f3", home: "Briar City", away: "Westhaven United", kickoff: "2026-08-16T17:30:00Z" },
+        { id: "l2f4", home: "Westhaven United", away: "Dunmore Rovers", kickoff: "2026-08-23T15:00:00Z" },
+        { id: "l2f5", home: "Castlemoor Athletic", away: "Ironbridge FC", kickoff: "2026-08-23T15:00:00Z" },
+        { id: "l2f6", home: "Fenwick Town", away: "Briar City", kickoff: "2026-08-23T17:30:00Z" },
+      ],
+    },
+    league3: emptyLeagueSlot("PLP League One", 24, 2),
+    league4: emptyLeagueSlot("PLP League Two", 24, 2),
+  },
+  predictions: {
+    // League 1, Matchday 1 (revealed)
+    l1m1__l1p1: { home: 2, away: 1, submittedAt: "2026-07-18T10:00:00Z" }, // correct
+    l1m1__l1p2: { home: 1, away: 1, submittedAt: "2026-07-18T10:05:00Z" }, // wrong
+    l1m1__l1p3: { home: 3, away: 0, submittedAt: "2026-07-18T11:00:00Z" }, // correct result, wrong score
+    l1m2__l1p1: { home: 0, away: 0, submittedAt: "2026-07-18T10:00:00Z" }, // correct
+    l1m2__l1p4: { home: 1, away: 0, submittedAt: "2026-07-18T12:00:00Z" }, // wrong
+    l1m3__l1p3: { home: 0, away: 2, submittedAt: "2026-07-18T11:05:00Z" }, // correct
+    l1m3__l1p5: { home: 1, away: 1, submittedAt: "2026-07-18T13:00:00Z" }, // wrong
+    // League 1, Matchday 2 (still hidden — release date in the future)
+    l1m4__l1p1: { home: 1, away: 1, submittedAt: "2026-07-27T09:00:00Z" },
+    l1m4__l1p2: { home: 2, away: 0, submittedAt: "2026-07-27T09:30:00Z" },
+    l1m5__l1p3: { home: 0, away: 1, submittedAt: "2026-07-27T10:00:00Z" },
+    // League 2, Matchday 1 (revealed)
+    l2m1__l2p1: { home: 1, away: 1, submittedAt: "2026-07-18T10:00:00Z" }, // correct
+    l2m1__l2p2: { home: 2, away: 0, submittedAt: "2026-07-18T10:10:00Z" }, // wrong
+    l2m2__l2p3: { home: 2, away: 1, submittedAt: "2026-07-18T11:00:00Z" }, // correct result
+    l2m2__l2p4: { home: 0, away: 0, submittedAt: "2026-07-18T11:30:00Z" }, // wrong
+    l2m3__l2p1: { home: 0, away: 1, submittedAt: "2026-07-18T12:00:00Z" }, // correct
+    l2m3__l2p5: { home: 1, away: 1, submittedAt: "2026-07-18T12:30:00Z" }, // wrong
+    // League 2, Matchday 2 (still hidden)
+    l2m4__l2p2: { home: 1, away: 2, submittedAt: "2026-07-27T09:00:00Z" },
+    l2m5__l2p3: { home: 1, away: 1, submittedAt: "2026-07-27T09:45:00Z" },
+  },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Scoring engine
+// ---------------------------------------------------------------------------
+function resultOf(home, away) {
+  if (home > away) return "home";
+  if (away > home) return "away";
+  return "draw";
+}
+
+function scoreMatch(match, prediction, scoring) {
+  if (!match.outcome) return { points: 0, evaluated: false, correct: false };
+  if (!prediction) return { points: 0, evaluated: true, correct: false };
+  const actual = match.outcome;
+
+  const resultCorrect = resultOf(prediction.home, prediction.away) === resultOf(actual.home, actual.away);
+  const homeCorrect = prediction.home === actual.home;
+  const awayCorrect = prediction.away === actual.away;
+  const marginCorrect = (prediction.home - prediction.away) === (actual.home - actual.away);
+
+  let points = 0;
+  if (resultCorrect) points += scoring.resultPoints;
+  if (homeCorrect) points += scoring.homeGoalPoints;
+  if (awayCorrect) points += scoring.awayGoalPoints;
+  if (marginCorrect) points += scoring.marginPoints;
+
+  return { points, evaluated: true, correct: resultCorrect, breakdown: { resultCorrect, homeCorrect, awayCorrect, marginCorrect } };
+}
+
+function maxMatchPoints(scoring) {
+  return scoring.resultPoints + scoring.homeGoalPoints + scoring.awayGoalPoints + scoring.marginPoints;
+}
+
+// Points earned by each participant for one matchday only — used for the
+// admin's "check before you publish" preview, not the running standings.
+// Turns a pairing's custom-match definition into a plain match object with
+// a stable id, so it can flow through the same scoring code as any other
+// match. The id is deterministic (matchday + home contestant) so both
+// contestants in the pairing — who each submit their own prediction — are
+// always scored against the exact same fixture.
+function customMatchAsMatch(matchday, homeParticipantId, custom) {
+  return {
+    id: `custom__${matchday.id}__${homeParticipantId}`,
+    home: custom.home,
+    away: custom.away,
+    kickoff: null,
+    outcome: custom.outcome ?? null,
+  };
+}
+
+// The 3 matches a given participant is actually being scored on for this
+// matchday. Normally that's just matchday.matches for everyone — but once
+// admin has marked one slot as "free" (matchday.freeMatchIndex), a
+// pairing's HOME contestant may swap that slot for a custom match of
+// their own choosing. Only the home contestant is affected — their
+// opponent always predicts the admin's pre-determined match at that slot,
+// regardless of what the home contestant picked.
+function effectiveMatchesFor(matchday, participantId) {
+  if (matchday.freeMatchIndex === null || matchday.freeMatchIndex === undefined || !matchday.pairings) {
+    return matchday.matches;
+  }
+  const pairing = matchday.pairings.pairings.find((p) => p.home === participantId);
+  if (!pairing) return matchday.matches; // away contestant, a bye, or not part of this matchday
+  const custom = matchday.customMatches?.[participantId];
+  if (!custom) return matchday.matches;
+  return matchday.matches.map((m, i) => (i === matchday.freeMatchIndex ? customMatchAsMatch(matchday, participantId, custom) : m));
+}
+
+function computeMatchdayPoints(matchday, predictions, participants) {
+  const rows = participants.map((p) => {
+    let points = 0, correct = 0;
+    effectiveMatchesFor(matchday, p.id).forEach((m) => {
+      const pred = predictions[`${m.id}__${p.id}`];
+      const result = scoreMatch(m, pred, matchday.scoring);
+      if (result.evaluated) {
+        points += result.points;
+        if (result.correct) correct += 1;
+      }
+    });
+    return { id: p.id, name: p.name, points: Math.round(points * 10) / 10, correct };
+  });
+  rows.sort((a, b) => b.points - a.points);
+  return rows;
+}
+
+// -----------------------------------------------------------------------------
+// HEAD-TO-HEAD FORMAT — each matchday, contestants are paired up (per a
+// season-long schedule generated in advance) and compete directly against
+// their opponent: whoever earns more prediction points that matchday wins
+// the head-to-head fixture (3 league points), a tie draws (1 point each),
+// and the margin between the two scores ("score difference") is the
+// tiebreaker for the table. The per-match/per-matchday prediction scoring
+// itself (scoreMatch, computeMatchdayPoints above) is unchanged — this
+// layer just decides what those raw points are worth in the standings.
+// -----------------------------------------------------------------------------
+
+// Double round-robin (circle method): every contestant plays every other
+// contestant twice — once with each as "home" — which for N contestants
+// produces exactly 2*(N-1) rounds (38 for 20 contestants, 30 for 16,
+// matching a normal top-flight football season). An odd contestant count
+// gets a rotating bye each round instead of a pairing.
+function generateRoundRobinSchedule(participantIds) {
+  let ids = [...participantIds];
+  if (ids.length < 2) return [];
+  const hasBye = ids.length % 2 !== 0;
+  if (hasBye) ids.push(null);
+  const n = ids.length;
+  const half = n / 2;
+  let arr = [...ids];
+  const firstLeg = [];
+  for (let r = 0; r < n - 1; r++) {
+    const pairings = [];
+    let bye = null;
+    for (let i = 0; i < half; i++) {
+      const a = arr[i];
+      const b = arr[n - 1 - i];
+      if (a === null) bye = b;
+      else if (b === null) bye = a;
+      else pairings.push({ home: a, away: b });
+    }
+    firstLeg.push({ pairings, bye });
+    const fixed = arr[0];
+    const rest = arr.slice(1);
+    rest.unshift(rest.pop());
+    arr = [fixed, ...rest];
+  }
+  const secondLeg = firstLeg.map(({ pairings, bye }) => ({
+    pairings: pairings.map((p) => ({ home: p.away, away: p.home })),
+    bye,
+  }));
+  return [...firstLeg, ...secondLeg];
+}
+
+// A bye counts as an automatic win with a neutral (zero) score difference —
+// it shouldn't be possible to boost your tiebreaker standing just by being
+// the odd one out that round.
+const BYE_RESULT = { leaguePoints: 3, scoreDiff: 0, opponentId: null, ownRaw: null, opponentRaw: null, outcome: "bye" };
+
+// Resolves one matchday's pairings (attached to the matchday when it was
+// created — see AdminView's matchday generation) into each involved
+// participant's head-to-head result for that matchday. Returns {} if this
+// matchday has no pairings attached (e.g. created before a schedule existed).
+function computeH2HResultsForMatchday(matchday, predictions, participants) {
+  if (!matchday.pairings) return {};
+  const rawRows = computeMatchdayPoints(matchday, predictions, participants);
+  const rawById = Object.fromEntries(rawRows.map((r) => [r.id, r.points]));
+  const results = {};
+
+  matchday.pairings.pairings.forEach(({ home, away }) => {
+    const homeRaw = rawById[home] ?? 0;
+    const awayRaw = rawById[away] ?? 0;
+    if (homeRaw > awayRaw) {
+      results[home] = { leaguePoints: 3, scoreDiff: homeRaw - awayRaw, opponentId: away, ownRaw: homeRaw, opponentRaw: awayRaw, outcome: "win" };
+      results[away] = { leaguePoints: 0, scoreDiff: awayRaw - homeRaw, opponentId: home, ownRaw: awayRaw, opponentRaw: homeRaw, outcome: "loss" };
+    } else if (awayRaw > homeRaw) {
+      results[away] = { leaguePoints: 3, scoreDiff: awayRaw - homeRaw, opponentId: home, ownRaw: awayRaw, opponentRaw: homeRaw, outcome: "win" };
+      results[home] = { leaguePoints: 0, scoreDiff: homeRaw - awayRaw, opponentId: away, ownRaw: homeRaw, opponentRaw: awayRaw, outcome: "loss" };
+    } else {
+      results[home] = { leaguePoints: 1, scoreDiff: 0, opponentId: away, ownRaw: homeRaw, opponentRaw: awayRaw, outcome: "draw" };
+      results[away] = { leaguePoints: 1, scoreDiff: 0, opponentId: home, ownRaw: awayRaw, opponentRaw: homeRaw, outcome: "draw" };
+    }
+  });
+
+  if (matchday.pairings.bye) {
+    results[matchday.pairings.bye] = { ...BYE_RESULT, ownRaw: rawById[matchday.pairings.bye] ?? 0 };
+  }
+  return results;
+}
+
+
+function isReleased(matchday, now) {
+  if (!matchday.releaseAt) return false;
+  return new Date(matchday.releaseAt).getTime() <= now;
+}
+
+// `adminMode` only affects the label shown for a fully-scored-but-unpublished
+// matchday: admins see "pending publish" (a nudge to go confirm it), while
+// contestants just see it as still "locked" until the admin publishes.
+function matchdayDisplayStatus(matchday, adminMode = false) {
+  if (matchday.draft) return "draft";
+  const allScored = matchday.matches.every((m) => m.outcome);
+  if (allScored && matchday.resultsPublished) return "completed";
+  if (allScored && !matchday.resultsPublished) return adminMode ? "pending publish" : "locked";
+  if (matchday.locked) return "locked";
+  return "open";
+}
+
+function cellStatus(matchday, hasPrediction) {
+  if (hasPrediction) return "submitted";
+  if (matchday.locked) return "locked";
+  return "pending";
+}
+
+const cx = (...c) => c.filter(Boolean).join(" ");
+
+const STATUS_STYLES = {
+  submitted: "bg-emerald-50 text-emerald-700 border-emerald-300/30",
+  pending: "bg-zinc-400/10 text-stone-500 border-zinc-500/30",
+  locked: "bg-rose-50 text-rose-700 border-rose-300/30",
+};
+const STATUS_ICON = { submitted: CheckCircle2, pending: Clock, locked: Lock };
+const MATCHDAY_STATUS_STYLES = {
+  draft: "bg-white/5 text-stone-500 border-stone-300 border-dashed",
+  open: "bg-white/5 text-stone-900 border-stone-400",
+  locked: "bg-amber-400/10 text-amber-300 border-amber-400/30",
+  "pending publish": "bg-amber-400/10 text-amber-300 border-amber-400/30",
+  completed: "bg-amber-400 text-black border-amber-400",
+};
+
+// Renames leagues from the old generic "League 1/2" test names to the real
+// ones, and backfills fields added in later versions (like `accounts`), so
+// anyone who already has data saved from earlier testing doesn't need to
+// start over.
+function migrateData(data) {
+  if (data.leagues?.league1?.name === "League 1") data.leagues.league1.name = "PLP Premier League";
+  if (data.leagues?.league2?.name === "League 2") data.leagues.league2.name = "PLP Championship";
+  if (!data.accounts) data.accounts = {};
+  if (typeof data.lastManualExportAt === "undefined") data.lastManualExportAt = null;
+  if (typeof data.seasonLabel !== "string") data.seasonLabel = "2026-27";
+  if (!Array.isArray(data.seasonArchives)) data.seasonArchives = [];
+  if (!Array.isArray(data.legacyHonours)) data.legacyHonours = [];
+  if (!data.historyPage || typeof data.historyPage !== "object") data.historyPage = { text: "", images: [] };
+  if (typeof data.historyPage.text !== "string") data.historyPage.text = "";
+  if (!Array.isArray(data.historyPage.images)) data.historyPage.images = [];
+  // Backfill any division slots that didn't exist yet (League One / League
+  // Two are new) so older saved data still has all four slots to work with.
+  LEAGUE_DEFS.forEach((def) => {
+    if (!data.leagues[def.key]) {
+      data.leagues[def.key] = emptyLeagueSlot(def.defaultName, def.defaultMaxParticipants, def.defaultMinParticipants);
+    }
+  });
+  Object.entries(data.leagues).forEach(([key, league]) => {
+    const def = LEAGUE_DEFS.find((d) => d.key === key);
+    if (typeof league.enabled !== "boolean") {
+      // A division that already has real data (participants or matchdays)
+      // was clearly in active use, so migration preserves that regardless
+      // of which slot it happens to be — Championship is treated exactly
+      // like League One/Two here, not as a special case.
+      league.enabled = def?.alwaysEnabled || league.participants.length > 0 || league.matchdays.length > 0;
+    }
+    if (def?.alwaysEnabled) league.enabled = true;
+    if (typeof league.maxParticipants !== "number") {
+      league.maxParticipants = def?.defaultMaxParticipants ?? DEFAULT_MAX_PARTICIPANTS;
+    }
+    if (typeof league.minParticipants !== "number") {
+      league.minParticipants = def?.defaultMinParticipants ?? DEFAULT_MIN_PARTICIPANTS;
+    }
+    league.participants.forEach((p) => {
+      if (!p.code) p.code = randomInviteCode();
+    });
+    if (!league.fixturePool) league.fixturePool = [];
+    if (!Array.isArray(league.h2hSchedule)) league.h2hSchedule = [];
+    league.h2hSchedule.forEach((round) => {
+      if (typeof round.scheduledDate === "undefined") round.scheduledDate = null;
+    });
+    league.matchdays.forEach((md) => {
+      if (typeof md.draft !== "boolean") md.draft = false;
+      if (typeof md.blog !== "string") md.blog = "";
+      if (typeof md.pairings === "undefined") md.pairings = null;
+      if (typeof md.scheduledDate === "undefined") md.scheduledDate = null;
+      if (typeof md.freeMatchIndex === "undefined") md.freeMatchIndex = null;
+      if (!md.customMatches) md.customMatches = {};
+      // Grandfather in matchdays from before the publish-gate existed: if
+      // every match already has a result, treat it as already published so
+      // standings people had already seen don't disappear.
+      if (typeof md.resultsPublished !== "boolean") {
+        md.resultsPublished = md.matches.every((m) => m.outcome);
+      }
+    });
+  });
+  return data;
+}
+
+// Breaks the single unified `data` shape (what every component in this app
+// reads and writes) into the separate storage keys described above.
+function splitData(data) {
+  const stripPhoto = (p) => {
+    const { photo, badge, ...rest } = p;
+    return rest;
+  };
+  const leagueMeta = {};
+  const rosterLeagues = {};
+  const photos = {};
+  const badges = {};
+  Object.entries(data.leagues).forEach(([key, league]) => {
+    leagueMeta[key] = {
+      name: league.name,
+      enabled: league.enabled,
+      maxParticipants: league.maxParticipants,
+      minParticipants: league.minParticipants,
+      h2hSchedule: league.h2hSchedule,
+      matchdays: league.matchdays,
+      fixturePool: league.fixturePool,
+    };
+    rosterLeagues[key] = { participants: league.participants.map(stripPhoto) };
+    league.participants.forEach((p) => {
+      if (p.photo) photos[p.id] = p.photo;
+      if (p.badge) badges[p.id] = p.badge;
+    });
+  });
+  return {
+    core: { adminPin: data.adminPin, lastManualExportAt: data.lastManualExportAt, seasonLabel: data.seasonLabel, leagueMeta },
+    accountsBlob: { accounts: data.accounts },
+    rosterBlob: { leagues: rosterLeagues },
+    photosBlob: { photos },
+    predictionsBlob: { predictions: data.predictions },
+    archivesBlob: { seasonArchives: data.seasonArchives, legacyHonours: data.legacyHonours },
+    badgesBlob: { badges },
+    historyBlob: { historyPage: data.historyPage },
+  };
+}
+
+// The inverse of splitData — reconstructs the unified shape the rest of the
+// app expects from the 8 separately-loaded pieces.
+function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob) {
+  const leagues = {};
+  Object.keys(core.leagueMeta).forEach((key) => {
+    const roster = rosterBlob.leagues[key]?.participants ?? [];
+    leagues[key] = {
+      ...core.leagueMeta[key],
+      participants: roster.map((p) => ({ ...p, photo: photosBlob.photos[p.id] ?? null, badge: badgesBlob.badges[p.id] ?? null })),
+    };
+  });
+  return {
+    adminPin: core.adminPin,
+    lastManualExportAt: core.lastManualExportAt,
+    seasonLabel: core.seasonLabel,
+    seasonArchives: archivesBlob.seasonArchives ?? [],
+    legacyHonours: archivesBlob.legacyHonours ?? [],
+    historyPage: historyBlob.historyPage ?? { text: "", images: [] },
+    accounts: accountsBlob.accounts ?? {},
+    predictions: predictionsBlob.predictions ?? {},
+    leagues,
+  };
+}
+
+// Writes all 8 split keys from a unified `data` object.
+// Reads that decide "is this a brand-new install with nothing saved yet"
+// carry real weight — getting that wrong means overwriting genuine saved
+// data with an empty seed. A single empty read is never trusted for that
+// decision on its own; it's retried a few times first, so a one-off timing
+// hiccup can't be mistaken for "nothing was ever saved here."
+async function getWithRetry(key, attempts = 4, delayMs = 500) {
+  for (let i = 0; i < attempts; i++) {
+    const res = await window.storage.get(key, true);
+    if (res && res.value) return res;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return null; // consistently empty across every attempt
+}
+
+// Same reasoning as getWithRetry, applied to writes: a single failed
+// attempt to save one key isn't trusted as a genuine failure on its own.
+// It's retried a few times first, with a short pause between attempts, so
+// a one-off hiccup mid-burst doesn't get reported as a real failure when
+// it's actually just a transient blip.
+async function setWithRetry(key, json, attempts = 3, delayMs = 400) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await window.storage.set(key, json, true);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+async function writeSplitData(data) {
+  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob } = splitData(data);
+  // Named entries, written one at a time (not all at once) — sequencing
+  // keeps write bursts gentle on the backend and makes failures easier to
+  // attribute. Still independent of each other: one failing doesn't stop
+  // the rest from being attempted.
+  const entries = [
+    ["core settings", CORE_KEY, core],
+    ["accounts", ACCOUNTS_KEY, accountsBlob],
+    ["roster", ROSTER_KEY, rosterBlob],
+    ["profile photos", PHOTOS_KEY, photosBlob],
+    ["predictions", PREDICTIONS_KEY, predictionsBlob],
+    ["season archives", SEASON_ARCHIVES_KEY, archivesBlob],
+    ["badges", BADGES_KEY, badgesBlob],
+    ["history page", HISTORY_KEY, historyBlob],
+  ];
+  const failed = [];
+  for (const [label, key, blob] of entries) {
+    try {
+      const json = JSON.stringify(blob);
+      await setWithRetry(key, json);
+    } catch {
+      failed.push(label);
+    }
+  }
+  if (failed.length > 0) {
+    const err = new Error(`Failed to save: ${failed.join(", ")}`);
+    err.failedParts = failed;
+    throw err;
+  }
+}
+
+// --- Password hashing (Web Crypto SHA-256 + a random per-account salt) ---
+// Passwords are never stored in plain text. This is still client-side
+// hashing with no server-side auth layer to keep secrets away from a
+// determined user — see the note in the app's footer about what this does
+// and doesn't protect against.
+function bufferToHex(buf) {
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return bufferToHex(digest);
+}
+// Short, human-shareable invite codes (no ambiguous 0/O/1/I characters) —
+// one per contestant. The admin hands these out privately; a contestant
+// must supply theirs to register, so nobody can register as someone else.
+const INVITE_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function randomInviteCode(length = 6) {
+  let code = "";
+  for (let i = 0; i < length; i++) code += INVITE_CODE_ALPHABET[Math.floor(Math.random() * INVITE_CODE_ALPHABET.length)];
+  return code;
+}
+
+function randomSaltHex(bytes = 16) {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function hashPassword(password, salt) {
+  return sha256Hex(`${salt}:${password}`);
+}
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function fmtDateTime(iso) {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  } catch {
+    return iso;
+  }
+}
+function fmtDateOnly(iso) {
+  if (!iso) return null;
+  try {
+    return new Date(`${iso.slice(0, 10)}T00:00:00`).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+  } catch {
+    return iso;
+  }
+}
+function toLocalInputValue(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// =============================================================================
+// APP
+// =============================================================================
+// -----------------------------------------------------------------------------
+// ERROR BOUNDARY — one bug anywhere in the tree used to take the whole app
+// down to a blank screen for everyone. This catches render/lifecycle errors
+// (not errors inside async storage calls, which are already try/caught at
+// the source) and shows a recoverable screen instead of nothing at all.
+// -----------------------------------------------------------------------------
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error, info) {
+    // Best-effort logging only — there's no server to send this to, but it
+    // still shows up in the browser console for anyone debugging live.
+    console.error("PLP 2026-27 crashed:", error, info?.componentStack);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-[500px] w-full flex items-center justify-center bg-stone-100 text-stone-900 px-4">
+          <div className="max-w-sm text-center space-y-4">
+            <Logo className="h-16 w-auto object-contain mx-auto" />
+            <h2 className="font-display font-bold text-lg text-rose-700">Something went wrong</h2>
+            <p className="text-sm text-stone-500">
+              The app hit an unexpected error and couldn't continue. Nothing you've already saved is affected — reloading should get you back in.
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="bg-violet-700 hover:bg-violet-600 text-white font-display font-semibold rounded-lg px-4 py-2 text-sm"
+            >
+              Reload
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function ForecastRoom() {
+  return (
+    <ErrorBoundary>
+      <ForecastRoomApp />
+    </ErrorBoundary>
+  );
+}
+
+function ForecastRoomApp() {
+  const [data, setData] = useState(null);
+  const [loadError, setLoadError] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null); // { email, name, leagueKey, participantId }
+  const [leagueKey, setLeagueKey] = useState("league1");
+  const [globalView, setGlobalView] = useState(null); // null | "honours" | "history" — sits outside the division tabs
+  const [adminMode, setAdminMode] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const [snapshots, setSnapshots] = useState([]); // rotating automatic backups: [{ timestamp, data }]
+  const [saveError, setSaveError] = useState(null); // non-null whenever the most recent save genuinely failed
+  const dataRef = useRef(null);
+  const snapshotsRef = useRef([]);
+  // Chains every save so only one is ever actually in flight at a time —
+  // without this, rapidly triggering several saves in a row (e.g. removing
+  // multiple contestants back to back) can start a new save before the
+  // previous one's requests have finished, letting them collide with each
+  // other even though each save's own 8 requests are already sequenced.
+  const persistQueueRef = useRef(Promise.resolve());
+
+  useEffect(() => { dataRef.current = data; }, [data]);
+  useEffect(() => { snapshotsRef.current = snapshots; }, [snapshots]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        // Read one key at a time (not all at once) — same reasoning as
+        // writeSplitData. Any failure here still falls through to the catch
+        // block below exactly as before, so a transient read failure can
+        // never be mistaken for "no data exists yet" and risk overwriting
+        // real saved data with a fresh seed.
+        const coreRes = await getWithRetry(CORE_KEY);
+        const accountsRes = await window.storage.get(ACCOUNTS_KEY, true);
+        const rosterRes = await window.storage.get(ROSTER_KEY, true);
+        const photosRes = await window.storage.get(PHOTOS_KEY, true);
+        const predictionsRes = await window.storage.get(PREDICTIONS_KEY, true);
+        const archivesRes = await window.storage.get(SEASON_ARCHIVES_KEY, true);
+        const badgesRes = await window.storage.get(BADGES_KEY, true);
+        const historyRes = await window.storage.get(HISTORY_KEY, true);
+        if (cancelled) return;
+
+        if (coreRes && coreRes.value) {
+          // Already on the split-storage format.
+          const merged = mergeSplitData(
+            JSON.parse(coreRes.value),
+            accountsRes && accountsRes.value ? JSON.parse(accountsRes.value) : { accounts: {} },
+            rosterRes && rosterRes.value ? JSON.parse(rosterRes.value) : { leagues: {} },
+            photosRes && photosRes.value ? JSON.parse(photosRes.value) : { photos: {} },
+            predictionsRes && predictionsRes.value ? JSON.parse(predictionsRes.value) : { predictions: {} },
+            archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
+            badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
+            historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } }
+          );
+          setData(migrateData(merged));
+          return;
+        }
+
+        // Not split yet — see if there's data under the old single-blob key
+        // from before this update, and migrate it into the split keys.
+        // Same retry safeguard applies here for the same reason.
+        const legacyRes = await getWithRetry(STORAGE_KEY);
+        if (legacyRes && legacyRes.value) {
+          const migrated = migrateData(JSON.parse(legacyRes.value));
+          setData(migrated);
+          await writeSplitData(migrated);
+          return;
+        }
+
+        // Brand new install — nothing saved anywhere yet, confirmed by
+        // several consecutive empty reads, not just one.
+        const seed = seedData();
+        setData(seed);
+        await writeSplitData(seed);
+      } catch {
+        if (!cancelled) {
+          setData(seedData());
+          setLoadError(true);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Load previously-saved automatic snapshots (a separate storage key so a
+  // snapshot never has to contain a copy of all the earlier snapshots too).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await window.storage.get(SNAPSHOTS_KEY, true);
+        if (cancelled) return;
+        setSnapshots(result && result.value ? JSON.parse(result.value) : []);
+      } catch {
+        /* best-effort — snapshots are a safety net, not core functionality */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Takes a new automatic snapshot if it's been >= 24h since the last one.
+  // Uses refs (not state) so the interval below always sees the latest
+  // data/snapshots without needing to be re-created on every change.
+  const maybeTakeSnapshot = useCallback(async () => {
+    if (!dataRef.current) return;
+    const current = snapshotsRef.current;
+    const last = current[current.length - 1];
+    const now = Date.now();
+    if (last && now - last.timestamp < SNAPSHOT_INTERVAL_MS) return;
+    const next = [...current, { timestamp: now, data: JSON.parse(JSON.stringify(dataRef.current)) }].slice(-MAX_SNAPSHOTS);
+    setSnapshots(next);
+    try {
+      await window.storage.set(SNAPSHOTS_KEY, JSON.stringify(next), true);
+    } catch {
+      /* best-effort */
+    }
+  }, []);
+
+  // Once data has loaded for the first time, check immediately, then keep
+  // checking hourly for as long as someone has the app open (a snapshot is
+  // only ever actually written once 24h have genuinely passed).
+  useEffect(() => {
+    if (!data) return;
+    maybeTakeSnapshot();
+    const t = setInterval(maybeTakeSnapshot, 60 * 60 * 1000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [!!data, maybeTakeSnapshot]);
+
+  const persist = useCallback((next) => {
+    // Queue this save behind whatever's already running, rather than
+    // starting it immediately — see persistQueueRef above for why.
+    const run = persistQueueRef.current.then(async () => {
+      const previous = dataRef.current;
+      setData(next); // optimistic UI update, applied only once it's actually this save's turn
+      try {
+        await writeSplitData(next);
+        setSaveError(null);
+        return true;
+      } catch (err) {
+        // The save genuinely failed — roll the screen back to what's actually
+        // saved rather than leave it showing a change that never went through.
+        setData(previous);
+        const parts = err?.failedParts;
+        setSaveError(
+          parts && parts.length
+            ? `Your last change didn't save — the ${parts.join(", ")} couldn't be written, even after retrying. This is usually a connection issue — try again in a moment. If it keeps happening, download a backup from Admin \u2192 Backups and let your organizer know.`
+            : "Your last change didn't save — check your connection and try again."
+        );
+        return false;
+      }
+    });
+    // Keep the queue chain alive even if this save failed, so the NEXT
+    // queued save still runs rather than getting stuck behind a rejection.
+    persistQueueRef.current = run.catch(() => {});
+    return run;
+  }, []);
+
+  // Prediction submissions are the highest-frequency, highest-concurrency
+  // write in the app — many contestants could submit around the same
+  // deadline. Rather than trusting this browser's possibly-stale in-memory
+  // copy of `predictions` (which would silently clobber anyone else's
+  // submission since the last time this tab loaded data), this re-reads the
+  // predictions key immediately before writing and merges on top of
+  // whatever is actually latest there.
+  const submitPredictions = useCallback((newEntries) => {
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const latest = await window.storage.get(PREDICTIONS_KEY, true);
+        const latestPredictions = latest && latest.value ? JSON.parse(latest.value).predictions : {};
+        const mergedPredictions = { ...latestPredictions, ...newEntries };
+        await window.storage.set(PREDICTIONS_KEY, JSON.stringify({ predictions: mergedPredictions }), true);
+        setSaveError(null);
+        setData((prev) => (prev ? { ...prev, predictions: mergedPredictions } : prev));
+        return true;
+      } catch {
+        // Genuinely couldn't reach storage — don't show the prediction as
+        // submitted, since it wasn't. Leave the draft as the contestant typed
+        // it so they can see something's wrong and try again.
+        setSaveError("Your prediction didn't save — check your connection and try again.");
+        return false;
+      }
+    });
+    persistQueueRef.current = run.catch(() => {});
+    return run;
+  }, []);
+
+  const restoreSnapshot = useCallback(async (snapshotData) => {
+    return persist(snapshotData);
+  }, [persist]);
+
+  if (!data) {
+    return (
+      <div className="min-h-[500px] w-full flex items-center justify-center bg-stone-100 text-stone-700">
+        <div className="flex flex-col items-center gap-4">
+          <Logo className="h-24 w-auto object-contain" />
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Loader2 className="animate-spin" size={16} /> Loading…
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <AuthScreen
+        data={data}
+        persist={persist}
+        onLogin={(user) => { setCurrentUser(user); setLeagueKey(user.leagueKey); }}
+        snapshots={snapshots}
+        onRestoreSnapshot={restoreSnapshot}
+        saveError={saveError}
+        setSaveError={setSaveError}
+      />
+    );
+  }
+
+  const activeLeagueKeys = enabledLeagueKeys(data);
+  const safeLeagueKey = data.leagues[leagueKey]?.enabled ? leagueKey : (activeLeagueKeys[0] ?? "league1");
+  const league = data.leagues[safeLeagueKey];
+  // A logged-in contestant is only ever "themselves" in the league they
+  // registered for — browsing the other league is read-only (no submit).
+  const viewerId = safeLeagueKey === currentUser.leagueKey ? currentUser.participantId : "";
+
+  return (
+    <div className="min-h-[700px] w-full bg-stone-100 text-stone-900" style={{ fontFamily: "'Inter', ui-sans-serif, system-ui, sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Anton&family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
+        .font-display { font-family: 'Oswald', ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }
+        .font-score { font-family: 'Anton', ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.01em; }
+        .font-mono-num { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+        ::-webkit-scrollbar { height: 8px; width: 8px; }
+        ::-webkit-scrollbar-thumb { background: #C7CFC0; border-radius: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+      `}</style>
+
+      <div style={{ background: "#3D1F5C" }} className="w-full">
+        <Header data={data} leagueKey={safeLeagueKey} />
+
+        {/* League switcher */}
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 flex gap-2 pb-2 flex-wrap">
+          {activeLeagueKeys.map((k) => (
+            <button
+              key={k}
+              onClick={() => { setLeagueKey(k); setGlobalView(null); }}
+              className={cx(
+                "px-4 py-2 rounded-xl border text-sm font-display font-semibold flex items-center gap-2 transition-colors",
+                !globalView && safeLeagueKey === k ? "bg-amber-400 text-black border-amber-400" : "border-white/20 text-stone-200 hover:border-white/40"
+              )}
+            >
+              {data.leagues[k].name}
+              <span className={cx("text-xs px-1.5 py-0.5 rounded-full", !globalView && safeLeagueKey === k ? "bg-black/20" : "bg-white/10")}>
+                {data.leagues[k].participants.length}/{data.leagues[k].maxParticipants}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        {/* Honours / History — deliberately separate from the division tabs above: these cover every division at once. */}
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 flex gap-2 pb-4 flex-wrap border-t border-white/10 pt-3">
+          <button
+            onClick={() => setGlobalView(globalView === "honours" ? null : "honours")}
+            className={cx(
+              "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5 transition-colors",
+              globalView === "honours" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+            )}
+          >
+            <Trophy size={13} /> Honours
+          </button>
+          <button
+            onClick={() => setGlobalView(globalView === "history" ? null : "history")}
+            className={cx(
+              "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5 transition-colors",
+              globalView === "history" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+            )}
+          >
+            <History size={13} /> History
+          </button>
+        </div>
+      </div>
+
+      {saveError && (
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-4">
+          <div className="flex items-center gap-2 bg-rose-50 border border-rose-300 text-rose-700 text-sm rounded-lg px-4 py-2.5">
+            <AlertCircle size={16} className="shrink-0" />
+            <span className="flex-1">{saveError}</span>
+            <button onClick={() => setSaveError(null)} className="text-rose-500 hover:text-rose-700 shrink-0"><X size={15} /></button>
+          </div>
+        </div>
+      )}
+
+      {/* Identity / admin control bar */}
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex flex-wrap items-center gap-3 text-sm">
+        <div className="flex items-center gap-2 bg-white border border-stone-200 rounded-lg px-3 py-1.5">
+          <UserCircle2 size={14} className="text-amber-400" />
+          <span className="text-stone-500">Signed in as</span>
+          <span className="font-medium text-stone-900">{currentUser.name}</span>
+          <span className="text-stone-500">· {data.leagues[currentUser.leagueKey].name}</span>
+          <button onClick={() => setCurrentUser(null)} className="ml-1 text-stone-500 hover:text-rose-600" title="Log out">
+            <LogOut size={14} />
+          </button>
+        </div>
+        <AdminGate data={data} adminMode={adminMode} setAdminMode={setAdminMode} persist={persist} />
+      </div>
+
+      {globalView === "honours" ? (
+        <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><HonoursView data={data} adminMode={adminMode} persist={persist} /></main>
+      ) : globalView === "history" ? (
+        <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><HistoryView data={data} adminMode={adminMode} persist={persist} /></main>
+      ) : (
+        <AppTabs
+          league={league}
+          leagueKey={safeLeagueKey}
+          data={data}
+          persist={persist}
+          submitPredictions={submitPredictions}
+          viewerId={viewerId}
+          adminMode={adminMode}
+          now={now}
+          snapshots={snapshots}
+          onRestoreSnapshot={restoreSnapshot}
+          allowSubmit
+        />
+      )}
+
+      <footer className="max-w-6xl mx-auto px-4 sm:px-6 pb-10 pt-4 text-xs text-stone-500 border-t border-stone-200/60 mt-6 space-y-1">
+        <p>Data is shared — everyone opening this site sees the same leagues, fixtures and scores.</p>
+        <p>
+          Passwords are salted and hashed (SHA-256) before they're ever saved — never stored in plain text. That
+          said, the login check runs in your browser rather than behind server-side authentication, so it's honest
+          security for a friendly league among people who trust each other, not the guarantees of a full
+          production auth system with rate-limiting, session tokens, etc. The admin PIN is a separate, simpler
+          gate on top.
+        </p>
+        {loadError && <p>The database wasn't reachable this session, so changes will only last until you reload.</p>}
+      </footer>
+    </div>
+  );
+}
+
+function Header({ data, leagueKey }) {
+  const league = data.leagues[leagueKey];
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const leader = board[0];
+  return (
+    <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-10 pb-6 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+      <div>
+        <div className="flex items-center gap-2 text-amber-400/90 text-xs font-semibold tracking-[0.2em] uppercase mb-2">
+          <Sparkles size={14} /> Live scoring room · Season {data.seasonLabel}
+        </div>
+        <Logo className="h-16 sm:h-20 w-auto object-contain -ml-2" />
+        <p className="text-stone-300 mt-1 text-sm">Predict scorelines, watch the table move — up to {league.matchdays[0] ? maxMatchPoints(league.matchdays[0].scoring) : 6} pts per match.</p>
+      </div>
+      {leader && leader.leaguePoints > 0 && (
+        <div className="flex items-center gap-3 bg-white/10 border border-amber-400/30 rounded-xl px-4 py-3">
+          <Crown className="text-amber-400" size={28} />
+          <div>
+            <div className="text-[11px] uppercase tracking-wider text-amber-300/80 font-semibold">{league.name} leader</div>
+            <div className="font-display font-bold text-lg leading-tight text-white">{leader.name}</div>
+            <div className="font-mono-num text-amber-300 text-sm">{leader.leaguePoints} pts <span className="text-stone-300">({leader.wins}-{leader.draws}-{leader.losses})</span></div>
+          </div>
+        </div>
+      )}
+    </header>
+  );
+}
+
+function AdminGate({ data, adminMode, setAdminMode, persist }) {
+  const [entering, setEntering] = useState(false);
+  const [pin, setPin] = useState("");
+  const [err, setErr] = useState("");
+
+  if (adminMode) {
+    return (
+      <button
+        onClick={() => setAdminMode(false)}
+        className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-300/30 text-emerald-700 rounded-lg px-3 py-1.5 font-medium"
+      >
+        <Unlock size={14} /> Admin mode on
+      </button>
+    );
+  }
+  if (entering) {
+    const tryUnlock = () => {
+      if (pin === data.adminPin) {
+        setAdminMode(true);
+        setEntering(false);
+        setErr("");
+        setPin("");
+      } else {
+        setErr("Wrong PIN");
+      }
+    };
+    return (
+      <div className="flex items-center gap-2">
+        <input
+          autoFocus
+          type="password"
+          value={pin}
+          onChange={(e) => setPin(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && tryUnlock()}
+          placeholder="Admin PIN"
+          className="bg-white border border-stone-300 rounded-lg px-3 py-1.5 text-sm w-28 focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        />
+        <button onClick={tryUnlock} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 font-medium">Unlock</button>
+        <button onClick={() => { setEntering(false); setErr(""); }} className="text-stone-500 hover:text-stone-700"><X size={16} /></button>
+        {err && <span className="text-rose-600 text-xs">{err}</span>}
+      </div>
+    );
+  }
+  return (
+    <button
+      onClick={() => setEntering(true)}
+      className="flex items-center gap-1.5 border border-stone-300 text-stone-700 hover:border-stone-400 rounded-lg px-3 py-1.5 font-medium"
+    >
+      <ShieldCheck size={14} /> Admin mode
+    </button>
+  );
+}
+
+function LockedAdminNotice() {
+  return (
+    <div className="flex flex-col items-center justify-center text-center py-16 text-stone-500 gap-2">
+      <Lock size={28} className="text-stone-400" />
+      <p className="font-medium">Admin mode is off.</p>
+      <p className="text-sm max-w-sm">Unlock it with the PIN above to manage fixtures, enter outcomes, or edit scoring rules.</p>
+    </div>
+  );
+}
+
+function TabButton({ icon: Icon, label, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={cx(
+        "flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap",
+        active ? "border-amber-400 text-amber-300" : "border-transparent text-stone-300 hover:text-white"
+      )}
+    >
+      <Icon size={16} /> {label}
+    </button>
+  );
+}
+
+// Shared tab nav + content switcher — used both by the normal logged-in app
+// (with Submit available, viewerId set to the logged-in contestant) and by
+// the PIN-only "admin access" panel on the login screen (no Submit tab,
+// since there's no contestant identity there, but everything else — the
+// Matrix, Standings, Profiles, Stats and Admin panel itself — is the same).
+function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId, adminMode, now, snapshots, onRestoreSnapshot, allowSubmit }) {
+  const [tab, setTab] = useState(allowSubmit ? "submit" : "matrix");
+  return (
+    <>
+      <nav style={{ background: "#3D1F5C" }} className="border-b border-white/10 sticky top-0 z-20">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 flex gap-1 overflow-x-auto">
+          {allowSubmit && <TabButton icon={Send} label="Submit" active={tab === "submit"} onClick={() => setTab("submit")} />}
+          <TabButton icon={BarChart3} label="Predictions Matrix" active={tab === "matrix"} onClick={() => setTab("matrix")} />
+          <TabButton icon={Calendar} label="Fixture List" active={tab === "fixtures"} onClick={() => setTab("fixtures")} />
+          <TabButton icon={Settings2} label="Outcomes & Admin" active={tab === "admin"} onClick={() => setTab("admin")} />
+          <TabButton icon={Trophy} label="Standings" active={tab === "leaderboard"} onClick={() => setTab("leaderboard")} />
+          <TabButton icon={UserCircle2} label="Profiles" active={tab === "profiles"} onClick={() => setTab("profiles")} />
+          <TabButton icon={TrendingUp} label="Stats" active={tab === "stats"} onClick={() => setTab("stats")} />
+        </div>
+      </nav>
+
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+        {allowSubmit && tab === "submit" && (
+          <SubmitView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} submitPredictions={submitPredictions} persist={persist} />
+        )}
+        {tab === "matrix" && (
+          <MatrixView league={league} data={data} viewerId={viewerId} adminMode={adminMode} now={now} />
+        )}
+        {tab === "fixtures" && <FixtureListView league={league} viewerId={viewerId} />}
+        {tab === "admin" && (
+          adminMode
+            ? <AdminView league={league} leagueKey={leagueKey} data={data} persist={persist} snapshots={snapshots} onRestoreSnapshot={onRestoreSnapshot} now={now} />
+            : <LockedAdminNotice />
+        )}
+        {tab === "leaderboard" && <LeaderboardView league={league} data={data} />}
+        {tab === "profiles" && <ProfilesView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} adminMode={adminMode} persist={persist} />}
+        {tab === "stats" && <StatsView league={league} leagueKey={leagueKey} data={data} />}
+      </main>
+    </>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// SUBMIT VIEW
+// -----------------------------------------------------------------------------
+function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, persist }) {
+  const [draft, setDraft] = useState({});
+  const [customDraft, setCustomDraft] = useState({}); // matchdayId -> { home, away }
+  const [confirmation, setConfirmation] = useState(null);
+  const [error, setError] = useState("");
+
+  const openMatchdays = league.matchdays.filter((md) => matchdayDisplayStatus(md) === "open");
+  const participant = league.participants.find((p) => p.id === viewerId);
+
+  useEffect(() => {
+    const next = {};
+    openMatchdays.forEach((md) =>
+      (viewerId ? effectiveMatchesFor(md, viewerId) : md.matches).forEach((m) => {
+        const existing = data.predictions[`${m.id}__${viewerId}`];
+        next[m.id] = existing ? { home: String(existing.home), away: String(existing.away) } : { home: "", away: "" };
+      })
+    );
+    setDraft(next);
+    setConfirmation(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewerId, league]);
+
+  const setField = (matchId, side, val) =>
+    setDraft((d) => ({ ...d, [matchId]: { ...d[matchId], [side]: val } }));
+
+  const validPair = (pair) =>
+    pair && pair.home !== "" && pair.away !== "" && Number(pair.home) >= 0 && Number(pair.away) >= 0 &&
+    Number.isInteger(Number(pair.home)) && Number.isInteger(Number(pair.away));
+
+  const submitMatch = async (matchId) => {
+    if (!viewerId) { setError("You're not registered in this league, so this can't be saved."); return; }
+    const pair = draft[matchId];
+    if (!validPair(pair)) { setError("Enter a whole-number score for both teams."); return; }
+    setError("");
+    const ok = await submitPredictions({
+      [`${matchId}__${viewerId}`]: { home: Number(pair.home), away: Number(pair.away), submittedAt: new Date().toISOString() },
+    });
+    if (ok) setConfirmation("Prediction saved.");
+  };
+
+  const submitMatchday = async (md) => {
+    if (!viewerId) { setError("You're not registered in this league, so this can't be saved."); return; }
+    const matches = effectiveMatchesFor(md, viewerId);
+    const bad = matches.some((m) => !validPair(draft[m.id]));
+    if (bad) { setError(`Fill in a score for all 3 matches in ${md.label} first.`); return; }
+    setError("");
+    const newEntries = {};
+    matches.forEach((m) => {
+      const pair = draft[m.id];
+      newEntries[`${m.id}__${viewerId}`] = { home: Number(pair.home), away: Number(pair.away), submittedAt: new Date().toISOString() };
+    });
+    const ok = await submitPredictions(newEntries);
+    if (ok) setConfirmation(`Submitted all 3 predictions for ${md.label}.`);
+  };
+
+  const saveCustomMatch = async (md) => {
+    const draftEntry = customDraft[md.id] || { home: "", away: "" };
+    if (!draftEntry.home.trim() || !draftEntry.away.trim()) { setError("Enter both team names for your own match."); return; }
+    setError("");
+    const nextMatchdays = league.matchdays.map((m) =>
+      m.id === md.id
+        ? { ...m, customMatches: { ...(m.customMatches || {}), [viewerId]: { home: draftEntry.home.trim(), away: draftEntry.away.trim(), outcome: null } } }
+        : m
+    );
+    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
+  };
+
+  return (
+    <div className="space-y-6">
+      {!viewerId && (
+        <div className="flex items-center gap-2 bg-amber-400/10 border border-amber-400/30 text-amber-300 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> You're not a registered contestant in {league.name}, so you can look around but not submit here.
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+      {confirmation && (
+        <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-300/30 text-emerald-700 text-sm rounded-lg px-3 py-2">
+          <CheckCircle2 size={16} /> {confirmation}
+        </div>
+      )}
+
+      {openMatchdays.length === 0 && (
+        <p className="text-stone-500 text-sm">No matchdays are currently open for predictions in {league.name}.</p>
+      )}
+
+      {openMatchdays.map((md) => {
+        const myPairing = viewerId && md.pairings ? md.pairings.pairings.find((p) => p.home === viewerId || p.away === viewerId) : null;
+        const opponentId = myPairing ? (myPairing.home === viewerId ? myPairing.away : myPairing.home) : null;
+        const opponentName = opponentId ? league.participants.find((p) => p.id === opponentId)?.name : null;
+        const isBye = viewerId && md.pairings?.bye === viewerId;
+        const hostId = myPairing ? myPairing.home : null;
+        const hostStadium = hostId ? league.participants.find((p) => p.id === hostId)?.stadium : null;
+        const hasFreeSlot = md.freeMatchIndex !== null && md.freeMatchIndex !== undefined;
+        const isHomeInPairing = myPairing && myPairing.home === viewerId;
+        const myCustomMatch = myPairing ? md.customMatches?.[myPairing.home] : null;
+        const matches = viewerId ? effectiveMatchesFor(md, viewerId) : md.matches;
+        const cDraft = customDraft[md.id] || { home: "", away: "" };
+        return (
+        <section key={md.id} className="bg-white border border-stone-200 rounded-2xl p-5">
+          <div className="flex items-center justify-between flex-wrap gap-2 mb-1">
+            <h2 className="font-display font-semibold text-lg flex items-center gap-2">
+              {md.label}
+              {md.scheduledDate && <span className="text-xs font-normal normal-case text-violet-700 flex items-center gap-1"><Calendar size={12} /> {fmtDateOnly(md.scheduledDate)}</span>}
+            </h2>
+            <span className="text-xs text-stone-500 flex items-center gap-1"><Calendar size={13} /> reveals {fmtDateTime(md.releaseAt)}</span>
+          </div>
+          {(opponentName || isBye) && (
+            <p className="text-xs text-amber-300 mb-4 flex items-center gap-1">
+              <Trophy size={12} /> {isBye ? "You have a bye this matchday — automatic win." : `Head-to-head this matchday: vs ${opponentName}`}
+              {hostStadium && <span className="text-stone-500 flex items-center gap-1">· <Landmark size={11} /> {hostStadium}</span>}
+            </p>
+          )}
+          {!opponentName && !isBye && <div className="mb-4" />}
+          <div className="space-y-3">
+            {matches.map((m, idx) => {
+              const isFreeSlot = hasFreeSlot && idx === md.freeMatchIndex && isHomeInPairing;
+
+              // The home contestant hasn't chosen their own match yet — show
+              // the picker instead of a normal prediction row. Their
+              // opponent always sees the admin's pre-determined match here,
+              // unaffected by this — so this branch only ever applies to
+              // the home contestant.
+              if (isFreeSlot && !myCustomMatch) {
+                return (
+                  <div key={`free-${md.id}`} className="border border-amber-400/30 bg-amber-400/5 rounded-xl p-4 space-y-2">
+                    <div className="text-xs font-semibold text-amber-300 uppercase tracking-wide flex items-center gap-1.5"><Landmark size={12} /> Your home match — pick your own</div>
+                    <p className="text-[11px] text-stone-500">
+                      {leagueKey === "league1"
+                        ? "You can only change this match to another Premier League match."
+                        : "You can change this match to any match from the Premier League down to the National League."}
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        value={cDraft.home}
+                        onChange={(e) => setCustomDraft((d) => ({ ...d, [md.id]: { ...cDraft, home: e.target.value } }))}
+                        placeholder="Home team"
+                        className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                      />
+                      <span className="text-stone-500 text-xs">v</span>
+                      <input
+                        value={cDraft.away}
+                        onChange={(e) => setCustomDraft((d) => ({ ...d, [md.id]: { ...cDraft, away: e.target.value } }))}
+                        placeholder="Away team"
+                        className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                      />
+                      <button onClick={() => saveCustomMatch(md)} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
+                        Set match
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+
+              const already = viewerId && data.predictions[`${m.id}__${viewerId}`];
+              const pair = draft[m.id] || { home: "", away: "" };
+              return (
+                <div key={m.id} className="border border-stone-200 rounded-xl p-4 bg-white">
+                  <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+                    <div className="text-xs text-stone-500 flex items-center gap-1">
+                      {isFreeSlot ? <><Landmark size={12} /> Your own match</> : <><Clock size={12} /> {fmtDateTime(m.kickoff)}</>}
+                    </div>
+                    {already && <span className="text-xs text-emerald-700 flex items-center gap-1 font-medium"><CheckCircle2 size={13} /> submitted</span>}
+                  </div>
+                  <div className="flex items-center justify-center gap-3">
+                    <span className="flex-1 text-right font-medium truncate">{m.home}</span>
+                    <ScoreInput value={pair.home} onChange={(v) => setField(m.id, "home", v)} />
+                    <span className="text-stone-500 font-mono-num">–</span>
+                    <ScoreInput value={pair.away} onChange={(v) => setField(m.id, "away", v)} />
+                    <span className="flex-1 text-left font-medium truncate">{m.away}</span>
+                  </div>
+                  <div className="flex justify-end mt-3">
+                    <button onClick={() => submitMatch(m.id)} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">Save</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <button
+            onClick={() => submitMatchday(md)}
+            className="mt-4 w-full sm:w-auto flex items-center justify-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-5 py-2.5 text-sm"
+          >
+            <Send size={16} /> Submit all 3 for {md.label}
+          </button>
+        </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function ScoreInput({ value, onChange }) {
+  return (
+    <input
+      type="number"
+      min="0"
+      step="1"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="w-14 text-center bg-white border border-stone-300 rounded-lg px-2 py-1.5 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+    />
+  );
+}
+
+// -----------------------------------------------------------------------------
+// MATRIX VIEW — respects the reveal date
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// FIXTURE LIST — the whole season's head-to-head schedule, visible to every
+// contestant so they can see who they're facing every matchday, including
+// rounds that haven't happened yet. Cross-references real matchdays where
+// they exist (for status/label); rounds with no matchday yet still show
+// the pairing on its own.
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// HONOURS & HISTORY — global pages, deliberately separate from the
+// division-scoped tabs. Both are built entirely from data.seasonArchives,
+// so they need nothing extra tracked season to season — ending a season
+// (see endSeason()) already captures everything they need.
+// -----------------------------------------------------------------------------
+// Given a legacy honour entry, resolves the winner's live name/badge from
+// the current roster if it's linked to one (so a badge update later still
+// shows correctly here), falling back to the plain text originally entered
+// if it isn't linked, or the linked contestant no longer exists.
+function resolveLegacyWinner(entry, data) {
+  if (entry.linkedParticipantId) {
+    for (const league of Object.values(data.leagues)) {
+      const p = league.participants.find((x) => x.id === entry.linkedParticipantId);
+      if (p) return { name: p.name, badge: p.badge || null };
+    }
+  }
+  return { name: entry.winnerName, badge: null };
+}
+
+function LegacyHonourForm({ data, onAdd, onCancel }) {
+  const [competition, setCompetition] = useState("");
+  const [season, setSeason] = useState("");
+  const [winnerName, setWinnerName] = useState("");
+  const [linkedId, setLinkedId] = useState("");
+
+  const allParticipants = Object.entries(data.leagues).flatMap(([key, league]) =>
+    league.participants.map((p) => ({ id: p.id, name: p.name, leagueName: league.name, leagueKey: key }))
+  );
+
+  const handleLinkChange = (id) => {
+    setLinkedId(id);
+    const match = allParticipants.find((p) => p.id === id);
+    if (match) setWinnerName(match.name);
+  };
+
+  const submit = () => {
+    if (!competition.trim() || !season.trim() || !winnerName.trim()) return;
+    onAdd({
+      id: `legacy_${Date.now()}`,
+      competition: competition.trim(),
+      season: season.trim(),
+      winnerName: winnerName.trim(),
+      linkedParticipantId: linkedId || null,
+    });
+    setCompetition(""); setSeason(""); setWinnerName(""); setLinkedId("");
+  };
+
+  return (
+    <div className="border border-amber-400/30 bg-amber-400/5 rounded-2xl p-4 space-y-3">
+      <h4 className="font-display font-semibold text-sm">Add a legacy honour</h4>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className="text-xs text-stone-500">Tournament / competition name</label>
+          <input value={competition} onChange={(e) => setCompetition(e.target.value)} placeholder="e.g. Premier League" className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <div>
+          <label className="text-xs text-stone-500">Season</label>
+          <input value={season} onChange={(e) => setSeason(e.target.value)} placeholder="e.g. 2011/12" className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <div>
+          <label className="text-xs text-stone-500">Link to a current contestant (optional)</label>
+          <select value={linkedId} onChange={(e) => handleLinkChange(e.target.value)} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50">
+            <option value="">— not on the current roster —</option>
+            {allParticipants.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.leagueName})</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-xs text-stone-500">Winner's name</label>
+          <input value={winnerName} onChange={(e) => setWinnerName(e.target.value)} placeholder="Winner name" className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <span className="text-[11px] text-stone-500">Auto-filled when you link a contestant above — edit freely if they're not on the roster.</span>
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <button onClick={submit} className="bg-amber-400 hover:bg-amber-300 text-black font-semibold rounded-lg px-4 py-2 text-sm">Add honour</button>
+        <button onClick={onCancel} className="text-sm text-stone-500 hover:text-stone-900 px-2">Close</button>
+      </div>
+    </div>
+  );
+}
+
+function HonoursView({ data, adminMode, persist }) {
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState(null);
+  const visibleArchives = [...data.seasonArchives].filter((s) => adminMode || !s.hidden).reverse(); // most recent season first
+  const legacyHonours = [...(data.legacyHonours || [])].sort((a, b) => {
+    const ya = parseInt((a.season.match(/\d{4}/) || ["0"])[0], 10);
+    const yb = parseInt((b.season.match(/\d{4}/) || ["0"])[0], 10);
+    return yb - ya;
+  });
+
+  const addLegacyHonour = async (entry) => {
+    await persist({ ...data, legacyHonours: [...(data.legacyHonours || []), entry] });
+    setShowAddForm(false);
+  };
+  const removeLegacyHonour = async (id) => {
+    await persist({ ...data, legacyHonours: (data.legacyHonours || []).filter((h) => h.id !== id) });
+  };
+  const toggleSeasonHidden = async (seasonId) => {
+    const nextArchives = data.seasonArchives.map((s) => (s.id === seasonId ? { ...s, hidden: !s.hidden } : s));
+    await persist({ ...data, seasonArchives: nextArchives });
+  };
+  const deleteSeasonArchive = async (seasonId) => {
+    const nextArchives = data.seasonArchives.filter((s) => s.id !== seasonId);
+    await persist({ ...data, seasonArchives: nextArchives });
+    setPendingDeleteId(null);
+  };
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Trophy size={18} className="text-amber-400" /> Honours</h2>
+        <p className="text-xs text-stone-500">Champions and podium finishers from every completed season, across every division.</p>
+      </div>
+
+      {visibleArchives.length === 0 ? (
+        <p className="text-stone-500 text-sm">No seasons have been completed on this site yet — this section fills in once a season ends.</p>
+      ) : (
+        visibleArchives.map((season) => (
+          <div key={season.id} className="space-y-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <h3 className="font-display font-semibold text-sm text-violet-800">
+                {season.label} <span className="text-stone-400 font-normal normal-case">ended {fmtDateTime(season.endedAt)}</span>
+                {season.hidden && <span className="ml-2 text-[10px] uppercase tracking-wide text-stone-400 border border-stone-300 rounded-full px-2 py-0.5">Hidden from contestants</span>}
+              </h3>
+              {adminMode && pendingDeleteId !== season.id && (
+                <div className="flex items-center gap-3 text-xs">
+                  <button onClick={() => toggleSeasonHidden(season.id)} className="text-stone-500 hover:text-stone-900 flex items-center gap-1">
+                    {season.hidden ? <><Eye size={12} /> Unhide</> : <><EyeOff size={12} /> Hide</>}
+                  </button>
+                  <button onClick={() => setPendingDeleteId(season.id)} className="text-stone-500 hover:text-rose-600 flex items-center gap-1">
+                    <Trash2 size={12} /> Delete
+                  </button>
+                </div>
+              )}
+            </div>
+            {pendingDeleteId === season.id && (
+              <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/40 rounded-lg px-3 py-2">
+                <span className="text-xs text-rose-700">Permanently delete {season.label}'s honours record? This can't be undone — it won't affect anything else, just this entry.</span>
+                <button onClick={() => deleteSeasonArchive(season.id)} className="ml-auto text-xs bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded px-2 py-1 shrink-0">Yes, delete</button>
+                <button onClick={() => setPendingDeleteId(null)} className="text-xs text-stone-500 hover:text-stone-900 shrink-0">Cancel</button>
+              </div>
+            )}
+            <div className="grid sm:grid-cols-2 gap-4">
+              {Object.values(season.leagues).map((leagueArchive) => {
+                const badgeById = Object.fromEntries(leagueArchive.participants.map((p) => [p.id, p.badge]));
+                const podium = leagueArchive.finalStandings.slice(0, 3);
+                return (
+                  <div key={leagueArchive.name} className="border border-stone-200 rounded-2xl bg-white overflow-hidden">
+                    <div style={{ background: "#3D1F5C" }} className="px-4 py-2">
+                      <span className="font-display font-semibold text-sm text-amber-300">{leagueArchive.name}</span>
+                    </div>
+                    <div className="p-4 space-y-3">
+                      {podium.length === 0 && <p className="text-xs text-stone-400">No results recorded.</p>}
+                      {podium.map((row, i) => (
+                        <div key={row.id} className="flex items-center gap-3">
+                          {i === 0 ? <Crown size={18} className="text-amber-400 shrink-0" /> : <Medal size={18} className={cx("shrink-0", i === 1 ? "text-stone-400" : "text-orange-400")} />}
+                          {badgeById[row.id] ? (
+                            <img src={badgeById[row.id]} alt="" className="w-7 h-7 rounded-full border border-stone-200 object-contain shrink-0" />
+                          ) : (
+                            <div className="w-7 h-7 rounded-full bg-stone-100 border border-stone-200 shrink-0" />
+                          )}
+                          <span className="font-medium flex-1 truncate">{row.name}</span>
+                          <span className="text-xs font-mono-num text-stone-500">{row.leaguePoints ?? row.totalPoints} pts</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))
+      )}
+
+      <div className="space-y-3 border-t border-stone-200 pt-6">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <h3 className="font-display font-semibold text-sm text-stone-600">Before this site — prior honours</h3>
+          {adminMode && !showAddForm && (
+            <button onClick={() => setShowAddForm(true)} className="flex items-center gap-1.5 text-xs bg-stone-200 hover:bg-stone-300 rounded-lg px-3 py-1.5 font-medium">
+              <Plus size={13} /> Add legacy honour
+            </button>
+          )}
+        </div>
+
+        {adminMode && showAddForm && <LegacyHonourForm data={data} onAdd={addLegacyHonour} onCancel={() => setShowAddForm(false)} />}
+
+        {legacyHonours.length === 0 ? (
+          <p className="text-xs text-stone-500">No honours recorded from before this site yet{adminMode ? " — add them above." : "."}</p>
+        ) : (
+          <div className="border border-stone-200 rounded-2xl bg-white overflow-hidden">
+            <table className="min-w-full text-sm">
+              <tbody>
+                {legacyHonours.map((entry) => {
+                  const winner = resolveLegacyWinner(entry, data);
+                  return (
+                    <tr key={entry.id} className="border-t border-stone-100 first:border-t-0">
+                      <td className="px-4 py-2.5 font-mono-num text-stone-400 w-24">{entry.season}</td>
+                      <td className="px-4 py-2.5 text-stone-700">{entry.competition}</td>
+                      <td className="px-4 py-2.5">
+                        <div className="flex items-center gap-2">
+                          {winner.badge ? (
+                            <img src={winner.badge} alt="" className="w-5 h-5 rounded-full border border-stone-200 object-contain shrink-0" />
+                          ) : (
+                            <Crown size={14} className="text-amber-400 shrink-0" />
+                          )}
+                          <span className="font-medium">{winner.name}</span>
+                        </div>
+                      </td>
+                      {adminMode && (
+                        <td className="px-4 py-2.5 text-right">
+                          <button onClick={() => removeLegacyHonour(entry.id)} className="text-stone-400 hover:text-rose-600"><X size={14} /></button>
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HistoryView({ data, adminMode, persist }) {
+  const [editing, setEditing] = useState(false);
+  const [textDraft, setTextDraft] = useState(data.historyPage.text);
+  const [saved, setSaved] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [imageError, setImageError] = useState("");
+  const fileInputRef = useRef(null);
+  const MAX_HISTORY_IMAGES = 30; // a comfortable safety margin so this page's storage bucket stays a sensible size
+
+  const saveText = async () => {
+    await persist({ ...data, historyPage: { ...data.historyPage, text: textDraft } });
+    setEditing(false);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  const addImage = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (data.historyPage.images.length >= MAX_HISTORY_IMAGES) {
+      setImageError(`This page is capped at ${MAX_HISTORY_IMAGES} photos to keep it a sensible size — remove one before adding another.`);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+    setImageError("");
+    setUploading(true);
+    try {
+      const url = await resizeImageFile(file, 640);
+      const nextImages = [...data.historyPage.images, { id: `hist_${Date.now()}`, url, caption: "" }];
+      await persist({ ...data, historyPage: { ...data.historyPage, images: nextImages } });
+    } catch {
+      /* best-effort — a failed image shouldn't break the page */
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const setCaption = async (id, caption) => {
+    const nextImages = data.historyPage.images.map((img) => (img.id === id ? { ...img, caption } : img));
+    await persist({ ...data, historyPage: { ...data.historyPage, images: nextImages } });
+  };
+
+  const removeImage = async (id) => {
+    const nextImages = data.historyPage.images.filter((img) => img.id !== id);
+    await persist({ ...data, historyPage: { ...data.historyPage, images: nextImages } });
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <h2 className="font-display font-semibold text-lg flex items-center gap-2"><History size={18} className="text-amber-400" /> History</h2>
+          <p className="text-xs text-stone-500">The story of the competition, in Admin's own words.</p>
+        </div>
+        {adminMode && !editing && (
+          <button onClick={() => { setTextDraft(data.historyPage.text); setEditing(true); }} className="flex items-center gap-1.5 text-xs bg-stone-200 hover:bg-stone-300 rounded-lg px-3 py-1.5 font-medium">
+            <UserCircle2 size={13} /> Edit text
+          </button>
+        )}
+      </div>
+
+      <div className="border border-stone-200 rounded-2xl bg-white p-5">
+        {editing ? (
+          <div className="space-y-3">
+            <textarea
+              value={textDraft}
+              onChange={(e) => setTextDraft(e.target.value)}
+              rows={14}
+              placeholder="Write the history of the competition here…"
+              className="w-full bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+            />
+            <div className="flex gap-2">
+              <button onClick={saveText} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+                {saved ? <CheckCircle2 size={16} /> : null} Save
+              </button>
+              <button onClick={() => setEditing(false)} className="text-sm text-stone-500 hover:text-stone-900 px-2">Cancel</button>
+            </div>
+          </div>
+        ) : data.historyPage.text.trim() ? (
+          <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{data.historyPage.text}</p>
+        ) : (
+          <p className="text-sm text-stone-400 italic">Nothing written yet{adminMode ? " — click \"Edit text\" above to get started." : "."}</p>
+        )}
+      </div>
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <h3 className="font-display font-semibold text-sm text-stone-600">Photos</h3>
+          {adminMode && (
+            <>
+              <button onClick={() => fileInputRef.current?.click()} disabled={uploading} className="flex items-center gap-1.5 text-xs bg-stone-200 hover:bg-stone-300 disabled:opacity-50 rounded-lg px-3 py-1.5 font-medium">
+                <Camera size={13} /> {uploading ? "Uploading…" : "Add photo"}
+              </button>
+              <input ref={fileInputRef} type="file" accept="image/*" onChange={addImage} className="hidden" />
+            </>
+          )}
+        </div>
+        {imageError && (
+          <div className="flex items-center gap-2 bg-amber-400/10 border border-amber-400/30 text-amber-700 text-sm rounded-lg px-3 py-2">
+            <AlertCircle size={16} className="shrink-0" /> {imageError}
+          </div>
+        )}
+
+        {data.historyPage.images.length === 0 ? (
+          <p className="text-xs text-stone-500">No photos added yet{adminMode ? " — add some above to bring the history to life." : "."}</p>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {data.historyPage.images.map((img) => (
+              <div key={img.id} className="border border-stone-200 rounded-2xl bg-white overflow-hidden">
+                <img src={img.url} alt={img.caption || ""} className="w-full h-40 object-cover" />
+                <div className="p-3 space-y-2">
+                  {adminMode ? (
+                    <input
+                      value={img.caption}
+                      onChange={(e) => setCaption(img.id, e.target.value)}
+                      placeholder="Caption (optional)"
+                      className="w-full bg-stone-50 border border-stone-300 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                    />
+                  ) : (
+                    img.caption && <p className="text-xs text-stone-600">{img.caption}</p>
+                  )}
+                  {adminMode && (
+                    <button onClick={() => removeImage(img.id)} className="text-[11px] text-stone-400 hover:text-rose-600 flex items-center gap-1">
+                      <X size={11} /> Remove photo
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FixtureListView({ league, viewerId }) {
+  const nameById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.name])), [league.participants]);
+  const stadiumById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.stadium])), [league.participants]);
+
+  if (league.h2hSchedule.length === 0) {
+    return (
+      <div className="space-y-4">
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Calendar size={18} className="text-amber-400" /> {league.name} fixture list</h2>
+        <p className="text-stone-500 text-sm">The season fixture list hasn't been generated yet — check back once the admin sets it up.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Calendar size={18} className="text-amber-400" /> {league.name} fixture list</h2>
+      <p className="text-xs text-stone-500">The whole season's head-to-head match-ups, matchday by matchday. Your own is highlighted. Matchdays not yet set up by the admin still show who you're due to face.</p>
+
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {league.h2hSchedule.map((round, i) => {
+          // Matchdays are always created in round order and never reordered
+          // or deleted, so round i lines up directly with matchdays[i].
+          const md = league.matchdays[i] && !league.matchdays[i].draft ? league.matchdays[i] : null;
+          const label = md?.label ?? `Matchday ${i + 1}`;
+          const statusText = md ? matchdayDisplayStatus(md) : "not yet scheduled";
+          const statusStyle = md ? MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(md)] : "bg-white/5 text-stone-500 border-stone-300 border-dashed";
+          return (
+            <div key={i} className="border border-stone-200 rounded-xl p-3 bg-white">
+              <div className="flex items-center justify-between mb-1">
+                <span className="font-display font-semibold text-sm">{label}</span>
+                <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", statusStyle)}>
+                  {statusText}
+                </span>
+              </div>
+              <div className="text-[11px] text-violet-700 flex items-center gap-1 mb-2">
+                <Calendar size={11} /> {fmtDateOnly(round.scheduledDate) ?? "Date to be confirmed"}
+              </div>
+              <div className="space-y-1">
+                {round.pairings.map((p, j) => {
+                  const mine = viewerId && (p.home === viewerId || p.away === viewerId);
+                  const stadium = stadiumById[p.home];
+                  return (
+                    <div key={j} className={cx("text-xs rounded px-2 py-1", mine ? "bg-amber-400/10 text-amber-300 font-medium" : "text-stone-500")}>
+                      <div>{nameById[p.home] ?? "?"} v {nameById[p.away] ?? "?"}</div>
+                      {stadium && <div className="text-[10px] opacity-70 flex items-center gap-1 mt-0.5"><Landmark size={10} /> {stadium}</div>}
+                    </div>
+                  );
+                })}
+                {round.bye && (
+                  <div className={cx("text-xs rounded px-2 py-1", viewerId === round.bye ? "bg-amber-400/10 text-amber-300 font-medium" : "text-stone-500")}>
+                    Bye: {nameById[round.bye] ?? "?"}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function MatrixView({ league, data, viewerId, adminMode, now }) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const boardById = useMemo(() => Object.fromEntries(board.map((r) => [r.id, r])), [board]);
+  const nameById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.name])), [league.participants]);
+
+  // Rows: participants ordered by accumulated points so far (highest first),
+  // matching the leaderboard's ranking.
+  const participants = league.participants
+    .filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
+    .slice()
+    .sort((a, b) => (boardById[b.id]?.totalPoints ?? 0) - (boardById[a.id]?.totalPoints ?? 0));
+
+  const matchdays = league.matchdays
+    .filter((md) => adminMode || !md.draft)
+    .filter((md) => statusFilter === "all" || matchdayDisplayStatus(md, adminMode) === statusFilter);
+
+  return (
+    <div className="space-y-8">
+      <div className="flex flex-wrap gap-3 items-center justify-between">
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><BarChart3 size={18} className="text-amber-400" /> Predictions Matrix — {league.name}</h2>
+        <div className="flex gap-2 flex-wrap">
+          <div className="relative">
+            <Search size={15} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-500" />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search participant" className="bg-white border border-stone-300 rounded-lg pl-8 pr-3 py-1.5 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </div>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="bg-white border border-stone-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50">
+            <option value="all">All matchdays</option>
+            <option value="open">Open</option>
+            <option value="locked">Locked</option>
+            <option value="completed">Completed</option>
+            {adminMode && <option value="draft">Draft</option>}
+            {adminMode && <option value="pending publish">Pending publish</option>}
+          </select>
+        </div>
+      </div>
+
+      {matchdays.map((md) => {
+        const released = adminMode || isReleased(md, now);
+        return (
+          <div key={md.id} className="space-y-2">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <h3 className="font-display font-semibold">{md.label}</h3>
+                {md.scheduledDate && <span className="text-xs font-normal normal-case text-violet-700 flex items-center gap-1"><Calendar size={12} /> {fmtDateOnly(md.scheduledDate)}</span>}
+                <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(md, adminMode)])}>
+                  {matchdayDisplayStatus(md, adminMode)}
+                </span>
+              </div>
+              <span className={cx("text-xs flex items-center gap-1", released ? "text-emerald-600" : "text-stone-500")}>
+                {released ? <Eye size={13} /> : <EyeOff size={13} />}
+                {released ? "revealed to everyone" : `hides other picks until ${fmtDateTime(md.releaseAt)}`}
+              </span>
+            </div>
+            {md.pairings && (
+              <div className="border border-stone-200 rounded-xl px-3 py-2 bg-stone-50">
+                <div className="text-[11px] text-stone-500 uppercase tracking-wide mb-1">Head-to-head pairings this matchday</div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                  {md.pairings.pairings.map((p, i) => {
+                    const mine = viewerId && (p.home === viewerId || p.away === viewerId);
+                    const stadium = nameById[p.home] && league.participants.find((x) => x.id === p.home)?.stadium;
+                    return (
+                      <span key={i} className={mine ? "text-amber-300 font-medium" : "text-stone-700"}>
+                        {nameById[p.home] ?? "?"} v {nameById[p.away] ?? "?"}
+                        {stadium && <span className="opacity-70"> · {stadium}</span>}
+                      </span>
+                    );
+                  })}
+                  {md.pairings.bye && (
+                    <span className={viewerId === md.pairings.bye ? "text-amber-300 font-medium" : "text-stone-500"}>
+                      Bye: {nameById[md.pairings.bye] ?? "?"}
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+            {released && md.blog && md.blog.trim() && (
+              <div className="border border-amber-400/20 bg-amber-400/5 rounded-2xl p-4">
+                <h4 className="text-xs font-semibold text-amber-300 uppercase tracking-wide mb-2">Matchday blog</h4>
+                <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.blog}</p>
+              </div>
+            )}
+            <div className="overflow-x-auto border border-stone-200 rounded-2xl">
+              <table className="min-w-full text-sm">
+                <thead>
+                  <tr style={{ background: "#3D1F5C" }}>
+                    <th className="text-left px-4 py-3 font-semibold sticky left-0 z-10 min-w-[160px] text-amber-300" style={{ background: "#3D1F5C" }}>Contestant</th>
+                    <th className="text-right px-3 py-3 font-semibold min-w-[70px] text-amber-300">Pts</th>
+                    {md.matches.map((m, idx) => {
+                      const isFreeCol = md.freeMatchIndex === idx;
+                      return (
+                        <th key={m.id} className="text-center px-3 py-3 font-semibold min-w-[130px] text-amber-300">
+                          {isFreeCol ? (
+                            <div className="flex flex-col items-center gap-0.5">
+                              <span>Match {idx + 1}</span>
+                              <span className="text-stone-300 font-normal normal-case text-[10px]" title="Each pairing's home contestant may have swapped this for their own match">varies by contestant</span>
+                            </div>
+                          ) : (
+                            <>
+                              <div>{m.home}</div>
+                              <div className="text-stone-300 font-normal normal-case text-[11px]">v {m.away}</div>
+                              {m.outcome && (adminMode || md.resultsPublished) && <div className="text-amber-300 font-mono-num text-[11px] mt-0.5">{m.outcome.home}–{m.outcome.away}</div>}
+                            </>
+                          )}
+                        </th>
+                      );
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {participants.map((p, idx) => (
+                    <tr key={p.id} className={cx("border-t border-stone-200", idx % 2 === 0 ? "bg-white" : "bg-transparent")}>
+                      <td className="px-4 py-3 sticky left-0 bg-inherit backdrop-blur z-10">
+                        <div className="flex items-center gap-2 font-medium">
+                          <span className="text-stone-500 font-mono-num text-xs">#{boardById[p.id]?.rank ?? "–"}</span>
+                          {p.name}
+                        </div>
+                      </td>
+                      <td className="px-3 py-3 text-right font-mono-num text-amber-300 font-semibold">{boardById[p.id]?.totalPoints ?? 0}</td>
+                      {md.matches.map((defaultMatch, colIdx) => {
+                        const isFreeCol = md.freeMatchIndex === colIdx;
+                        // Each row's actual match at this slot — the default
+                        // fixture, unless this row's contestant is a pairing's
+                        // home contestant who's swapped it for their own.
+                        const m = isFreeCol ? effectiveMatchesFor(md, p.id)[colIdx] : defaultMatch;
+                        const pred = data.predictions[`${m.id}__${p.id}`];
+                        const isSelf = p.id === viewerId;
+                        const canSeeValue = released || isSelf;
+                        const status = cellStatus(md, !!pred);
+                        const Icon = STATUS_ICON[status];
+                        return (
+                          <td key={defaultMatch.id} className="px-3 py-3 text-center">
+                            {isFreeCol && (
+                              <div className="text-[10px] text-stone-500 leading-tight mb-1">
+                                {m.home} v {m.away}
+                                {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
+                              </div>
+                            )}
+                            <span className={cx("inline-flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-medium", STATUS_STYLES[status])}>
+                              <Icon size={12} />
+                              {status === "submitted" ? (canSeeValue ? `${pred.home}–${pred.away}` : "Submitted") : status[0].toUpperCase() + status.slice(1)}
+                            </span>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {released && <MatchStatsPanel matchday={md} predictions={data.predictions} />}
+          </div>
+        );
+      })}
+      {matchdays.length === 0 && <p className="text-stone-500 text-sm">No matchdays match this filter.</p>}
+    </div>
+  );
+}
+
+// Aggregate stats for one match: how contestants split across home/draw/away,
+// and the average scoreline predicted (simple mean of submitted home/away
+// goal counts). Only ever rendered once a matchday is revealed.
+function computeMatchStats(match, predictions) {
+  const preds = Object.entries(predictions)
+    .filter(([key]) => key.startsWith(`${match.id}__`))
+    .map(([, v]) => v);
+  const total = preds.length;
+  const counts = { home: 0, draw: 0, away: 0 };
+  let sumHome = 0, sumAway = 0;
+  preds.forEach((p) => {
+    counts[resultOf(p.home, p.away)] += 1;
+    sumHome += p.home;
+    sumAway += p.away;
+  });
+  const pct = (n) => (total > 0 ? Math.round((n / total) * 1000) / 10 : 0);
+  return {
+    total,
+    home: { count: counts.home, pct: pct(counts.home) },
+    draw: { count: counts.draw, pct: pct(counts.draw) },
+    away: { count: counts.away, pct: pct(counts.away) },
+    avgHome: total > 0 ? Math.round((sumHome / total) * 10) / 10 : null,
+    avgAway: total > 0 ? Math.round((sumAway / total) * 10) / 10 : null,
+  };
+}
+
+function MatchStatsPanel({ matchday, predictions }) {
+  const statsMatches = matchday.matches.filter((_, idx) => idx !== matchday.freeMatchIndex);
+  return (
+    <div className="border border-stone-200 rounded-2xl p-4 bg-white">
+      <h4 className="text-xs font-semibold text-stone-500 uppercase tracking-wide mb-3 flex items-center gap-1.5"><BarChart3 size={13} /> What the league predicted</h4>
+      {matchday.freeMatchIndex !== null && matchday.freeMatchIndex !== undefined && (
+        <p className="text-[11px] text-stone-500 mb-3">The free match slot is skipped here — it's a different fixture for each home contestant, so it can't be summarized as one match.</p>
+      )}
+      <div className="grid sm:grid-cols-3 gap-4">
+        {statsMatches.map((m) => {
+          const stats = computeMatchStats(m, predictions);
+          return (
+            <div key={m.id} className="space-y-2">
+              <div className="text-xs font-medium truncate">{m.home} v {m.away}</div>
+              {stats.total === 0 ? (
+                <p className="text-xs text-stone-500">No predictions yet.</p>
+              ) : (
+                <>
+                  {[
+                    ["Home win", stats.home, "bg-amber-400"],
+                    ["Draw", stats.draw, "bg-zinc-400"],
+                    ["Away win", stats.away, "bg-zinc-600"],
+                  ].map(([label, s, barColor]) => (
+                    <div key={label}>
+                      <div className="flex justify-between text-[11px] text-stone-500 mb-0.5">
+                        <span>{label}</span>
+                        <span className="font-mono-num">{s.count} · {s.pct}%</span>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-stone-200 overflow-hidden">
+                        <div className={cx("h-full rounded-full", barColor)} style={{ width: `${s.pct}%` }} />
+                      </div>
+                    </div>
+                  ))}
+                  <p className="text-[11px] text-stone-500 pt-1">
+                    Average predicted scoreline: <span className="font-mono-num text-stone-700">{stats.avgHome}–{stats.avgAway}</span> ({stats.total} prediction{stats.total === 1 ? "" : "s"})
+                  </p>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// ADMIN VIEW
+// -----------------------------------------------------------------------------
+// Shows exactly how full each of the app's storage buckets actually is,
+// computed live from the real current data — so admin can see a problem
+// coming (and know exactly where) rather than finding out only when a save
+// fails. The 5MB figure is a conservative safety guide carried over from
+// the old platform — the database behind this site doesn't enforce a hard
+// per-key cap, but keeping each bucket under it keeps saves fast and
+// payload sizes sensible.
+const STORAGE_KEY_LIMIT_BYTES = 5 * 1024 * 1024;
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function StorageUsageCard({ data }) {
+  const split = splitData(data);
+  const buckets = [
+    ["Core settings", split.core],
+    ["Accounts", split.accountsBlob],
+    ["Roster", split.rosterBlob],
+    ["Profile photos", split.photosBlob],
+    ["Predictions", split.predictionsBlob],
+    ["Season archives", split.archivesBlob],
+    ["Badges", split.badgesBlob],
+    ["History page", split.historyBlob],
+  ].map(([label, blob]) => {
+    const bytes = new Blob([JSON.stringify(blob)]).size;
+    return { label, bytes, pct: Math.min(100, (bytes / STORAGE_KEY_LIMIT_BYTES) * 100) };
+  });
+  const fullest = buckets.reduce((max, b) => (b.pct > max.pct ? b : max), buckets[0]);
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5 space-y-3">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><BarChart3 size={18} className="text-amber-400" /> Storage usage</h2>
+      <p className="text-xs text-stone-500">
+        Each part of the app's data is saved separately. The {formatBytes(STORAGE_KEY_LIMIT_BYTES)} figure is a conservative guide rather than a hard database limit — this shows exactly how full each bucket really is, right now, so you can see a problem coming instead of finding out when a save slows down.
+      </p>
+      {fullest.pct >= 70 && (
+        <div className="flex items-center gap-2 bg-amber-400/10 border border-amber-400/30 text-amber-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} className="shrink-0" />
+          <span>{fullest.label} is at {fullest.pct.toFixed(0)}% of its guide limit — worth keeping an eye on, and reducing what's in it if you can (removing photos, or hiding/deleting old season honours, both help).</span>
+        </div>
+      )}
+      <div className="space-y-2.5">
+        {buckets.map((b) => (
+          <div key={b.label}>
+            <div className="flex items-center justify-between text-xs mb-1">
+              <span className="text-stone-600">{b.label}</span>
+              <span className="font-mono-num text-stone-500">{formatBytes(b.bytes)} / {formatBytes(STORAGE_KEY_LIMIT_BYTES)}</span>
+            </div>
+            <div className="h-2 rounded-full bg-stone-100 overflow-hidden">
+              <div
+                className={cx("h-full rounded-full", b.pct >= 90 ? "bg-rose-500" : b.pct >= 70 ? "bg-amber-400" : "bg-violet-600")}
+                style={{ width: `${Math.max(2, b.pct)}%` }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BackupsCard({ data, snapshots, onRestoreSnapshot, onDownload, onImportBackup, now }) {
+  const [restoringId, setRestoringId] = useState(null);
+  const [pendingRestoreId, setPendingRestoreId] = useState(null);
+  const [justDownloaded, setJustDownloaded] = useState(false);
+  const [importFile, setImportFile] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importMsg, setImportMsg] = useState(null); // { type: "ok" | "err", text }
+  const importInputRef = useRef(null);
+
+  const hoursSinceExport = data.lastManualExportAt ? (now - data.lastManualExportAt) / (60 * 60 * 1000) : Infinity;
+  const needsReminder = hoursSinceExport > EXPORT_REMINDER_MS / (60 * 60 * 1000);
+
+  const download = async () => {
+    await onDownload();
+    setJustDownloaded(true);
+    setTimeout(() => setJustDownloaded(false), 2000);
+  };
+
+  const confirmRestore = (snapshot) => {
+    setPendingRestoreId(snapshot.timestamp);
+    setRestoringId(snapshot.timestamp);
+    onRestoreSnapshot(snapshot.data).finally(() => {
+      setRestoringId(null);
+      setPendingRestoreId(null);
+    });
+  };
+
+  const handleImportFilePicked = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportFile(file);
+    setImportMsg(null);
+  };
+
+  const cancelImport = () => {
+    setImportFile(null);
+    setImportMsg(null);
+    if (importInputRef.current) importInputRef.current.value = "";
+  };
+
+  const confirmImport = async () => {
+    if (!importFile) return;
+    setImportBusy(true);
+    setImportMsg(null);
+    try {
+      const ok = await onImportBackup(importFile);
+      if (ok) {
+        setImportMsg({ type: "ok", text: "Backup restored — everything in the file is now live for everyone." });
+        setImportFile(null);
+      } else {
+        setImportMsg({ type: "err", text: "The backup was read fine, but saving it didn't go through — check your connection and try again." });
+      }
+    } catch (err) {
+      setImportMsg({ type: "err", text: err?.message || "That file couldn't be restored." });
+    } finally {
+      setImportBusy(false);
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  };
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5 space-y-4">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><ShieldCheck size={18} className="text-amber-400" /> Backups & data safety</h2>
+
+      {needsReminder && (
+        <div className="flex items-center gap-2 bg-amber-400/10 border border-amber-400/30 text-amber-300 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} />
+          {data.lastManualExportAt
+            ? "It's been over 72 hours since your last manual backup — worth downloading a fresh one."
+            : "You haven't downloaded a manual backup yet — worth grabbing one now."}
+        </div>
+      )}
+
+      <div>
+        <p className="text-xs text-stone-500 mb-2">
+          Downloads the entire app's data (every division, every prediction, all accounts) as a JSON file to your device — the only copy that lives fully outside this app.
+        </p>
+        <button onClick={download} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+          {justDownloaded ? <CheckCircle2 size={16} /> : null} Download full backup now
+        </button>
+        <p className="text-xs text-stone-500 mt-2">
+          Last manual backup: {data.lastManualExportAt ? fmtDateTime(new Date(data.lastManualExportAt).toISOString()) : "never"}
+        </p>
+      </div>
+
+      <div className="border-t border-stone-200 pt-4">
+        <p className="text-xs text-stone-500 mb-2">
+          Restore from a downloaded backup file — replaces <strong>everything</strong> currently in the app (all divisions, predictions, accounts, honours and history) with the file's contents. This is also how league data from the old version of this app gets imported: download a backup there, then restore it here.
+        </p>
+        <button onClick={() => importInputRef.current?.click()} disabled={importBusy} className="flex items-center gap-2 border border-violet-700/40 text-violet-700 hover:bg-violet-700/5 disabled:opacity-50 font-semibold rounded-lg px-4 py-2 text-sm">
+          <Upload size={15} /> Restore from backup file
+        </button>
+        <input ref={importInputRef} type="file" accept="application/json,.json" onChange={handleImportFilePicked} className="hidden" />
+        {importFile && (
+          <div className="mt-2 flex items-center gap-2 bg-amber-400/5 border border-amber-400/20 rounded-lg px-3 py-2 flex-wrap">
+            <span className="text-xs text-amber-700">
+              Overwrite ALL current data with <span className="font-mono-num">{importFile.name}</span>? This can't be undone — if in doubt, download a fresh backup above first.
+            </span>
+            <button
+              onClick={confirmImport}
+              disabled={importBusy}
+              className="ml-auto text-xs bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-black font-semibold rounded px-2 py-1 shrink-0"
+            >
+              {importBusy ? "Restoring…" : "Yes, restore this file"}
+            </button>
+            <button onClick={cancelImport} disabled={importBusy} className="text-xs text-stone-500 hover:text-stone-900 shrink-0">Cancel</button>
+          </div>
+        )}
+        {importMsg && (
+          <div className={cx(
+            "mt-2 flex items-center gap-2 text-sm rounded-lg px-3 py-2 border",
+            importMsg.type === "ok" ? "bg-emerald-50 border-emerald-300/30 text-emerald-700" : "bg-rose-50 border-rose-300/30 text-rose-700"
+          )}>
+            {importMsg.type === "ok" ? <CheckCircle2 size={16} className="shrink-0" /> : <AlertCircle size={16} className="shrink-0" />}
+            {importMsg.text}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <p className="text-xs text-stone-500 mb-2">
+          Automatic snapshots (taken at most once every 24h, whenever someone has the app open — up to the last {MAX_SNAPSHOTS} are kept). These live inside the same storage as everything else, so they protect against mistakes, not against the storage itself failing.
+        </p>
+        {snapshots.length === 0 ? (
+          <p className="text-xs text-stone-500">No automatic snapshots yet — one will be taken the next time the app is open, 24h after it was first set up.</p>
+        ) : (
+          <div className="space-y-2">
+            {[...snapshots].reverse().map((s) => {
+              const isPending = pendingRestoreId === s.timestamp;
+              const isRestoring = restoringId === s.timestamp;
+              return (
+                <div key={s.timestamp} className="border border-stone-200 rounded-xl px-3 py-2 bg-stone-50">
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm font-mono-num text-stone-700">{fmtDateTime(new Date(s.timestamp).toISOString())}</span>
+                    {!isPending && (
+                      <button
+                        onClick={() => setPendingRestoreId(s.timestamp)}
+                        disabled={restoringId !== null}
+                        className="ml-auto text-xs text-stone-500 hover:text-amber-300 disabled:opacity-50"
+                      >
+                        Restore this snapshot
+                      </button>
+                    )}
+                  </div>
+                  {isPending && (
+                    <div className="mt-2 flex items-center gap-2 bg-amber-400/5 border border-amber-400/20 rounded-lg px-3 py-2">
+                      <span className="text-xs text-amber-300">Overwrite ALL current data with this snapshot? This can't be undone.</span>
+                      <button
+                        onClick={() => confirmRestore(s)}
+                        disabled={isRestoring}
+                        className="ml-auto text-xs bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-black font-semibold rounded px-2 py-1"
+                      >
+                        {isRestoring ? "Restoring…" : "Yes, restore"}
+                      </button>
+                      <button onClick={() => setPendingRestoreId(null)} disabled={isRestoring} className="text-xs text-stone-500 hover:text-stone-900">Cancel</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function SeasonCard({ data, persist }) {
+  const [label, setLabel] = useState(data.seasonLabel);
+  const [labelSaved, setLabelSaved] = useState(false);
+  const [ending, setEnding] = useState(false);
+  const [newLabel, setNewLabel] = useState(suggestNextSeasonLabel(data.seasonLabel));
+  const [busy, setBusy] = useState(false);
+  const [expandedArchiveId, setExpandedArchiveId] = useState(null);
+
+  const saveLabel = async () => {
+    if (!label.trim()) return;
+    await persist({ ...data, seasonLabel: label.trim() });
+    setLabelSaved(true);
+    setTimeout(() => setLabelSaved(false), 1500);
+  };
+
+  const confirmEndSeason = async () => {
+    if (!newLabel.trim()) return;
+    setBusy(true);
+    try {
+      const ok = await persist(endSeason(data, newLabel.trim()));
+      if (ok) setEnding(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const archives = [...(data.seasonArchives || [])].reverse();
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5 space-y-4">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Archive size={18} className="text-amber-400" /> Season</h2>
+
+      <div>
+        <label className="text-xs text-stone-500">Current season label</label>
+        <div className="flex gap-2 mt-1.5 max-w-xs">
+          <input value={label} onChange={(e) => setLabel(e.target.value)} className="flex-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <button onClick={saveLabel} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 text-sm font-medium">
+            {labelSaved ? <CheckCircle2 size={16} /> : "Save"}
+          </button>
+        </div>
+      </div>
+
+      {!ending ? (
+        <button
+          onClick={() => { setNewLabel(suggestNextSeasonLabel(data.seasonLabel)); setEnding(true); }}
+          className="flex items-center gap-2 border border-amber-400/40 text-amber-300 hover:bg-amber-400/10 rounded-lg px-4 py-2 text-sm font-medium"
+        >
+          <Archive size={15} /> End "{data.seasonLabel}" & start a new season
+        </button>
+      ) : (
+        <div className="border border-amber-400/30 bg-amber-400/5 rounded-xl p-4 space-y-3">
+          <p className="text-xs text-stone-700">
+            Archives every active division's full history from <strong>{data.seasonLabel}</strong> permanently, then resets live matchdays and standings to zero for the new season. Roster, logins and profiles carry over unchanged. Worth grabbing a manual backup above first, just in case.
+          </p>
+          <p className="text-xs text-stone-500">
+            Starting a new season is also a good moment to check the <strong>Divisions</strong> section below — turn on League One or League Two there if you need them for the season ahead, or adjust any division's contestant cap.
+          </p>
+          <div>
+            <label className="text-xs text-stone-500">New season label</label>
+            <input value={newLabel} onChange={(e) => setNewLabel(e.target.value)} placeholder="e.g. 2027-28" className="w-full mt-1 max-w-xs bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={confirmEndSeason}
+              disabled={busy || !newLabel.trim()}
+              className="flex items-center gap-2 bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-black font-semibold rounded-lg px-4 py-2 text-sm"
+            >
+              {busy ? "Archiving…" : "Confirm: archive & start new season"}
+            </button>
+            <button onClick={() => setEnding(false)} className="text-sm text-stone-500 hover:text-stone-900 px-3 py-2">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {archives.length > 0 && (
+        <div>
+          <h3 className="text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2 flex items-center gap-1.5"><History size={13} /> Past seasons</h3>
+          <div className="space-y-2">
+            {archives.map((season) => {
+              const expanded = expandedArchiveId === season.id;
+              return (
+                <div key={season.id} className="border border-stone-200 rounded-xl bg-stone-50 overflow-hidden">
+                  <button
+                    onClick={() => setExpandedArchiveId(expanded ? null : season.id)}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 text-left"
+                  >
+                    <span className="font-display font-semibold text-sm">{season.label}</span>
+                    <span className="text-xs text-stone-500">ended {fmtDateTime(season.endedAt)}</span>
+                    <span className="ml-auto text-xs text-stone-500">{expanded ? "Hide" : "View final standings"}</span>
+                  </button>
+                  {expanded && (
+                    <div className="px-3 pb-3 grid sm:grid-cols-2 gap-3">
+                      {Object.values(season.leagues).map((leagueArchive) => (
+                        <div key={leagueArchive.name} className="border border-stone-200 rounded-lg overflow-hidden">
+                          <div className="bg-white px-3 py-1.5 text-xs font-semibold">{leagueArchive.name}</div>
+                          <table className="min-w-full text-xs">
+                            <tbody>
+                              {leagueArchive.finalStandings.slice(0, 10).map((row) => (
+                                <tr key={row.id} className="border-t border-stone-200">
+                                  <td className="px-3 py-1.5 font-mono-num text-stone-500 w-10">#{row.rank}</td>
+                                  <td className="px-3 py-1.5">{row.name}</td>
+                                  <td className="px-3 py-1.5 text-right font-mono-num text-amber-300">{row.totalPoints}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Lets the admin choose which of the four possible divisions are in use,
+// and set each one's name and participant cap. Premier League is always
+// on. A division can't be turned off while it still has contestants on
+// its roster, so nobody's registration silently disappears.
+function DivisionsCard({ data, persist }) {
+  const [rows, setRows] = useState(() =>
+    LEAGUE_DEFS.map((def) => ({
+      key: def.key,
+      alwaysEnabled: def.alwaysEnabled,
+      enabled: data.leagues[def.key].enabled,
+      name: data.leagues[def.key].name,
+      maxParticipants: data.leagues[def.key].maxParticipants,
+      minParticipants: data.leagues[def.key].minParticipants ?? DEFAULT_MIN_PARTICIPANTS,
+    }))
+  );
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  // Read live from `data` on every render rather than caching it in `rows`
+  // state — the roster can change (contestants added or removed) while
+  // this card stays mounted, and a cached count would silently go stale.
+  const currentCountByKey = Object.fromEntries(LEAGUE_DEFS.map((def) => [def.key, data.leagues[def.key].participants.length]));
+
+  const updateRow = (key, patch) => setRows((rs) => rs.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+
+  const save = async () => {
+    for (const r of rows) {
+      const currentCount = currentCountByKey[r.key];
+      if (!r.enabled && currentCount > 0) {
+        setError(`Can't disable ${r.name} — it still has ${currentCount} contestant${currentCount === 1 ? "" : "s"} on its roster. Remove them first if you no longer need this division.`);
+        return;
+      }
+      if (r.enabled && r.maxParticipants < currentCount) {
+        setError(`${r.name}'s cap can't be set below its current roster size (${currentCount}).`);
+        return;
+      }
+      if (r.minParticipants < 1) {
+        setError(`${r.name}'s minimum needs to be at least 1.`);
+        return;
+      }
+      if (r.minParticipants > r.maxParticipants) {
+        setError(`${r.name}'s minimum can't be higher than its cap.`);
+        return;
+      }
+      if (!r.name.trim()) {
+        setError("Every enabled division needs a name.");
+        return;
+      }
+    }
+    setError("");
+    const nextLeagues = { ...data.leagues };
+    rows.forEach((r) => {
+      nextLeagues[r.key] = { ...nextLeagues[r.key], enabled: r.alwaysEnabled ? true : r.enabled, name: r.name.trim(), maxParticipants: r.maxParticipants, minParticipants: r.minParticipants };
+    });
+    await persist({ ...data, leagues: nextLeagues });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5 space-y-4">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Trophy size={18} className="text-amber-400" /> Divisions</h2>
+      <p className="text-xs text-stone-500">
+        Choose which divisions this competition uses, and each one's contestant cap and minimum. Premier League is always active. Turning a division on or off takes effect immediately — it isn't tied to season start/end.
+      </p>
+
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+
+      <div className="space-y-2">
+        {rows.map((r) => {
+          const currentCount = currentCountByKey[r.key];
+          return (
+          <div key={r.key} className="flex flex-wrap items-center gap-3 border border-stone-200 rounded-xl px-3 py-2 bg-stone-50">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={r.enabled}
+                disabled={r.alwaysEnabled}
+                onChange={(e) => updateRow(r.key, { enabled: e.target.checked })}
+                className="accent-violet-700"
+              />
+            </label>
+            <input
+              value={r.name}
+              onChange={(e) => updateRow(r.key, { name: e.target.value })}
+              disabled={!r.enabled}
+              className="bg-transparent font-medium text-sm focus:outline-none border-b border-transparent focus:border-stone-400 disabled:opacity-40 min-w-[160px]"
+            />
+            <div className="flex items-center gap-1.5 text-xs text-stone-500">
+              <span>Min:</span>
+              <input
+                type="number"
+                min={1}
+                value={r.minParticipants}
+                onChange={(e) => updateRow(r.key, { minParticipants: parseInt(e.target.value, 10) || 0 })}
+                disabled={!r.enabled}
+                className="w-16 bg-white border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50 disabled:opacity-40"
+              />
+            </div>
+            <div className="flex items-center gap-1.5 text-xs text-stone-500">
+              <span>Cap:</span>
+              <input
+                type="number"
+                min={currentCount}
+                value={r.maxParticipants}
+                onChange={(e) => updateRow(r.key, { maxParticipants: parseInt(e.target.value, 10) || 0 })}
+                disabled={!r.enabled}
+                className="w-16 bg-white border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50 disabled:opacity-40"
+              />
+            </div>
+            <span className="text-[11px] text-stone-500 ml-auto">{currentCount} on roster</span>
+          </div>
+          );
+        })}
+      </div>
+
+      <button onClick={save} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+        {saved ? <CheckCircle2 size={16} /> : null} Save divisions
+      </button>
+    </section>
+  );
+}
+
+function RoomSettingsCard({ currentPin, onUpdatePin }) {
+  const [pin, setPin] = useState(currentPin);
+  const [saved, setSaved] = useState(false);
+
+  const save = () => {
+    if (!pin.trim()) return;
+    onUpdatePin(pin.trim());
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5">
+      <h2 className="font-display font-semibold text-lg mb-3 flex items-center gap-2"><ShieldCheck size={18} className="text-amber-400" /> Room settings</h2>
+      <label className="text-xs text-stone-500">Admin PIN</label>
+      <div className="flex gap-2 mt-1.5 max-w-xs">
+        <input value={pin} onChange={(e) => setPin(e.target.value)} className="flex-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        <button onClick={save} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm">
+          {saved ? <CheckCircle2 size={16} /> : "Save"}
+        </button>
+      </div>
+      <p className="text-xs text-stone-500 mt-2">Whoever knows this PIN can enter admin mode — share it only with people who should manage fixtures and outcomes.</p>
+    </section>
+  );
+}
+
+// One roster entry: name, registration status, invite code, badge upload,
+// and admin actions. Badge upload reuses the same client-side resize used
+// for profile photos, so a big source image never bloats storage.
+function RosterRow({ participant, claimed, copied, copyFailed, onCopyCode, onRegenerateCode, pendingRemove, onRequestRemove, onConfirmRemove, onCancelRemove, onSetBadge, onSetStadium, onMoveLeague, moveOptions }) {
+  const fileInputRef = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const [stadiumDraft, setStadiumDraft] = useState(participant.stadium ?? "");
+
+  useEffect(() => { setStadiumDraft(participant.stadium ?? ""); }, [participant.id, participant.stadium]);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const dataUrl = await resizeImageFile(file, 200);
+      await onSetBadge(dataUrl);
+    } catch {
+      /* best-effort — badge upload failing shouldn't break the roster */
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div className="border border-stone-200 rounded-xl px-3 py-2 bg-stone-50">
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          title="Upload a badge"
+          className="w-9 h-9 rounded-full border border-stone-300 bg-white flex items-center justify-center overflow-hidden shrink-0 hover:border-amber-400/50"
+        >
+          {participant.badge ? (
+            <img src={participant.badge} alt="" className="w-full h-full object-contain" />
+          ) : (
+            <Camera size={13} className="text-stone-500" />
+          )}
+        </button>
+        <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
+        <span className="font-medium min-w-[100px]">{participant.name}</span>
+        <span className={cx(
+          "text-[10px] px-2 py-0.5 rounded-full border font-medium uppercase tracking-wide",
+          claimed ? "bg-emerald-50 text-emerald-700 border-emerald-300/30" : "bg-zinc-400/10 text-stone-500 border-zinc-500/30"
+        )}>
+          {claimed ? "Registered" : "Not registered"}
+        </span>
+        <code className="font-mono-num text-sm text-amber-300 bg-amber-400/5 border border-amber-400/20 rounded px-2 py-0.5 tracking-widest">{participant.code}</code>
+        <button onClick={onCopyCode} className={cx("text-xs hover:text-stone-900", copyFailed ? "text-rose-600" : "text-stone-500")}>
+          {copied ? "Copied!" : copyFailed ? "Couldn't copy — select the code above" : "Copy code"}
+        </button>
+        <button onClick={onRegenerateCode} className="text-xs text-stone-500 hover:text-stone-900" title="Invalidate the old code and issue a new one">
+          Regenerate
+        </button>
+        {moveOptions && moveOptions.length > 0 && (
+          moveOptions.length === 1 ? (
+            <button onClick={() => onMoveLeague(moveOptions[0].key)} className="text-xs text-stone-500 hover:text-stone-900" title={`Move to ${moveOptions[0].name}`}>
+              Move to {moveOptions[0].name}
+            </button>
+          ) : (
+            <select
+              defaultValue=""
+              onChange={(e) => { if (e.target.value) { onMoveLeague(e.target.value); e.target.value = ""; } }}
+              className="text-xs bg-transparent text-stone-500 hover:text-stone-900 border border-stone-300 rounded px-1.5 py-1"
+            >
+              <option value="">Move to…</option>
+              {moveOptions.map((opt) => <option key={opt.key} value={opt.key}>{opt.name}</option>)}
+            </select>
+          )
+        )}
+        {!pendingRemove && (
+          <button onClick={onRequestRemove} className="ml-auto text-stone-500 hover:text-rose-600"><X size={15} /></button>
+        )}
+        {uploading && <span className="text-[10px] text-stone-500">uploading…</span>}
+      </div>
+      <div className="flex items-center gap-1.5 mt-1.5 pl-[3rem]">
+        <Landmark size={11} className="text-stone-500 shrink-0" />
+        <input
+          value={stadiumDraft}
+          onChange={(e) => setStadiumDraft(e.target.value)}
+          onBlur={() => { if (stadiumDraft !== (participant.stadium ?? "")) onSetStadium(stadiumDraft.trim()); }}
+          placeholder="Home stadium (optional)"
+          className="text-xs bg-transparent text-stone-500 focus:text-stone-900 placeholder:text-stone-400 focus:outline-none border-b border-transparent focus:border-stone-400 w-52"
+        />
+      </div>
+      {pendingRemove && (
+        <div className="mt-2 flex items-center gap-2 bg-rose-50 border border-rose-300/20 rounded-lg px-3 py-2">
+          <span className="text-xs text-rose-700">
+            {claimed
+              ? `${participant.name} has already registered — removing them also deletes their account and every prediction they've made. This can't be undone.`
+              : `Remove ${participant.name} from the roster? This can't be undone.`}
+          </span>
+          <button onClick={onConfirmRemove} className="ml-auto text-xs bg-rose-600 hover:bg-rose-500 text-stone-900 font-semibold rounded px-2 py-1 shrink-0">
+            Yes, remove
+          </button>
+          <button onClick={onCancelRemove} className="text-xs text-stone-500 hover:text-stone-900 shrink-0">Cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Paste a list of names (one per line) to add many contestants at once —
+// much faster than the one-at-a-time form when setting up a roster from
+// scratch. Badges and per-person details still get added individually
+// afterwards, since there's no way to bulk-match uploaded files to names.
+function BulkAddParticipants({ disabled, onAdd }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [result, setResult] = useState(null);
+
+  const submit = async () => {
+    const names = text.split("\n").map((n) => n.trim()).filter(Boolean);
+    if (names.length === 0) return;
+    const added = await onAdd(names);
+    setResult(`Added ${added} of ${names.length} name${names.length === 1 ? "" : "s"}.`);
+    setText("");
+  };
+
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)} disabled={disabled} className="text-xs text-stone-500 hover:text-stone-900 mt-2 disabled:opacity-50">
+        + Bulk add multiple names at once
+      </button>
+    );
+  }
+
+  return (
+    <div className="mt-3 space-y-2 max-w-sm">
+      <label className="text-xs text-stone-500">One name per line</label>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={5}
+        placeholder={"Guthrie\nMarjolin\nJackson\n…"}
+        className="w-full bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+      />
+      {result && <p className="text-xs text-emerald-700">{result}</p>}
+      <div className="flex gap-2">
+        <button onClick={submit} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">Add all</button>
+        <button onClick={() => { setOpen(false); setResult(null); }} className="text-sm text-stone-500 hover:text-stone-900 px-2">Close</button>
+      </div>
+    </div>
+  );
+}
+
+function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnapshot, now }) {
+  const [showNewMatchday, setShowNewMatchday] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [copiedId, setCopiedId] = useState(null);
+  const [copyFailedId, setCopyFailedId] = useState(null);
+  const [pendingRemoveId, setPendingRemoveId] = useState(null);
+  const [moveError, setMoveError] = useState("");
+  const atCap = league.participants.length >= league.maxParticipants;
+  const claimedIds = useMemo(() => new Set(Object.values(data.accounts).map((a) => a.participantId)), [data.accounts]);
+
+  const updatePin = async (newPin) => {
+    await persist({ ...data, adminPin: newPin });
+  };
+
+  const downloadBackup = async () => {
+    const payload = JSON.stringify(data, null, 2);
+    const blob = new Blob([payload], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `plp-2026-27-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    await persist({ ...data, lastManualExportAt: Date.now() });
+  };
+
+  // Reads a backup JSON file (downloaded from this app — or from the old
+  // artifact version of it) and replaces ALL live data with its contents.
+  // Runs through the same migrateData() every load runs through, so older
+  // backups pick up any fields added since they were downloaded.
+  const importBackupFile = async (file) => {
+    let text;
+    try {
+      text = await file.text();
+    } catch {
+      throw new Error("That file couldn't be read — try selecting it again.");
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error("That file isn't valid JSON — make sure you're selecting a backup downloaded from this app.");
+    }
+    if (!parsed || typeof parsed !== "object" || !parsed.leagues || !parsed.predictions) {
+      throw new Error("That file doesn't look like a PLP backup — it's missing the leagues/predictions data a backup always contains.");
+    }
+    const migrated = migrateData(parsed);
+    return await persist(migrated);
+  };
+
+  const updateLeague = async (patch) => {
+    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, ...patch } } });
+  };
+
+  const addParticipant = async () => {
+    const trimmed = newName.trim();
+    if (!trimmed || atCap) return;
+    await updateLeague({ participants: [...league.participants, { id: `p_${Date.now()}`, name: trimmed, code: randomInviteCode() }] });
+    setNewName("");
+  };
+
+  const confirmRemoveParticipant = async (id) => {
+    const participant = league.participants.find((p) => p.id === id);
+    if (!participant) return;
+    const nextAccounts = Object.fromEntries(Object.entries(data.accounts).filter(([, acc]) => acc.participantId !== id));
+    const nextPredictions = Object.fromEntries(Object.entries(data.predictions).filter(([key]) => !key.endsWith(`__${id}`)));
+    await persist({
+      ...data,
+      accounts: nextAccounts,
+      predictions: nextPredictions,
+      leagues: { ...data.leagues, [leagueKey]: { ...league, participants: league.participants.filter((p) => p.id !== id) } },
+    });
+    setPendingRemoveId(null);
+  };
+
+  const regenerateCode = async (id) => {
+    await updateLeague({ participants: league.participants.map((p) => (p.id === id ? { ...p, code: randomInviteCode() } : p)) });
+  };
+
+  const copyCode = async (p) => {
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard API unavailable");
+      await navigator.clipboard.writeText(p.code);
+      setCopyFailedId(null);
+      setCopiedId(p.id);
+      setTimeout(() => setCopiedId(null), 1500);
+    } catch {
+      setCopiedId(null);
+      setCopyFailedId(p.id);
+      setTimeout(() => setCopyFailedId(null), 2500);
+    }
+  };
+
+  const setBadge = async (id, badge) => {
+    await updateLeague({ participants: league.participants.map((p) => (p.id === id ? { ...p, badge } : p)) });
+  };
+
+  const setStadium = async (id, stadium) => {
+    await updateLeague({ participants: league.participants.map((p) => (p.id === id ? { ...p, stadium } : p)) });
+  };
+
+  const otherLeagueKeys = enabledLeagueKeys(data).filter((k) => k !== leagueKey);
+  const moveToLeague = async (id, targetKey) => {
+    const participant = league.participants.find((p) => p.id === id);
+    if (!participant) return;
+    const targetLeague = data.leagues[targetKey];
+    if (targetLeague.participants.length >= targetLeague.maxParticipants) {
+      setMoveError(`${targetLeague.name} is already full (${targetLeague.maxParticipants}/${targetLeague.maxParticipants}).`);
+      return;
+    }
+    setMoveError("");
+    await persist({
+      ...data,
+      leagues: {
+        ...data.leagues,
+        [leagueKey]: { ...league, participants: league.participants.filter((p) => p.id !== id) },
+        [targetKey]: { ...targetLeague, participants: [...targetLeague.participants, participant] },
+      },
+    });
+  };
+
+  const bulkAddParticipants = async (names) => {
+    const room = league.maxParticipants - league.participants.length;
+    const toAdd = names.slice(0, room).map((name, i) => ({
+      id: `p_${Date.now()}_${i}`,
+      name,
+      code: randomInviteCode(),
+    }));
+    if (toAdd.length === 0) return 0;
+    await updateLeague({ participants: [...league.participants, ...toAdd] });
+    return toAdd.length;
+  };
+
+  const updateMatchday = async (mdId, patch) => {
+    await updateLeague({ matchdays: league.matchdays.map((md) => (md.id === mdId ? { ...md, ...patch } : md)) });
+  };
+
+  const addMatchday = async (md) => {
+    await updateLeague({ matchdays: [...league.matchdays, md] });
+    setShowNewMatchday(false);
+  };
+
+  const addFixtureToPool = async (home, away, kickoff) => {
+    await updateLeague({ fixturePool: [...league.fixturePool, { id: `f_${Date.now()}`, home, away, kickoff: kickoff || null }] });
+  };
+
+  const removeFixtureFromPool = async (id) => {
+    await updateLeague({ fixturePool: league.fixturePool.filter((f) => f.id !== id) });
+  };
+
+  const generateH2HSchedule = async () => {
+    const schedule = generateRoundRobinSchedule(league.participants.map((p) => p.id));
+    await updateLeague({ h2hSchedule: schedule });
+  };
+
+  const setRoundDate = async (index, date) => {
+    const nextSchedule = league.h2hSchedule.map((r, i) => (i === index ? { ...r, scheduledDate: date || null } : r));
+    await updateLeague({ h2hSchedule: nextSchedule });
+  };
+
+  const bulkSetDates = async (startDateStr, intervalDays) => {
+    if (!startDateStr) return;
+    const start = new Date(`${startDateStr}T00:00:00`);
+    const nextSchedule = league.h2hSchedule.map((r, i) => {
+      const d = new Date(start.getTime() + i * intervalDays * 24 * 60 * 60 * 1000);
+      return { ...r, scheduledDate: d.toISOString().slice(0, 10) };
+    });
+    await updateLeague({ h2hSchedule: nextSchedule });
+  };
+
+  const generateRandomMatchday = async () => {
+    if (league.fixturePool.length < 3) return;
+    const picked = [...league.fixturePool].sort(() => Math.random() - 0.5).slice(0, 3);
+    const pickedIds = new Set(picked.map((f) => f.id));
+    const roundIndex = league.matchdays.length;
+    const newMatchday = {
+      id: `md_${Date.now()}`,
+      label: `Matchday ${roundIndex + 1}`,
+      draft: true,
+      resultsPublished: false,
+      blog: "",
+      releaseAt: null,
+      locked: false,
+      scoring: { resultPoints: 3, homeGoalPoints: 1, awayGoalPoints: 1, marginPoints: 1 },
+      pairings: league.h2hSchedule[roundIndex] ?? null,
+      scheduledDate: league.h2hSchedule[roundIndex]?.scheduledDate ?? null,
+      freeMatchIndex: null,
+      customMatches: {},
+      matches: picked.map((f) => ({ id: f.id, home: f.home, away: f.away, kickoff: f.kickoff, outcome: null })),
+    };
+    await updateLeague({
+      fixturePool: league.fixturePool.filter((f) => !pickedIds.has(f.id)),
+      matchdays: [...league.matchdays, newMatchday],
+    });
+  };
+
+  return (
+    <div className="space-y-8">
+      <StorageUsageCard data={data} />
+      <BackupsCard data={data} snapshots={snapshots} onRestoreSnapshot={onRestoreSnapshot} onDownload={downloadBackup} onImportBackup={importBackupFile} now={now} />
+      <SeasonCard data={data} persist={persist} />
+      <DivisionsCard data={data} persist={persist} />
+      <RoomSettingsCard currentPin={data.adminPin} onUpdatePin={updatePin} />
+
+      {/* Participants */}
+      <section className="bg-white border border-stone-200 rounded-2xl p-5">
+        <h2 className="font-display font-semibold text-lg mb-1 flex items-center gap-2"><Users size={18} className="text-amber-400" /> {league.name} roster ({league.participants.length}/{league.maxParticipants})</h2>
+        <p className="text-xs text-stone-500 mb-4">Each contestant needs their own invite code to register — send it to them privately (not the whole list).</p>
+        {moveError && (
+          <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2 mb-4">
+            <AlertCircle size={16} /> {moveError}
+          </div>
+        )}
+        <div className="space-y-2 mb-4">
+          {league.participants.map((p) => (
+            <RosterRow
+              key={p.id}
+              participant={p}
+              claimed={claimedIds.has(p.id)}
+              copied={copiedId === p.id}
+              copyFailed={copyFailedId === p.id}
+              onCopyCode={() => copyCode(p)}
+              onRegenerateCode={() => regenerateCode(p.id)}
+              pendingRemove={pendingRemoveId === p.id}
+              onRequestRemove={() => setPendingRemoveId(p.id)}
+              onConfirmRemove={() => confirmRemoveParticipant(p.id)}
+              onCancelRemove={() => setPendingRemoveId(null)}
+              onSetBadge={(badge) => setBadge(p.id, badge)}
+              onSetStadium={(stadium) => setStadium(p.id, stadium)}
+              moveOptions={claimedIds.has(p.id) ? [] : otherLeagueKeys.map((k) => ({ key: k, name: data.leagues[k].name }))}
+              onMoveLeague={(targetKey) => moveToLeague(p.id, targetKey)}
+            />
+          ))}
+        </div>
+        <div className="flex gap-2 max-w-sm">
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addParticipant()}
+            disabled={atCap}
+            placeholder={atCap ? `Full — max ${league.maxParticipants}` : "Add a participant"}
+            className="flex-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm placeholder:text-stone-500 focus:outline-none focus:ring-2 focus:ring-violet-600/50 disabled:opacity-50"
+          />
+          <button onClick={addParticipant} disabled={atCap} className="flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50">
+            <Plus size={16} /> Add
+          </button>
+        </div>
+        <BulkAddParticipants disabled={atCap} onAdd={bulkAddParticipants} />
+      </section>
+
+      {/* Season-long head-to-head schedule */}
+      <H2HScheduleCard league={league} onGenerate={generateH2HSchedule} onSetRoundDate={setRoundDate} onBulkSetDates={bulkSetDates} />
+
+      {/* Fixture pool + random matchday generator */}
+      <FixturePoolCard
+        pool={league.fixturePool}
+        onAdd={addFixtureToPool}
+        onRemove={removeFixtureFromPool}
+        onGenerate={generateRandomMatchday}
+      />
+
+      {/* Matchdays */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Settings2 size={18} className="text-amber-400" /> Matchdays</h2>
+          <button onClick={() => setShowNewMatchday((s) => !s)} className="flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">
+            <Plus size={15} /> New matchday manually
+          </button>
+        </div>
+
+        {showNewMatchday && <NewMatchdayForm league={league} onCreate={addMatchday} onCancel={() => setShowNewMatchday(false)} />}
+
+        {league.matchdays.map((md) => (
+          <MatchdayAdminCard
+            key={md.id}
+            matchday={md}
+            participants={league.participants}
+            predictions={data.predictions}
+            onUpdate={(patch) => updateMatchday(md.id, patch)}
+          />
+        ))}
+      </section>
+    </div>
+  );
+}
+
+// Generates (or regenerates) the season-long head-to-head schedule: every
+// contestant plays every other contestant twice, home and away, in a
+// pre-set rotation — exactly like a normal football season's fixture list.
+// Each matchday, when created, pulls its pairings from the next unused
+// round of this schedule (see generateRandomMatchday / NewMatchdayForm).
+function H2HScheduleCard({ league, onGenerate, onSetRoundDate, onBulkSetDates }) {
+  const [confirmingRegenerate, setConfirmingRegenerate] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const [bulkStart, setBulkStart] = useState("");
+  const [bulkInterval, setBulkInterval] = useState(7);
+
+  const n = league.participants.length;
+  const minRequired = league.minParticipants ?? DEFAULT_MIN_PARTICIPANTS;
+  const hasBye = n % 2 !== 0;
+  const roundCount = n >= 2 ? 2 * (hasBye ? n : n - 1) : 0;
+  const hasSchedule = league.h2hSchedule.length > 0;
+  const nameById = Object.fromEntries(league.participants.map((p) => [p.id, p.name]));
+
+  const generate = async () => {
+    await onGenerate();
+    setConfirmingRegenerate(false);
+  };
+
+  const applyBulkDates = () => {
+    if (!bulkStart) return;
+    onBulkSetDates(bulkStart, Number(bulkInterval) || 7);
+  };
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5 space-y-3">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Trophy size={18} className="text-amber-400" /> Season fixture list (head-to-head)</h2>
+      <p className="text-xs text-stone-500">
+        Generates the whole season's head-to-head pairings at once — every contestant plays every other contestant twice (home and away). Each matchday you create afterwards automatically picks up the next round's pairings and date.
+      </p>
+
+      {hasSchedule ? (
+        <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-300/30 text-emerald-700 text-sm rounded-lg px-3 py-2">
+          <CheckCircle2 size={16} /> {league.h2hSchedule.length}-round schedule generated for {n} contestants.
+        </div>
+      ) : (
+        <p className="text-xs text-stone-500">No fixture list generated yet{n < minRequired ? ` — add at least ${minRequired} contestant${minRequired === 1 ? "" : "s"} first.` : "."}</p>
+      )}
+
+      {!hasSchedule && (
+        <button
+          onClick={generate}
+          disabled={n < minRequired}
+          className="flex items-center gap-2 bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-black font-display font-semibold rounded-lg px-4 py-2.5 text-sm"
+        >
+          <Trophy size={15} /> Generate {roundCount}-round fixture list
+        </button>
+      )}
+
+      {hasSchedule && !confirmingRegenerate && (
+        <button onClick={() => setConfirmingRegenerate(true)} className="text-xs text-stone-500 hover:text-stone-900">
+          Regenerate fixture list
+        </button>
+      )}
+      {confirmingRegenerate && (
+        <div className="flex items-center gap-2 bg-amber-400/5 border border-amber-400/20 rounded-lg px-3 py-2">
+          <span className="text-xs text-amber-300">
+            Regenerating replaces the {n}-contestant schedule going forward with a new {roundCount}-round one. Matchdays already created keep the pairings and dates they were given — only matchdays created after this will use the new schedule.
+          </span>
+          <button onClick={generate} className="ml-auto text-xs bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded px-2 py-1 shrink-0">Yes, regenerate</button>
+          <button onClick={() => setConfirmingRegenerate(false)} className="text-xs text-stone-500 hover:text-stone-900 shrink-0">Cancel</button>
+        </div>
+      )}
+
+      {hasSchedule && (
+        <div className="border-t border-stone-200 pt-3">
+          <label className="text-xs text-stone-400">Matchday dates for the season</label>
+          <p className="text-[11px] text-stone-500 mb-2">Set every round's date at once, then fine-tune individual ones below — visible to contestants in the Fixture List from day one, even before you've created that round's matches yet.</p>
+          <div className="flex flex-wrap items-end gap-2 mb-3">
+            <div>
+              <label className="text-[10px] text-stone-500">First matchday</label>
+              <input type="date" value={bulkStart} onChange={(e) => setBulkStart(e.target.value)} className="block bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            </div>
+            <div>
+              <label className="text-[10px] text-stone-500">Days between matchdays</label>
+              <input type="number" min="1" value={bulkInterval} onChange={(e) => setBulkInterval(e.target.value)} className="block w-24 bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            </div>
+            <button onClick={applyBulkDates} disabled={!bulkStart} className="bg-stone-200 hover:bg-stone-300 disabled:opacity-50 rounded-lg px-3 py-2 text-sm font-medium">
+              Fill all {league.h2hSchedule.length} dates
+            </button>
+          </div>
+
+          <button onClick={() => setExpanded((e) => !e)} className="text-xs text-stone-500 hover:text-stone-900">
+            {expanded ? "Hide" : "Show"} all {league.h2hSchedule.length} rounds & dates
+          </button>
+          {expanded && (
+            <div className="mt-2 max-h-80 overflow-y-auto space-y-2 pr-1">
+              {league.h2hSchedule.map((round, i) => (
+                <div key={i} className="text-xs border border-stone-200 rounded-lg px-3 py-2 bg-stone-50 flex flex-wrap items-center gap-3">
+                  <div className="min-w-[70px]">
+                    <div className="text-stone-500 font-medium">Round {i + 1}</div>
+                    <input
+                      type="date"
+                      value={round.scheduledDate ? round.scheduledDate.slice(0, 10) : ""}
+                      onChange={(e) => onSetRoundDate(i, e.target.value)}
+                      className="mt-1 bg-white border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                    />
+                  </div>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-stone-700">
+                    {round.pairings.map((p, j) => (
+                      <span key={j}>{nameById[p.home] ?? "?"} v {nameById[p.away] ?? "?"}</span>
+                    ))}
+                    {round.bye && <span className="text-stone-500">Bye: {nameById[round.bye] ?? "?"}</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function FixturePoolCard({ pool, onAdd, onRemove, onGenerate }) {
+  const [home, setHome] = useState("");
+  const [away, setAway] = useState("");
+  const [kickoff, setKickoff] = useState("");
+
+  const add = () => {
+    if (!home.trim() || !away.trim()) return;
+    onAdd(home.trim(), away.trim(), kickoff ? new Date(kickoff).toISOString() : null);
+    setHome(""); setAway(""); setKickoff("");
+  };
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5">
+      <h2 className="font-display font-semibold text-lg mb-1 flex items-center gap-2"><Sparkles size={18} className="text-amber-400" /> Fixture pool</h2>
+      <p className="text-xs text-stone-500 mb-4">Add the candidate matches for upcoming rounds here, then randomly draw 3 for the next matchday. Drawn fixtures are removed from the pool.</p>
+
+      <div className="space-y-2 mb-4">
+        {pool.length === 0 && <p className="text-xs text-stone-500">No fixtures in the pool yet — add some below.</p>}
+        {pool.map((f) => (
+          <div key={f.id} className="flex flex-wrap items-center gap-3 border border-stone-200 rounded-xl px-3 py-2 bg-stone-50">
+            <span className="text-sm">{f.home} <span className="text-stone-500">v</span> {f.away}</span>
+            {f.kickoff && <span className="text-xs text-stone-500 flex items-center gap-1"><Calendar size={12} /> {fmtDateTime(f.kickoff)}</span>}
+            <button onClick={() => onRemove(f.id)} className="ml-auto text-stone-500 hover:text-rose-600"><X size={15} /></button>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex flex-wrap gap-2 mb-4">
+        <input value={home} onChange={(e) => setHome(e.target.value)} placeholder="Home team" className="flex-1 min-w-[140px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        <input value={away} onChange={(e) => setAway(e.target.value)} placeholder="Away team" className="flex-1 min-w-[140px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        <input type="datetime-local" value={kickoff} onChange={(e) => setKickoff(e.target.value)} className="bg-white border border-stone-300 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        <button onClick={add} className="flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 text-sm font-medium">
+          <Plus size={15} /> Add to pool
+        </button>
+      </div>
+
+      <button
+        onClick={onGenerate}
+        disabled={pool.length < 3}
+        className="flex items-center gap-2 bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-black font-display font-semibold rounded-lg px-4 py-2.5 text-sm"
+      >
+        <Sparkles size={15} /> Randomly draw next matchday (3 matches)
+      </button>
+      {pool.length < 3 && <p className="text-xs text-stone-500 mt-2">Add at least 3 fixtures to the pool to draw a matchday.</p>}
+    </section>
+  );
+}
+
+function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
+  const [label, setLabel] = useState(matchday.label);
+  const [scheduledDate, setScheduledDate] = useState(matchday.scheduledDate ? matchday.scheduledDate.slice(0, 10) : "");
+  const [releaseAt, setReleaseAt] = useState(toLocalInputValue(matchday.releaseAt));
+  const [locked, setLocked] = useState(matchday.locked);
+  const [scoring, setScoring] = useState(matchday.scoring);
+  const [blog, setBlog] = useState(matchday.blog || "");
+  const [matches, setMatches] = useState(matchday.matches.map((m) => ({ ...m, outcomeHome: m.outcome?.home ?? "", outcomeAway: m.outcome?.away ?? "" })));
+  const [freeMatchIndex, setFreeMatchIndex] = useState(matchday.freeMatchIndex ?? null);
+  const [customOutcomes, setCustomOutcomes] = useState(() => {
+    const out = {};
+    Object.entries(matchday.customMatches || {}).forEach(([homeId, c]) => {
+      out[homeId] = { outcomeHome: c.outcome?.home ?? "", outcomeAway: c.outcome?.away ?? "" };
+    });
+    return out;
+  });
+  const [saved, setSaved] = useState(false);
+
+  const setMatchField = (idx, field, val) =>
+    setMatches((arr) => arr.map((m, i) => (i === idx ? { ...m, [field]: val } : m)));
+
+  const setCustomOutcomeField = (homeId, field, val) =>
+    setCustomOutcomes((o) => ({ ...o, [homeId]: { ...o[homeId], [field]: val } }));
+
+  const save = () => {
+    const nextMatches = matches.map((m) => ({
+      id: m.id,
+      home: m.home,
+      away: m.away,
+      kickoff: m.kickoff,
+      outcome: m.outcomeHome !== "" && m.outcomeAway !== "" ? { home: Number(m.outcomeHome), away: Number(m.outcomeAway) } : null,
+    }));
+    const nextCustomMatches = { ...(matchday.customMatches || {}) };
+    Object.entries(customOutcomes).forEach(([homeId, o]) => {
+      if (!nextCustomMatches[homeId]) return;
+      nextCustomMatches[homeId] = {
+        ...nextCustomMatches[homeId],
+        outcome: o.outcomeHome !== "" && o.outcomeAway !== "" ? { home: Number(o.outcomeHome), away: Number(o.outcomeAway) } : null,
+      };
+    });
+    onUpdate({
+      label,
+      scheduledDate: scheduledDate || null,
+      releaseAt: releaseAt ? new Date(releaseAt).toISOString() : null,
+      locked,
+      scoring,
+      blog,
+      matches: nextMatches,
+      freeMatchIndex,
+      customMatches: nextCustomMatches,
+    });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  const allScored = matchday.matches.every((m) => m.outcome)
+    && Object.values(matchday.customMatches || {}).every((c) => c.outcome);
+  const preview = useMemo(
+    () => (allScored && !matchday.resultsPublished ? computeMatchdayPoints(matchday, predictions, participants) : null),
+    [allScored, matchday, predictions, participants]
+  );
+  const h2hPreview = useMemo(
+    () => (allScored && !matchday.resultsPublished ? computeH2HResultsForMatchday(matchday, predictions, participants) : null),
+    [allScored, matchday, predictions, participants]
+  );
+  const nameById = useMemo(() => Object.fromEntries(participants.map((p) => [p.id, p.name])), [participants]);
+  const stadiumById = useMemo(() => Object.fromEntries(participants.map((p) => [p.id, p.stadium])), [participants]);
+
+  return (
+    <div className="border border-stone-200 rounded-2xl p-5 bg-white space-y-4">
+      <div className="flex flex-wrap items-center gap-3 justify-between">
+        <div className="flex items-center gap-3">
+          <input value={label} onChange={(e) => setLabel(e.target.value)} className="bg-transparent font-display font-semibold text-lg focus:outline-none border-b border-transparent focus:border-stone-400" />
+          <label className="flex items-center gap-1.5 text-xs text-stone-500">
+            <Calendar size={12} />
+            <input type="date" value={scheduledDate} onChange={(e) => setScheduledDate(e.target.value)} className="bg-stone-50 border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </label>
+        </div>
+        <span className={cx("text-[10px] px-2 py-1 rounded-full border font-medium uppercase tracking-wide", MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(matchday, true)])}>
+          {matchdayDisplayStatus(matchday, true)}
+        </span>
+      </div>
+
+      {matchday.draft && (
+        <div className="flex flex-wrap items-center gap-3 border border-amber-400/30 bg-amber-400/5 rounded-lg px-3 py-2.5">
+          <span className="text-xs text-amber-300">This matchday is a draft — contestants can't see it exists yet. Review the fixtures below, then release it.</span>
+          <button onClick={() => onUpdate({ draft: false })} className="ml-auto flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-1.5 text-xs shrink-0">
+            <Eye size={13} /> Release to contestants
+          </button>
+        </div>
+      )}
+
+      {matchday.pairings ? (
+        <div className="border border-stone-200 rounded-lg px-3 py-2 bg-stone-50">
+          <div className="text-[11px] text-stone-500 uppercase tracking-wide mb-1">Head-to-head pairings this matchday</div>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-stone-700">
+            {matchday.pairings.pairings.map((p, i) => (
+              <span key={i}>
+                {nameById[p.home] ?? "?"} v {nameById[p.away] ?? "?"}
+                {stadiumById[p.home] && <span className="opacity-70"> · {stadiumById[p.home]}</span>}
+              </span>
+            ))}
+            {matchday.pairings.bye && <span className="text-stone-500">Bye: {nameById[matchday.pairings.bye] ?? "?"}</span>}
+          </div>
+        </div>
+      ) : (
+        <p className="text-xs text-stone-500">No head-to-head pairings attached to this matchday — generate a season fixture list above before creating new matchdays so standings can be calculated.</p>
+      )}
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className="text-xs text-stone-500">Reveal picks at</label>
+          <input type="datetime-local" value={releaseAt} onChange={(e) => setReleaseAt(e.target.value)} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <div className="flex items-end">
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={locked} onChange={(e) => setLocked(e.target.checked)} className="accent-violet-700" />
+            Predictions locked (closed for entry)
+          </label>
+        </div>
+      </div>
+
+      <div>
+        <label className="text-xs text-stone-500">Matchday blog (private until picks are revealed above)</label>
+        <textarea
+          value={blog}
+          onChange={(e) => setBlog(e.target.value)}
+          rows={3}
+          placeholder="Write your commentary for this matchday — only you can see this until the reveal time above, then it appears alongside the Predictions Matrix for everyone."
+          className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        />
+      </div>
+
+      <div>
+        <label className="text-xs text-stone-500">Scoring — max {maxMatchPoints(scoring)} pts per match</label>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-1.5">
+          <div>
+            <label className="text-[10px] text-stone-500">Correct result</label>
+            <input type="number" step="1" value={scoring.resultPoints} onChange={(e) => setScoring({ ...scoring, resultPoints: parseFloat(e.target.value) || 0 })} className="w-full bg-white border border-stone-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </div>
+          <div>
+            <label className="text-[10px] text-stone-500">Home goals exact</label>
+            <input type="number" step="1" value={scoring.homeGoalPoints} onChange={(e) => setScoring({ ...scoring, homeGoalPoints: parseFloat(e.target.value) || 0 })} className="w-full bg-white border border-stone-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </div>
+          <div>
+            <label className="text-[10px] text-stone-500">Away goals exact</label>
+            <input type="number" step="1" value={scoring.awayGoalPoints} onChange={(e) => setScoring({ ...scoring, awayGoalPoints: parseFloat(e.target.value) || 0 })} className="w-full bg-white border border-stone-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </div>
+          <div>
+            <label className="text-[10px] text-stone-500">Margin exact</label>
+            <input type="number" step="1" value={scoring.marginPoints} onChange={(e) => setScoring({ ...scoring, marginPoints: parseFloat(e.target.value) || 0 })} className="w-full bg-white border border-stone-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <label className="text-xs text-stone-500">Fixtures — optionally mark one as the "free" match each pairing's home contestant can swap out</label>
+        {matches.map((m, idx) => (
+          <div key={m.id} className="flex flex-wrap items-center gap-2 border border-stone-200 rounded-xl p-3 bg-white">
+            <label className="flex items-center gap-1.5 text-[10px] text-stone-500" title="Home contestants can replace this match with their own">
+              <input
+                type="radio"
+                name={`free-${matchday.id}`}
+                checked={freeMatchIndex === idx}
+                onChange={() => setFreeMatchIndex(idx)}
+                className="accent-violet-700"
+              />
+              Free
+            </label>
+            <input value={m.home} onChange={(e) => setMatchField(idx, "home", e.target.value)} className="bg-transparent text-sm font-medium w-36 focus:outline-none border-b border-transparent focus:border-stone-400" />
+            <span className="text-stone-500 text-xs">vs</span>
+            <input value={m.away} onChange={(e) => setMatchField(idx, "away", e.target.value)} className="bg-transparent text-sm font-medium w-36 focus:outline-none border-b border-transparent focus:border-stone-400" />
+            <input type="datetime-local" value={toLocalInputValue(m.kickoff)} onChange={(e) => setMatchField(idx, "kickoff", e.target.value ? new Date(e.target.value).toISOString() : "")} className="bg-white border border-stone-300 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            <div className="flex items-center gap-1 ml-auto">
+              <span className="text-[10px] text-stone-500 mr-1">Result</span>
+              <input type="number" min="0" value={m.outcomeHome} onChange={(e) => setMatchField(idx, "outcomeHome", e.target.value)} className="w-12 text-center bg-white border border-stone-300 rounded-lg px-1 py-1 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+              <span className="text-stone-500">–</span>
+              <input type="number" min="0" value={m.outcomeAway} onChange={(e) => setMatchField(idx, "outcomeAway", e.target.value)} className="w-12 text-center bg-white border border-stone-300 rounded-lg px-1 py-1 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            </div>
+          </div>
+        ))}
+        {freeMatchIndex !== null && (
+          <button onClick={() => setFreeMatchIndex(null)} className="text-xs text-stone-500 hover:text-stone-900">Turn off free match for this matchday</button>
+        )}
+      </div>
+
+      {freeMatchIndex !== null && matchday.pairings && (
+        <div>
+          <label className="text-xs text-stone-500">Custom matches chosen by home contestants — enter their real results here too</label>
+          <div className="space-y-2 mt-1.5">
+            {matchday.pairings.pairings.map(({ home }) => {
+              const custom = matchday.customMatches?.[home];
+              const homeName = participants.find((p) => p.id === home)?.name ?? "?";
+              if (!custom) {
+                return (
+                  <div key={home} className="text-xs text-stone-500 border border-stone-200 rounded-lg px-3 py-2 bg-stone-50">
+                    {homeName} hasn't chosen their own match yet.
+                  </div>
+                );
+              }
+              const o = customOutcomes[home] || { outcomeHome: "", outcomeAway: "" };
+              return (
+                <div key={home} className="flex flex-wrap items-center gap-2 border border-stone-200 rounded-xl p-3 bg-white">
+                  <span className="text-xs text-stone-500 min-w-[80px]">{homeName}'s pick:</span>
+                  <span className="text-sm font-medium">{custom.home} <span className="text-stone-500">v</span> {custom.away}</span>
+                  <div className="flex items-center gap-1 ml-auto">
+                    <span className="text-[10px] text-stone-500 mr-1">Result</span>
+                    <input type="number" min="0" value={o.outcomeHome} onChange={(e) => setCustomOutcomeField(home, "outcomeHome", e.target.value)} className="w-12 text-center bg-white border border-stone-300 rounded-lg px-1 py-1 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                    <span className="text-stone-500">–</span>
+                    <input type="number" min="0" value={o.outcomeAway} onChange={(e) => setCustomOutcomeField(home, "outcomeAway", e.target.value)} className="w-12 text-center bg-white border border-stone-300 rounded-lg px-1 py-1 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <button onClick={save} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+        {saved ? <CheckCircle2 size={16} /> : null} Save changes
+      </button>
+
+      {matchday.resultsPublished ? (
+        <p className="text-xs text-emerald-600 flex items-center gap-1.5"><CheckCircle2 size={14} /> Results published — standings are updated for everyone.</p>
+      ) : preview ? (
+        <div className="border-t border-stone-200 pt-4 space-y-3">
+          <h4 className="text-xs font-semibold text-amber-300 uppercase tracking-wide">Results entered — check before publishing</h4>
+          <div className="border border-stone-200 rounded-xl overflow-hidden">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr style={{ background: "#3D1F5C" }} className="text-left">
+                  <th className="px-3 py-2 font-semibold text-amber-300">Contestant</th>
+                  <th className="px-3 py-2 font-semibold text-right text-amber-300">Points this matchday</th>
+                  <th className="px-3 py-2 font-semibold text-amber-300">Head-to-head</th>
+                  <th className="px-3 py-2 font-semibold text-right text-amber-300">League pts</th>
+                </tr>
+              </thead>
+              <tbody>
+                {preview.map((row, idx) => {
+                  const h2h = h2hPreview?.[row.id];
+                  return (
+                    <tr key={row.id} className={cx("border-t border-stone-200", idx % 2 === 1 && "bg-white")}>
+                      <td className="px-3 py-2">{row.name}</td>
+                      <td className="px-3 py-2 text-right font-mono-num text-amber-300 font-semibold">{row.points}</td>
+                      <td className="px-3 py-2 text-xs text-stone-500">
+                        {!h2h ? "—"
+                          : h2h.outcome === "bye" ? "Bye"
+                          : `${h2h.outcome === "win" ? "Won" : h2h.outcome === "loss" ? "Lost" : "Drew"} v ${nameById[h2h.opponentId] ?? "?"} (${h2h.ownRaw}\u2013${h2h.opponentRaw})`}
+                      </td>
+                      <td className="px-3 py-2 text-right font-mono-num text-stone-700">{h2h ? h2h.leaguePoints : "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-stone-500">This preview isn't visible to contestants yet. Publishing adds these results to the public standings and reveals the final scores in the Predictions Matrix.</p>
+          <button
+            onClick={() => onUpdate({ resultsPublished: true })}
+            className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-stone-900 font-semibold rounded-lg px-4 py-2 text-sm"
+          >
+            <CheckCircle2 size={16} /> Publish results & update standings
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function NewMatchdayForm({ league, onCreate, onCancel }) {
+  const [label, setLabel] = useState("");
+  const [releaseAt, setReleaseAt] = useState("");
+  const [fixtures, setFixtures] = useState([
+    { home: "", away: "", kickoff: "" },
+    { home: "", away: "", kickoff: "" },
+    { home: "", away: "", kickoff: "" },
+  ]);
+
+  const setFixtureField = (idx, field, val) =>
+    setFixtures((arr) => arr.map((f, i) => (i === idx ? { ...f, [field]: val } : f)));
+
+  const create = () => {
+    if (!label.trim() || fixtures.some((f) => !f.home.trim() || !f.away.trim())) return;
+    const roundIndex = league.matchdays.length;
+    onCreate({
+      id: `md_${Date.now()}`,
+      label: label.trim(),
+      releaseAt: releaseAt ? new Date(releaseAt).toISOString() : null,
+      draft: false,
+      resultsPublished: false,
+      blog: "",
+      locked: false,
+      scoring: { resultPoints: 3, homeGoalPoints: 1, awayGoalPoints: 1, marginPoints: 1 },
+      pairings: league.h2hSchedule[roundIndex] ?? null,
+      scheduledDate: league.h2hSchedule[roundIndex]?.scheduledDate ?? null,
+      freeMatchIndex: null,
+      customMatches: {},
+      matches: fixtures.map((f, i) => ({
+        id: `m_${Date.now()}_${i}`,
+        home: f.home.trim(),
+        away: f.away.trim(),
+        kickoff: f.kickoff ? new Date(f.kickoff).toISOString() : null,
+        outcome: null,
+      })),
+    });
+  };
+
+  return (
+    <div className="border border-amber-400/30 bg-amber-400/5 rounded-2xl p-5 space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="font-display font-semibold">New matchday — 3 fixtures</h3>
+        <button onClick={onCancel} className="text-stone-500 hover:text-stone-800"><X size={18} /></button>
+      </div>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className="text-xs text-stone-500">Label</label>
+          <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. Matchday 3" className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <div>
+          <label className="text-xs text-stone-500">Reveal picks at</label>
+          <input type="datetime-local" value={releaseAt} onChange={(e) => setReleaseAt(e.target.value)} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+      </div>
+      <div className="space-y-2">
+        {fixtures.map((f, idx) => (
+          <div key={idx} className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-stone-500 w-14">Match {idx + 1}</span>
+            <input value={f.home} onChange={(e) => setFixtureField(idx, "home", e.target.value)} placeholder="Home team" className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            <span className="text-stone-500 text-xs">vs</span>
+            <input value={f.away} onChange={(e) => setFixtureField(idx, "away", e.target.value)} placeholder="Away team" className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            <input type="datetime-local" value={f.kickoff} onChange={(e) => setFixtureField(idx, "kickoff", e.target.value)} className="bg-white border border-stone-300 rounded-lg px-2 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          </div>
+        ))}
+      </div>
+      <button onClick={create} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">Create matchday</button>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// LEADERBOARD
+// -----------------------------------------------------------------------------
+// Only matchdays the admin has explicitly published count toward what
+// contestants see — this is what keeps row order in the Matrix/Standings
+// from leaking a not-yet-confirmed result.
+function publishedMatchdays(league) {
+  return league.matchdays.filter((md) => md.resultsPublished);
+}
+
+// Predictions are keyed globally by matchId (not nested inside the league
+// object), so the leaderboard calc takes the top-level predictions map too.
+// `matchdays` is passed explicitly so callers decide whether unpublished
+// results should count (e.g. the admin's own preview) or not (everyone else).
+//
+// Standings are head-to-head: each matchday's raw prediction points decide
+// who wins that matchday's pairing (3 league points), draws (1 each), or
+// loses (0) — see computeH2HResultsForMatchday. Table order is league
+// points, then cumulative score difference, then alphabetical — exactly
+// the tiebreak chain requested, so ties are (almost) always fully resolved.
+function computeLeaderboardWithPredictions(participants, matchdays, predictions) {
+  const stats = {};
+  participants.forEach((p) => {
+    stats[p.id] = { id: p.id, name: p.name, leaguePoints: 0, scoreDifference: 0, wins: 0, draws: 0, losses: 0, predictedPointsTotal: 0, correctCount: 0, evaluatedCount: 0 };
+  });
+
+  matchdays.forEach((md) => {
+    md.matches.forEach((m) => {
+      if (!m.outcome) return;
+      participants.forEach((p) => {
+        const pred = predictions[`${m.id}__${p.id}`];
+        const result = scoreMatch(m, pred, md.scoring);
+        if (!result.evaluated) return;
+        stats[p.id].evaluatedCount += 1;
+        stats[p.id].predictedPointsTotal += result.points;
+        if (result.correct) stats[p.id].correctCount += 1;
+      });
+    });
+
+    const h2hResults = computeH2HResultsForMatchday(md, predictions, participants);
+    Object.entries(h2hResults).forEach(([pid, h2h]) => {
+      if (!stats[pid]) return; // participant may have since left the league
+      stats[pid].leaguePoints += h2h.leaguePoints;
+      stats[pid].scoreDifference += h2h.scoreDiff;
+      if (h2h.outcome === "win" || h2h.outcome === "bye") stats[pid].wins += 1;
+      else if (h2h.outcome === "draw") stats[pid].draws += 1;
+      else if (h2h.outcome === "loss") stats[pid].losses += 1;
+    });
+  });
+
+  const rows = participants.map((p) => {
+    const s = stats[p.id];
+    const accuracy = s.evaluatedCount > 0 ? Math.round((s.correctCount / s.evaluatedCount) * 1000) / 10 : 0;
+    return {
+      ...s,
+      totalPoints: s.leaguePoints, // alias — anywhere already displaying "points" shows table points
+      predictedPointsTotal: Math.round(s.predictedPointsTotal * 10) / 10,
+      accuracy,
+    };
+  });
+
+  rows.sort((a, b) => b.leaguePoints - a.leaguePoints || b.scoreDifference - a.scoreDifference || a.name.localeCompare(b.name));
+  rows.forEach((r, i) => { r.rank = i + 1; });
+  return rows;
+}
+
+// -----------------------------------------------------------------------------
+// SEASON ARCHIVE — closing out a season snapshots everything about it
+// (fixtures, every prediction, final standings) into a permanent record,
+// then resets both leagues to a clean slate — same roster, same accounts,
+// same invite codes, no live matchdays or standings — ready for the next
+// season without anyone needing to re-register.
+// -----------------------------------------------------------------------------
+// All match ids belonging to a matchday — the 3 base fixtures plus any
+// per-pairing custom matches home contestants have chosen. Used wherever
+// predictions need to be matched back to "everything in this matchday."
+function allMatchIdsForMatchday(md) {
+  const ids = md.matches.map((m) => m.id);
+  Object.keys(md.customMatches || {}).forEach((homeId) => ids.push(`custom__${md.id}__${homeId}`));
+  return ids;
+}
+
+// Prediction keys are "<matchId>__<participantId>". Custom-match ids
+// themselves contain "__" (custom__<matchdayId>__<homeId>), so splitting on
+// the *first* "__" would cut a custom matchId in half. Participant ids
+// never contain "__", so splitting on the *last* one is always correct.
+function matchIdFromPredictionKey(key) {
+  return key.slice(0, key.lastIndexOf("__"));
+}
+
+function endSeason(data, newSeasonLabel) {
+  const archivedMatchIds = new Set();
+  Object.values(data.leagues).forEach((league) => {
+    league.matchdays.forEach((md) => allMatchIdsForMatchday(md).forEach((id) => archivedMatchIds.add(id)));
+  });
+
+  const archivedLeagues = {};
+  Object.entries(data.leagues).forEach(([key, league]) => {
+    if (!league.enabled) return;
+    const matchIds = new Set();
+    league.matchdays.forEach((md) => allMatchIdsForMatchday(md).forEach((id) => matchIds.add(id)));
+    const leaguePredictions = {};
+    Object.entries(data.predictions).forEach(([predKey, predVal]) => {
+      if (matchIds.has(matchIdFromPredictionKey(predKey))) leaguePredictions[predKey] = predVal;
+    });
+    archivedLeagues[key] = {
+      name: league.name,
+      participants: league.participants.map((p) => ({ id: p.id, name: p.name, supports: p.supports || null, badge: p.badge || null })),
+      matchdays: JSON.parse(JSON.stringify(league.matchdays)),
+      predictions: leaguePredictions,
+      finalStandings: computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions),
+    };
+  });
+
+  const nextLeagues = {};
+  Object.entries(data.leagues).forEach(([key, league]) => {
+    nextLeagues[key] = { ...league, matchdays: [], fixturePool: [] };
+  });
+
+  const remainingPredictions = {};
+  Object.entries(data.predictions).forEach(([predKey, predVal]) => {
+    if (!archivedMatchIds.has(matchIdFromPredictionKey(predKey))) remainingPredictions[predKey] = predVal;
+  });
+
+  const archiveRecord = {
+    id: `season_${Date.now()}`,
+    label: data.seasonLabel || "Previous season",
+    endedAt: new Date().toISOString(),
+    leagues: archivedLeagues,
+  };
+
+  return {
+    ...data,
+    seasonLabel: newSeasonLabel,
+    seasonArchives: [...(data.seasonArchives || []), archiveRecord],
+    leagues: nextLeagues,
+    predictions: remainingPredictions,
+  };
+}
+
+// "2026-27" -> "2027-28" — just a starting suggestion for the new season's
+// label, the admin can always type over it.
+function suggestNextSeasonLabel(label) {
+  const m = /^(\d{4})-(\d{2,4})$/.exec(label || "");
+  if (!m) return "";
+  const nextStart = parseInt(m[1], 10) + 1;
+  const nextEndShort = String((nextStart + 1) % 100).padStart(2, "0");
+  return `${nextStart}-${nextEndShort}`;
+}
+
+function LeaderboardView({ league, data }) {
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const podium = board.filter((r) => r.leaguePoints > 0).slice(0, 3);
+  const visibleMatchdays = league.matchdays.filter((md) => !md.draft);
+  const totalMatches = visibleMatchdays.reduce((n, md) => n + md.matches.length, 0);
+  const scoredMatches = publishedMatchdays(league).reduce((n, md) => n + md.matches.length, 0);
+
+  return (
+    <div className="space-y-8">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Trophy size={18} className="text-amber-400" /> {league.name} Standings</h2>
+        <span className="text-xs text-stone-500">{scoredMatches} of {totalMatches} matches scored</span>
+      </div>
+      <p className="text-xs text-stone-500 -mt-6">
+        Head-to-head format: each matchday you're paired against another contestant — whoever scores more prediction points wins the matchup (3 pts), a tie draws (1 pt each). Ties in the table are broken by score difference, then alphabetically.
+      </p>
+
+      {podium.length === 0 ? (
+        <p className="text-stone-500 text-sm">No results have been entered yet — the board will populate once matches are scored.</p>
+      ) : (
+        <Podium podium={podium} />
+      )}
+
+      <div className="border border-stone-200 rounded-2xl overflow-hidden">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr style={{ background: "#3D1F5C" }} className="text-left">
+              <th className="px-4 py-3 font-semibold w-16 text-amber-300">Rank</th>
+              <th className="px-4 py-3 font-semibold text-amber-300">Participant</th>
+              <th className="px-4 py-3 font-semibold text-right text-amber-300">W</th>
+              <th className="px-4 py-3 font-semibold text-right text-amber-300">D</th>
+              <th className="px-4 py-3 font-semibold text-right text-amber-300">L</th>
+              <th className="px-4 py-3 font-semibold text-right text-amber-300">Score diff</th>
+              <th className="px-4 py-3 font-semibold text-right text-amber-300">Pts</th>
+            </tr>
+          </thead>
+          <tbody>
+            {board.map((row, idx) => (
+              <tr key={row.id} className={cx("border-t border-stone-200", row.rank === 1 && row.leaguePoints > 0 && "bg-amber-400/5", idx % 2 === 1 && "bg-white")}>
+                <td className="px-4 py-3 font-mono-num text-stone-500">
+                  <span className="inline-flex items-center gap-1">{row.rank === 1 && row.leaguePoints > 0 && <Crown size={14} className="text-amber-400" />}#{row.rank}</span>
+                </td>
+                <td className="px-4 py-3 font-medium">{row.name}</td>
+                <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.wins}</td>
+                <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.draws}</td>
+                <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.losses}</td>
+                <td className={cx("px-4 py-3 text-right font-mono-num", row.scoreDifference > 0 ? "text-emerald-600" : row.scoreDifference < 0 ? "text-rose-600" : "text-stone-500")}>
+                  {row.scoreDifference > 0 ? "+" : ""}{row.scoreDifference}
+                </td>
+                <td className="px-4 py-3 text-right font-mono-num font-semibold text-amber-300">{row.leaguePoints}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function Podium({ podium }) {
+  const order = [podium[1], podium[0], podium[2]];
+  const heights = { 0: "h-24", 1: "h-32", 2: "h-16" };
+  const medalColor = (place) => (place === 1 ? "text-amber-400" : place === 2 ? "text-stone-700" : "text-orange-400");
+  return (
+    <div className="flex items-end justify-center gap-3 sm:gap-6 py-4">
+      {order.map((row, i) => {
+        if (!row) return <div key={i} className="w-24" />;
+        const place = row.rank;
+        return (
+          <div key={row.id} className="flex flex-col items-center w-24 sm:w-28">
+            <Medal size={22} className={cx("mb-1", medalColor(place))} />
+            <div className="font-medium text-sm text-center truncate w-full">{row.name}</div>
+            <div className="font-mono-num text-xs text-stone-500 mb-2">{row.totalPoints} pts</div>
+            <div className={cx(
+              "w-full rounded-t-lg flex items-start justify-center pt-2 font-display font-bold text-lg",
+              heights[i],
+              place === 1 ? "bg-gradient-to-b from-amber-400/40 to-amber-400/10 text-amber-300 border border-amber-400/40"
+                : place === 2 ? "bg-gradient-to-b from-zinc-400/30 to-zinc-400/5 text-stone-700 border border-zinc-500/40"
+                : "bg-gradient-to-b from-orange-500/30 to-orange-500/5 text-orange-300 border border-orange-500/40"
+            )}>
+              #{place}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// PROFILES — contestants add their own photo, name, DOB, residence, supported
+// team and a bio. Name and supported team are required; everything else,
+// including the photo, is optional.
+// -----------------------------------------------------------------------------
+
+// Downscales an uploaded image in-browser (canvas) before it's stored, so
+// profile photos don't bloat the shared save file. Returns a JPEG data URL.
+function resizeImageFile(file, maxDim = 320) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Could not decode image"));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) {
+          height = Math.round(height * (maxDim / width));
+          width = maxDim;
+        } else if (height > maxDim) {
+          width = Math.round(width * (maxDim / height));
+          height = maxDim;
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", 0.85));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function Avatar({ name, photo, size = 56 }) {
+  if (photo) {
+    return <img src={photo} alt={name} style={{ width: size, height: size }} className="rounded-full object-cover border border-stone-300" />;
+  }
+  const initials = (name || "?").trim().slice(0, 1).toUpperCase();
+  return (
+    <div
+      style={{ width: size, height: size }}
+      className="rounded-full bg-amber-400 text-black font-display font-bold flex items-center justify-center border border-amber-300"
+    >
+      {initials}
+    </div>
+  );
+}
+
+function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist }) {
+  const fileInputRef = useRef(null);
+  // Normally you can only ever edit your own profile. In admin mode there's
+  // no "self" to default to, so admin explicitly picks who they're managing
+  // from the roster — useful for setting a contestant up before they've
+  // registered, or fixing something on their behalf.
+  const [adminTargetId, setAdminTargetId] = useState("");
+  const editTargetId = adminMode ? adminTargetId : viewerId;
+  const participant = league.participants.find((p) => p.id === editTargetId);
+
+  const [name, setName] = useState("");
+  const [supports, setSupports] = useState("");
+  const [dob, setDob] = useState("");
+  const [residence, setResidence] = useState("");
+  const [bio, setBio] = useState("");
+  const [stadium, setStadium] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  // Contestants can only set their own stadium name before the season's
+  // first matchday exists — once matchdays start, it's locked for them.
+  // Admin can always change it, from here or from the roster.
+  const stadiumLocked = !adminMode && league.matchdays.length > 0;
+
+  useEffect(() => {
+    setName(participant?.name ?? "");
+    setSupports(participant?.supports ?? "");
+    setDob(participant?.dob ?? "");
+    setResidence(participant?.residence ?? "");
+    setBio(participant?.bio ?? "");
+    setStadium(participant?.stadium ?? "");
+    setPhoto(participant?.photo ?? null);
+    setError("");
+    setSaved(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editTargetId, league]);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const dataUrl = await resizeImageFile(file, 320);
+      setPhoto(dataUrl);
+    } catch {
+      setError("Couldn't read that image — try a different file.");
+    }
+  };
+
+  const save = async () => {
+    if (!editTargetId) { setError(adminMode ? "Choose a contestant to manage first." : "You're not registered in this league, so there's no profile to save."); return; }
+    if (!name.trim() || !supports.trim()) { setError("Name and favourite team are required."); return; }
+    setError("");
+    const nextParticipants = league.participants.map((p) =>
+      p.id === editTargetId
+        ? { ...p, name: adminMode ? name.trim() : p.name, supports: supports.trim(), dob, residence: residence.trim(), bio: bio.trim(), photo, stadium: stadiumLocked ? p.stadium : stadium.trim() }
+        : p
+    );
+    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, participants: nextParticipants } } });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  return (
+    <div className="space-y-8">
+      {adminMode && (
+        <div className="flex items-center gap-2 bg-white border border-stone-200 rounded-lg px-3 py-2">
+          <ShieldCheck size={14} className="text-amber-400" />
+          <span className="text-xs text-stone-500">Managing profile for</span>
+          <select
+            value={adminTargetId}
+            onChange={(e) => setAdminTargetId(e.target.value)}
+            className="bg-transparent text-sm text-stone-900 focus:outline-none"
+          >
+            <option value="">— choose a contestant —</option>
+            {league.participants.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+      )}
+
+      {!editTargetId ? (
+        <div className="flex items-center gap-2 bg-amber-400/10 border border-amber-400/30 text-amber-300 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} />
+          {adminMode ? "Choose a contestant above to view or edit their profile." : `You're not a registered contestant in ${league.name}, so there's no profile to edit here.`}
+        </div>
+      ) : (
+        <section className="bg-white border border-stone-200 rounded-2xl p-5">
+          <h2 className="font-display font-semibold text-lg mb-4 flex items-center gap-2"><UserCircle2 size={18} className="text-amber-400" /> {adminMode ? `${participant?.name ?? ""}'s profile` : "Your profile"}</h2>
+
+          {error && (
+            <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2 mb-4">
+              <AlertCircle size={16} /> {error}
+            </div>
+          )}
+
+          <div className="flex flex-col sm:flex-row gap-6">
+            <div className="flex flex-col items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="relative group"
+                title="Upload a photo"
+              >
+                <Avatar name={name} photo={photo} size={88} />
+                <span className="absolute -bottom-1 -right-1 bg-amber-400 text-black rounded-full p-1.5 border-2 border-zinc-900 group-hover:bg-amber-300">
+                  <Camera size={13} />
+                </span>
+              </button>
+              <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
+              {photo && (
+                <button onClick={() => setPhoto(null)} className="text-xs text-stone-500 hover:text-rose-600">Remove photo</button>
+              )}
+              <span className="text-[11px] text-stone-500">Optional</span>
+            </div>
+
+            <div className="flex-1 grid sm:grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs text-stone-500">Name <span className="text-amber-400">*</span></label>
+                <input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  disabled={!adminMode}
+                  className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50 disabled:opacity-50"
+                />
+                {!adminMode && <span className="text-[11px] text-stone-500">Set by your organizer — contact them to change it.</span>}
+              </div>
+              <div>
+                <label className="text-xs text-stone-500 flex items-center gap-1"><Shirt size={12} /> Supports <span className="text-amber-400">*</span></label>
+                <input value={supports} onChange={(e) => setSupports(e.target.value)} placeholder="e.g. Northgate United" className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+              </div>
+              <div>
+                <label className="text-xs text-stone-500 flex items-center gap-1"><Cake size={12} /> Date of birth</label>
+                <input type="date" value={dob} onChange={(e) => setDob(e.target.value)} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                <span className="text-[11px] text-stone-500">Optional — kept off the public profile grid</span>
+              </div>
+              <div>
+                <label className="text-xs text-stone-500 flex items-center gap-1"><MapPin size={12} /> Residence</label>
+                <input value={residence} onChange={(e) => setResidence(e.target.value)} placeholder="e.g. Manchester" className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                <span className="text-[11px] text-stone-500">Optional</span>
+              </div>
+              <div>
+                <label className="text-xs text-stone-500 flex items-center gap-1"><Landmark size={12} /> Home stadium</label>
+                <input
+                  value={stadium}
+                  onChange={(e) => setStadium(e.target.value)}
+                  disabled={stadiumLocked}
+                  placeholder="e.g. The Amara Arena"
+                  className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50 disabled:opacity-50"
+                />
+                <span className="text-[11px] text-stone-500">
+                  {stadiumLocked ? "Locked once the season's first matchday exists — set again at the start of the next season." : adminMode ? "Admin can set or change this any time." : "Optional — shown for your home fixtures. Editable until matchday 1."}
+                </span>
+              </div>
+              <div className="sm:col-span-2">
+                <label className="text-xs text-stone-500">Bio</label>
+                <textarea value={bio} onChange={(e) => setBio(e.target.value)} maxLength={400} rows={3} placeholder="A few lines about yourself…" className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                <span className="text-[11px] text-stone-500">Optional — {400 - bio.length} characters left</span>
+              </div>
+            </div>
+          </div>
+
+          <button onClick={save} className="mt-5 flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-5 py-2.5 text-sm">
+            {saved ? <CheckCircle2 size={16} /> : null} Save profile
+          </button>
+        </section>
+      )}
+
+      <section>
+        <h2 className="font-display font-semibold text-lg mb-4 flex items-center gap-2"><Users size={18} className="text-amber-400" /> {league.name} squad</h2>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {league.participants.map((p) => (
+            <div key={p.id} className={cx("border rounded-2xl p-4 bg-white flex gap-3", p.id === editTargetId ? "border-amber-400/40" : "border-stone-200")}>
+              <Avatar name={p.name} photo={p.photo} size={56} />
+              <div className="min-w-0">
+                <div className="font-display font-semibold truncate">{p.name}</div>
+                <div className="text-xs text-amber-300 flex items-center gap-1 mt-0.5">
+                  <Shirt size={12} /> {p.supports || <span className="text-stone-500 italic normal-case">no team set yet</span>}
+                </div>
+                {p.residence && (
+                  <div className="text-xs text-stone-500 flex items-center gap-1 mt-0.5"><MapPin size={12} /> {p.residence}</div>
+                )}
+                {p.stadium && (
+                  <div className="text-xs text-stone-500 flex items-center gap-1 mt-0.5"><Landmark size={12} /> {p.stadium}</div>
+                )}
+                {p.bio && <p className="text-xs text-stone-500 mt-2 leading-snug">{p.bio}</p>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// AUTH SCREEN — email + password login/registration (no third-party auth).
+// Registering claims one of the admin-added, not-yet-claimed contestant
+// names in a chosen league; that becomes your permanent identity in the
+// app, so submitting predictions and editing your profile always maps back
+// to the account you logged into rather than a free-form name picker.
+// -----------------------------------------------------------------------------
+function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, saveError, setSaveError }) {
+  const [mode, setMode] = useState("login");
+  const [adminUnlocked, setAdminUnlocked] = useState(false);
+  const [enteringPin, setEnteringPin] = useState(false);
+  const [pin, setPin] = useState("");
+  const [pinError, setPinError] = useState("");
+  const [adminLeagueKey, setAdminLeagueKey] = useState("league1");
+  const [adminGlobalView, setAdminGlobalView] = useState(null); // null | "honours" | "history"
+
+  const tryUnlock = () => {
+    if (pin === data.adminPin) {
+      setAdminUnlocked(true);
+      setEnteringPin(false);
+      setPinError("");
+      setPin("");
+    } else {
+      setPinError("Wrong PIN");
+    }
+  };
+
+  if (adminUnlocked) {
+    const activeLeagueKeys = enabledLeagueKeys(data);
+    const safeAdminLeagueKey = data.leagues[adminLeagueKey]?.enabled ? adminLeagueKey : (activeLeagueKeys[0] ?? "league1");
+    const league = data.leagues[safeAdminLeagueKey];
+    return (
+      <div className="min-h-[700px] w-full bg-stone-100 text-stone-900" style={{ fontFamily: "'Inter', ui-sans-serif, system-ui, sans-serif" }}>
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=Anton&family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
+          .font-display { font-family: 'Oswald', ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }
+          .font-score { font-family: 'Anton', ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.01em; }
+          .font-mono-num { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+        `}</style>
+        <div style={{ background: "#3D1F5C" }} className="w-full px-4 pt-10 pb-6">
+          <div className="max-w-5xl mx-auto space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <Logo className="h-14 w-auto object-contain" />
+              <div className="flex items-center gap-2">
+                <div className="flex gap-2 flex-wrap">
+                  {activeLeagueKeys.map((k) => (
+                    <button
+                      key={k}
+                      onClick={() => { setAdminLeagueKey(k); setAdminGlobalView(null); }}
+                      className={cx(
+                        "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold",
+                        !adminGlobalView && safeAdminLeagueKey === k ? "bg-amber-400 text-black border-amber-400" : "border-white/20 text-stone-200 hover:border-white/40"
+                      )}
+                    >
+                      {data.leagues[k].name}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setAdminGlobalView(adminGlobalView === "honours" ? null : "honours")}
+                    className={cx(
+                      "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5",
+                      adminGlobalView === "honours" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+                    )}
+                  >
+                    <Trophy size={13} /> Honours
+                  </button>
+                  <button
+                    onClick={() => setAdminGlobalView(adminGlobalView === "history" ? null : "history")}
+                    className={cx(
+                      "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5",
+                      adminGlobalView === "history" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+                    )}
+                  >
+                    <History size={13} /> History
+                  </button>
+                </div>
+                <button
+                  onClick={() => setAdminUnlocked(false)}
+                  className="flex items-center gap-1.5 border border-white/20 text-stone-200 hover:border-white/40 hover:text-white rounded-lg px-3 py-1.5 text-xs font-medium"
+                >
+                  <LogOut size={13} /> Exit admin
+                </button>
+              </div>
+            </div>
+            <p className="text-xs text-stone-300">
+              Managing the roster here (before anyone's registered) — invite codes you generate can be sent out right away. Contestants use the <strong className="text-stone-100">Register</strong> screen with their code once you're ready.
+            </p>
+          </div>
+        </div>
+        <div className="max-w-5xl mx-auto px-4 py-6 space-y-6">
+          {saveError && (
+            <div className="flex items-center gap-2 bg-rose-50 border border-rose-300 text-rose-700 text-sm rounded-lg px-4 py-2.5">
+              <AlertCircle size={16} className="shrink-0" />
+              <span className="flex-1">{saveError}</span>
+              <button onClick={() => setSaveError(null)} className="text-rose-500 hover:text-rose-700 shrink-0"><X size={15} /></button>
+            </div>
+          )}
+          {adminGlobalView === "honours" ? (
+            <HonoursView data={data} adminMode persist={persist} />
+          ) : adminGlobalView === "history" ? (
+            <HistoryView data={data} adminMode persist={persist} />
+          ) : (
+            <AppTabs
+              league={league}
+              leagueKey={safeAdminLeagueKey}
+              data={data}
+              persist={persist}
+              viewerId=""
+              adminMode
+              now={Date.now()}
+              snapshots={snapshots}
+              onRestoreSnapshot={onRestoreSnapshot}
+              allowSubmit={false}
+            />
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-[700px] w-full bg-stone-100 text-stone-900 flex items-center justify-center px-4 py-12" style={{ fontFamily: "'Inter', ui-sans-serif, system-ui, sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Anton&family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+        .font-display { font-family: 'Oswald', ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.04em; text-transform: uppercase; }
+        .font-score { font-family: 'Anton', ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.01em; }
+      `}</style>
+      <div className="w-full max-w-sm">
+        <div className="flex justify-center mb-8">
+          <Logo className="h-28 w-auto object-contain" />
+        </div>
+
+        <div className="flex gap-1 mb-5 bg-white border border-stone-200 rounded-lg p-1">
+          <button
+            onClick={() => setMode("login")}
+            className={cx("flex-1 py-2 rounded-md text-sm font-display font-semibold", mode === "login" ? "bg-amber-400 text-black" : "text-stone-500")}
+          >
+            Log in
+          </button>
+          <button
+            onClick={() => setMode("register")}
+            className={cx("flex-1 py-2 rounded-md text-sm font-display font-semibold", mode === "register" ? "bg-amber-400 text-black" : "text-stone-500")}
+          >
+            Register
+          </button>
+        </div>
+
+        {mode === "login"
+          ? <LoginForm data={data} onLogin={onLogin} />
+          : <RegisterForm data={data} persist={persist} onLogin={onLogin} />}
+
+        <div className="mt-6 pt-4 border-t border-stone-200 text-center">
+          {enteringPin ? (
+            <div className="flex items-center justify-center gap-2">
+              <input
+                autoFocus
+                type="password"
+                value={pin}
+                onChange={(e) => setPin(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && tryUnlock()}
+                placeholder="Admin PIN"
+                className="bg-white border border-stone-300 rounded-lg px-3 py-1.5 text-sm w-28 focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+              />
+              <button onClick={tryUnlock} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">Unlock</button>
+              <button onClick={() => { setEnteringPin(false); setPinError(""); }} className="text-stone-500 hover:text-stone-700"><X size={16} /></button>
+            </div>
+          ) : (
+            <button onClick={() => setEnteringPin(true)} className="text-xs text-stone-500 hover:text-stone-700 flex items-center gap-1.5 mx-auto">
+              <ShieldCheck size={13} /> Organizing this competition? Admin access
+            </button>
+          )}
+          {pinError && <p className="text-xs text-rose-600 mt-2">{pinError}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoginForm({ data, onLogin }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setError("");
+    const key = email.trim().toLowerCase();
+    if (!key || !password) { setError("Enter your email and password."); return; }
+    setBusy(true);
+    try {
+      const account = data.accounts[key];
+      if (!account) { setError("No account found for that email."); return; }
+      const hash = await hashPassword(password, account.salt);
+      if (hash !== account.hash) { setError("Incorrect password."); return; }
+      const league = data.leagues[account.leagueKey];
+      const participant = league?.participants.find((p) => p.id === account.participantId);
+      if (!participant) { setError("Your linked contestant record is missing — ask the organizer to check the roster."); return; }
+      onLogin({ email: key, name: participant.name, leagueKey: account.leagueKey, participantId: account.participantId });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+      <div className="relative">
+        <Mail size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="Email"
+          className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        />
+      </div>
+      <div className="relative">
+        <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="Password"
+          className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        />
+      </div>
+      <button
+        onClick={submit}
+        disabled={busy}
+        className="w-full bg-amber-400 hover:bg-amber-300 disabled:opacity-60 text-black font-display font-semibold rounded-lg py-2.5 text-sm"
+      >
+        {busy ? "Signing in…" : "Log in"}
+      </button>
+    </div>
+  );
+}
+
+// Looks up which (unclaimed) contestant a code belongs to, across both
+// leagues. Returns null if the code is unknown or already used.
+function resolveInviteCode(data, rawCode, claimedIds) {
+  // Strip ALL whitespace (not just leading/trailing) before comparing —
+  // invite codes never legitimately contain spaces, so this only ever
+  // rescues a genuine code from a stray space a mobile keyboard, autofill,
+  // or copy-paste might have introduced.
+  const code = rawCode.replace(/\s+/g, "").toUpperCase();
+  if (!code) return null;
+  for (const leagueKey of enabledLeagueKeys(data)) {
+    const participant = data.leagues[leagueKey].participants.find((p) => p.code === code);
+    if (participant && !claimedIds.has(participant.id)) {
+      return { leagueKey, participant };
+    }
+  }
+  return null;
+}
+
+function RegisterForm({ data, persist, onLogin }) {
+  const [code, setCode] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const claimedIds = useMemo(() => new Set(Object.values(data.accounts).map((a) => a.participantId)), [data.accounts]);
+  const resolved = useMemo(() => resolveInviteCode(data, code, claimedIds), [data, code, claimedIds]);
+
+  const submit = async () => {
+    setError("");
+    const key = email.trim().toLowerCase();
+    if (!resolved) { setError("Enter the invite code your organizer gave you."); return; }
+    if (!EMAIL_RE.test(key)) { setError("Enter a valid email address."); return; }
+    if (data.accounts[key]) { setError("An account with that email already exists — try logging in instead."); return; }
+    if (password.length < 6) { setError("Password must be at least 6 characters."); return; }
+    if (password !== confirm) { setError("Passwords don't match."); return; }
+
+    setBusy(true);
+    try {
+      const salt = randomSaltHex();
+      const hash = await hashPassword(password, salt);
+      const { leagueKey, participant } = resolved;
+      const nextAccounts = { ...data.accounts, [key]: { email: key, salt, hash, leagueKey, participantId: participant.id } };
+      await persist({ ...data, accounts: nextAccounts });
+      onLogin({ email: key, name: participant.name, leagueKey, participantId: participant.id });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+
+      <div>
+        <label className="text-xs text-stone-500">Invite code</label>
+        <input
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          placeholder="e.g. 7K3PXM"
+          autoCapitalize="characters"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck="false"
+          className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2.5 text-sm tracking-widest uppercase focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        />
+        {code.trim() && (
+          resolved ? (
+            <p className="text-xs text-emerald-700 mt-1 flex items-center gap-1">
+              <CheckCircle2 size={12} /> Registering as <strong>{resolved.participant.name}</strong> — {data.leagues[resolved.leagueKey].name}
+            </p>
+          ) : (
+            <p className="text-xs text-rose-700 mt-1">That code isn't recognized, or it's already been used. Check with your organizer.</p>
+          )
+        )}
+        <p className="text-[11px] text-stone-500 mt-1">Ask your organizer for your personal invite code — this confirms the name you're registering is really yours.</p>
+      </div>
+
+      <div className="relative">
+        <Mail size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+        <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+      </div>
+      <div className="relative">
+        <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password (6+ characters)" className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+      </div>
+      <div className="relative">
+        <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+        <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder="Confirm password" className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+      </div>
+
+      <button
+        onClick={submit}
+        disabled={busy || !resolved}
+        className="w-full bg-amber-400 hover:bg-amber-300 disabled:opacity-60 text-black font-display font-semibold rounded-lg py-2.5 text-sm"
+      >
+        {busy ? "Creating account…" : "Create account"}
+      </button>
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// STATS — per-contestant performance profiles plus two position-history
+// graphs (one per league), both built entirely from published matchday
+// results so nothing here ever leaks results ahead of the admin's publish
+// step.
+// -----------------------------------------------------------------------------
+
+// A distinct color per participant, spread evenly around the color wheel —
+// works for any roster size up to the 20-per-league cap.
+function colorForIndex(i, total) {
+  const hue = Math.round((i * 360) / Math.max(total, 1)) % 360;
+  return `hsl(${hue}, 65%, 55%)`;
+}
+
+// All the numbers for one contestant's Stats Profile, computed from every
+// published matchday to date.
+function computeContestantStats(participant, league, predictions) {
+  const pubs = publishedMatchdays(league);
+  let totalPoints = 0, matchesEvaluated = 0, matchesPredicted = 0;
+  let correctResults = 0, exactScorelines = 0;
+  let sumHome = 0, sumAway = 0, goalPredictionCount = 0;
+  const matchdayPoints = [];
+  const matchResultsChrono = [];
+
+  pubs.forEach((md) => {
+    let mdPoints = 0;
+    effectiveMatchesFor(md, participant.id).forEach((m) => {
+      if (!m.outcome) return;
+      const pred = predictions[`${m.id}__${participant.id}`];
+      const result = scoreMatch(m, pred, md.scoring);
+      if (result.evaluated) {
+        matchesEvaluated += 1;
+        totalPoints += result.points;
+        mdPoints += result.points;
+        if (result.correct) correctResults += 1;
+        matchResultsChrono.push(result.correct);
+      }
+      if (pred) {
+        matchesPredicted += 1;
+        sumHome += pred.home;
+        sumAway += pred.away;
+        goalPredictionCount += 1;
+        if (pred.home === m.outcome.home && pred.away === m.outcome.away) exactScorelines += 1;
+      }
+    });
+    matchdayPoints.push({ id: md.id, label: md.label, points: Math.round(mdPoints * 10) / 10 });
+  });
+
+  let best = null, worst = null;
+  matchdayPoints.forEach((mp) => {
+    if (!best || mp.points > best.points) best = mp;
+    if (!worst || mp.points < worst.points) worst = mp;
+  });
+
+  let currentStreak = 0;
+  for (let i = matchResultsChrono.length - 1; i >= 0; i--) {
+    if (matchResultsChrono[i]) currentStreak += 1;
+    else break;
+  }
+  let longestStreak = 0, run = 0;
+  matchResultsChrono.forEach((correct) => {
+    if (correct) { run += 1; longestStreak = Math.max(longestStreak, run); }
+    else run = 0;
+  });
+
+  const round1 = (n) => Math.round(n * 10) / 10;
+  const round2 = (n) => Math.round(n * 100) / 100;
+
+  const h2h = computeLeaderboardWithPredictions(league.participants, pubs, predictions).find((r) => r.id === participant.id);
+
+  return {
+    totalPoints: round1(totalPoints),
+    matchdaysPlayed: matchdayPoints.length,
+    matchesEvaluated,
+    matchesPredicted,
+    correctResults,
+    accuracy: matchesEvaluated > 0 ? round1((correctResults / matchesEvaluated) * 100) : null,
+    exactScorelines,
+    avgPointsPerMatchday: matchdayPoints.length > 0 ? round2(totalPoints / matchdayPoints.length) : null,
+    avgPointsPerMatch: matchesEvaluated > 0 ? round2(totalPoints / matchesEvaluated) : null,
+    avgGoalsHome: goalPredictionCount > 0 ? round2(sumHome / goalPredictionCount) : null,
+    avgGoalsAway: goalPredictionCount > 0 ? round2(sumAway / goalPredictionCount) : null,
+    avgGoalsTotal: goalPredictionCount > 0 ? round2((sumHome + sumAway) / goalPredictionCount) : null,
+    best,
+    worst,
+    currentStreak,
+    longestStreak,
+    matchdayPoints,
+    // Head-to-head record — the table points, not the raw prediction score above.
+    leaguePoints: h2h?.leaguePoints ?? 0,
+    leagueRank: h2h?.rank ?? null,
+    wins: h2h?.wins ?? 0,
+    draws: h2h?.draws ?? 0,
+    losses: h2h?.losses ?? 0,
+    scoreDifference: h2h?.scoreDifference ?? 0,
+  };
+}
+
+// One row per published matchday, with every participant's actual table
+// rank at that point in the season — reuses the real standings calculation
+// for each prefix of matchdays so this always matches the live table's
+// tiebreak logic exactly.
+function computeRankHistory(league, predictions) {
+  const pubs = publishedMatchdays(league);
+  return pubs.map((md, idx) => {
+    const board = computeLeaderboardWithPredictions(league.participants, pubs.slice(0, idx + 1), predictions);
+    const row = { matchday: idx + 1, label: md.label };
+    board.forEach((r) => { row[r.id] = r.rank; });
+    return row;
+  });
+}
+
+function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
+  const rows = useMemo(() => computeRankHistory(league, predictions), [league, predictions]);
+  const maxX = league.h2hSchedule.length || Math.max(league.matchdays.length, 1);
+  const maxY = league.maxParticipants || DEFAULT_MAX_PARTICIPANTS;
+
+  if (rows.length === 0) {
+    return (
+      <div className="border border-stone-200 rounded-2xl p-8 text-center text-sm text-stone-500">
+        No published matchdays yet — this graph fills in as results are confirmed.
+      </div>
+    );
+  }
+
+  return (
+    <div className="border border-stone-200 rounded-2xl p-4 bg-white" style={{ height: 360 }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={rows} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+          <CartesianGrid stroke="#27272a" strokeDasharray="3 3" />
+          <XAxis
+            dataKey="matchday"
+            type="number"
+            domain={[1, maxX]}
+            allowDecimals={false}
+            stroke="#a1a1aa"
+            tick={{ fontSize: 11 }}
+            label={{ value: "Matchday", position: "insideBottom", offset: -4, fill: "#71717a", fontSize: 11 }}
+          />
+          <YAxis
+            reversed
+            domain={[1, maxY]}
+            allowDecimals={false}
+            stroke="#a1a1aa"
+            tick={{ fontSize: 11 }}
+            label={{ value: "Position", angle: -90, position: "insideLeft", fill: "#71717a", fontSize: 11 }}
+          />
+          <Tooltip
+            contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 12 }}
+            labelFormatter={(v) => `Matchday ${v}`}
+          />
+          {!highlightId && <Legend wrapperStyle={{ fontSize: 11 }} />}
+          {league.participants.map((p, i) => {
+            const isHighlighted = highlightId === p.id;
+            const color = highlightId ? (isHighlighted ? "#fbbf24" : "#52525b") : colorForIndex(i, league.participants.length);
+            return (
+              <Line
+                key={p.id}
+                dataKey={p.id}
+                name={p.name}
+                stroke={color}
+                strokeWidth={highlightId ? (isHighlighted ? 3 : 1) : 2}
+                isAnimationActive={false}
+                dot={(dotProps) => {
+                  if (dotProps.index !== rows.length - 1) return <React.Fragment key={`${p.id}-${dotProps.index}`} />;
+                  const r = 12;
+                  return (
+                    <g key={`${p.id}-badge`}>
+                      <circle cx={dotProps.cx} cy={dotProps.cy} r={r} fill={p.badge ? "#fff" : color} stroke="#000" strokeWidth={1.5} />
+                      {p.badge ? (
+                        <>
+                          <clipPath id={`badge-clip-${p.id}`}>
+                            <circle cx={dotProps.cx} cy={dotProps.cy} r={r - 1.5} />
+                          </clipPath>
+                          <image
+                            href={p.badge}
+                            x={dotProps.cx - r + 1.5}
+                            y={dotProps.cy - r + 1.5}
+                            width={(r - 1.5) * 2}
+                            height={(r - 1.5) * 2}
+                            clipPath={`url(#badge-clip-${p.id})`}
+                            preserveAspectRatio="xMidYMid slice"
+                          />
+                        </>
+                      ) : (
+                        <text x={dotProps.cx} y={dotProps.cy + 4} textAnchor="middle" fontSize={10} fontWeight="700" fill="#000">
+                          {p.name.slice(0, 1).toUpperCase()}
+                        </text>
+                      )}
+                    </g>
+                  );
+                }}
+              />
+            );
+          })}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function StatTile({ icon: Icon, label, value, sub }) {
+  return (
+    <div className="border border-stone-200 rounded-xl p-3 bg-stone-50">
+      <div className="flex items-center gap-1.5 text-[11px] text-stone-500 uppercase tracking-wide mb-1">
+        <Icon size={12} /> {label}
+      </div>
+      <div className="font-mono-num text-lg font-semibold text-amber-300">{value}</div>
+      {sub && <div className="text-[11px] text-stone-500 mt-0.5">{sub}</div>}
+    </div>
+  );
+}
+
+function StatsProfileView({ participant, league, leagueKey, data, onBack }) {
+  const stats = useMemo(() => computeContestantStats(participant, league, data.predictions), [participant, league, data.predictions]);
+
+  return (
+    <div className="space-y-6">
+      <button onClick={onBack} className="flex items-center gap-1.5 text-sm text-stone-500 hover:text-stone-900">
+        <ArrowLeft size={15} /> Back to {league.name} stats
+      </button>
+
+      <div className="flex items-center gap-4">
+        <div className="relative shrink-0">
+          <Avatar name={participant.name} photo={participant.photo} size={64} />
+          {participant.badge && (
+            <img src={participant.badge} alt="" className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full border-2 border-black bg-white object-contain" />
+          )}
+        </div>
+        <div>
+          <h2 className="font-display font-bold text-2xl">{participant.name}</h2>
+          {participant.supports && <p className="text-xs text-amber-300 flex items-center gap-1 mt-1"><Shirt size={12} /> Supports {participant.supports}</p>}
+        </div>
+      </div>
+
+      {stats.matchdaysPlayed === 0 ? (
+        <p className="text-sm text-stone-500">No published results yet for this contestant — stats will populate as matchdays are confirmed.</p>
+      ) : (
+        <>
+          <div className="border border-amber-400/20 bg-amber-400/5 rounded-xl p-4 flex flex-wrap items-center gap-4">
+            <div>
+              <div className="text-[11px] text-amber-300 uppercase tracking-wide">League position</div>
+              <div className="font-display font-bold text-2xl">#{stats.leagueRank ?? "—"}</div>
+            </div>
+            <div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wide">Record (W-D-L)</div>
+              <div className="font-mono-num text-lg">{stats.wins}-{stats.draws}-{stats.losses}</div>
+            </div>
+            <div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wide">Score difference</div>
+              <div className={cx("font-mono-num text-lg", stats.scoreDifference > 0 ? "text-emerald-600" : stats.scoreDifference < 0 ? "text-rose-600" : "text-stone-700")}>
+                {stats.scoreDifference > 0 ? "+" : ""}{stats.scoreDifference}
+              </div>
+            </div>
+            <div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wide">League points</div>
+              <div className="font-mono-num text-lg text-amber-300 font-semibold">{stats.leaguePoints}</div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <StatTile icon={Trophy} label="Predicted points" value={stats.totalPoints} sub={`raw score over ${stats.matchdaysPlayed} matchday${stats.matchdaysPlayed === 1 ? "" : "s"}`} />
+            <StatTile icon={BarChart3} label="Avg pts / matchday" value={stats.avgPointsPerMatchday} />
+            <StatTile icon={Target} label="Avg pts / match" value={stats.avgPointsPerMatch} />
+            <StatTile icon={CheckCircle2} label="Result accuracy" value={stats.accuracy !== null ? `${stats.accuracy}%` : "—"} sub={`${stats.correctResults}/${stats.matchesEvaluated} correct`} />
+            <StatTile icon={Award} label="Exact scorelines" value={stats.exactScorelines} />
+            <StatTile icon={Send} label="Predictions made" value={stats.matchesPredicted} sub={`of ${stats.matchesEvaluated} matches`} />
+            <StatTile icon={Flame} label="Current streak" value={`${stats.currentStreak} correct`} sub={`best run: ${stats.longestStreak}`} />
+            <StatTile icon={BarChart3} label="Avg goals predicted" value={stats.avgGoalsTotal ?? "—"} sub={stats.avgGoalsHome !== null ? `${stats.avgGoalsHome} home · ${stats.avgGoalsAway} away` : undefined} />
+          </div>
+
+          <div className="grid sm:grid-cols-2 gap-3">
+            <div className="border border-emerald-300/20 bg-emerald-50 rounded-xl p-3">
+              <div className="text-[11px] text-emerald-700 uppercase tracking-wide mb-1">Best matchday</div>
+              <div className="font-medium">{stats.best?.label ?? "—"}</div>
+              <div className="font-mono-num text-emerald-700 text-sm">{stats.best?.points ?? 0} pts</div>
+            </div>
+            <div className="border border-rose-300/20 bg-rose-50 rounded-xl p-3">
+              <div className="text-[11px] text-rose-700 uppercase tracking-wide mb-1">Toughest matchday</div>
+              <div className="font-medium">{stats.worst?.label ?? "—"}</div>
+              <div className="font-mono-num text-rose-700 text-sm">{stats.worst?.points ?? 0} pts</div>
+            </div>
+          </div>
+        </>
+      )}
+
+      <div>
+        <h3 className="font-display font-semibold text-sm mb-2">Position through the season</h3>
+        <RankHistoryChart league={league} leagueKey={leagueKey} predictions={data.predictions} highlightId={participant.id} />
+      </div>
+    </div>
+  );
+}
+
+function StatsView({ league, leagueKey, data }) {
+  const [selectedId, setSelectedId] = useState(null);
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const selected = selectedId ? league.participants.find((p) => p.id === selectedId) : null;
+
+  if (selected) {
+    return <StatsProfileView participant={selected} league={league} leagueKey={leagueKey} data={data} onBack={() => setSelectedId(null)} />;
+  }
+
+  return (
+    <div className="space-y-6">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><TrendingUp size={18} className="text-amber-400" /> {league.name} stats</h2>
+
+      <div>
+        <h3 className="font-display font-semibold text-sm mb-2">Position through the season</h3>
+        <RankHistoryChart league={league} leagueKey={leagueKey} predictions={data.predictions} />
+      </div>
+
+      <div>
+        <h3 className="font-display font-semibold text-sm mb-2">Contestants</h3>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {board.map((row) => {
+            const participant = league.participants.find((p) => p.id === row.id);
+            return (
+              <button
+                key={row.id}
+                onClick={() => setSelectedId(row.id)}
+                className="flex items-center gap-3 border border-stone-200 rounded-xl p-3 bg-white hover:border-amber-400/40 text-left transition-colors"
+              >
+                <div className="relative shrink-0">
+                  <Avatar name={participant.name} photo={participant.photo} size={40} />
+                  {participant.badge && (
+                    <img src={participant.badge} alt="" className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full border-2 border-black bg-white object-contain" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium truncate">{participant.name}</div>
+                  <div className="text-xs text-stone-500 font-mono-num">#{row.rank} · {row.leaguePoints} pts ({row.wins}-{row.draws}-{row.losses})</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
