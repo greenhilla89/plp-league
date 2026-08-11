@@ -354,14 +354,57 @@ function customMatchAsMatch(matchday, homeParticipantId, custom) {
   };
 }
 
+// -----------------------------------------------------------------------------
+// BONANZA MATCHDAYS — a rare special round (admin's discretion, a couple of
+// times a season) where EVERY contestant picks their own matches instead of
+// predicting the admin's chosen three:
+//   - the pairing's HOME contestant picks all 3 matches themselves
+//   - the AWAY contestant (and anyone on a bye) picks matches 1 and 2, and
+//     predicts the admin's Match 3 (the "anchor") like a normal fixture
+// Division rules (communicated in the picker, like the normal free match):
+//   Premier League home: any 3 PL matches. Other divisions' home: 2 PL
+//   matches + Match 3 from any division (PL down to the National League).
+//   Away contestants everywhere: 2 PL matches + the anchor.
+// The admin's three entered fixtures stay as FALLBACKS — anyone who never
+// makes a pick for a slot is simply scored on the admin's fixture there,
+// so nobody is ever left without a match. Scoring, head-to-head and
+// publishing all work exactly as on a normal matchday.
+// -----------------------------------------------------------------------------
+// Which slots a participant picks for themselves on a Bonanza matchday —
+// [0,1,2] for pairing homes, [0,1] for aways and byes, null if this isn't
+// a Bonanza matchday or they're not part of it.
+function bonanzaSlotsFor(matchday, participantId) {
+  if (!matchday.bonanza || !matchday.pairings || !participantId) return null;
+  const isHome = matchday.pairings.pairings.some((p) => p.home === participantId);
+  if (isHome) return [0, 1, 2];
+  const isAway = matchday.pairings.pairings.some((p) => p.away === participantId);
+  const isBye = matchday.pairings.bye === participantId;
+  if (isAway || isBye) return [0, 1];
+  return null;
+}
+
 // The 3 matches a given participant is actually being scored on for this
 // matchday. Normally that's just matchday.matches for everyone — but once
 // admin has marked one slot as "free" (matchday.freeMatchIndex), a
 // pairing's HOME contestant may swap that slot for a custom match of
 // their own choosing. Only the home contestant is affected — their
 // opponent always predicts the admin's pre-determined match at that slot,
-// regardless of what the home contestant picked.
+// regardless of what the home contestant picked. On a Bonanza matchday
+// (see above) the substitution instead applies per-slot for everyone,
+// using their saved picks in matchday.bonanzaPicks.
 function effectiveMatchesFor(matchday, participantId) {
+  if (matchday.bonanza) {
+    const slots = bonanzaSlotsFor(matchday, participantId);
+    if (!slots) return matchday.matches;
+    return matchday.matches.map((m, i) => {
+      if (!slots.includes(i)) return m;
+      const pick = matchday.bonanzaPicks?.[participantId]?.[i];
+      // Each pick carries its own unique id (stamped when it was chosen),
+      // so a cleared-and-repicked slot can never inherit a prediction that
+      // was made against the previous pick's teams.
+      return pick ? { id: pick.id, home: pick.home, away: pick.away, kickoff: null, outcome: pick.outcome ?? null } : m;
+    });
+  }
   if (matchday.freeMatchIndex === null || matchday.freeMatchIndex === undefined || !matchday.pairings) {
     return matchday.matches;
   }
@@ -567,6 +610,8 @@ function migrateData(data) {
       if (typeof md.scheduledDate === "undefined") md.scheduledDate = null;
       if (typeof md.freeMatchIndex === "undefined") md.freeMatchIndex = null;
       if (!md.customMatches) md.customMatches = {};
+      if (typeof md.bonanza !== "boolean") md.bonanza = false; // rare special matchdays — see bonanzaSlotsFor()
+      if (!md.bonanzaPicks) md.bonanzaPicks = {};
       // Grandfather in matchdays from before the publish-gate existed: if
       // every match already has a result, treat it as already published so
       // standings people had already seen don't disappear.
@@ -1410,6 +1455,7 @@ function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId
 function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, persist }) {
   const [draft, setDraft] = useState({});
   const [customDraft, setCustomDraft] = useState({}); // matchdayId -> { home, away }
+  const [bonanzaDraft, setBonanzaDraft] = useState({}); // "matchdayId__slot" -> { home, away }
   const [confirmation, setConfirmation] = useState(null);
   const [error, setError] = useState("");
 
@@ -1474,6 +1520,31 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
     await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
   };
 
+  // Saves one Bonanza pick (one slot). Each pick gets a unique id stamped
+  // now, so its predictions can never bleed onto a different pick if the
+  // admin later clears this one and the slot is re-picked.
+  const saveBonanzaPick = async (md, slotIdx) => {
+    const key = `${md.id}__${slotIdx}`;
+    const draftEntry = bonanzaDraft[key] || { home: "", away: "" };
+    if (!draftEntry.home.trim() || !draftEntry.away.trim()) { setError("Enter both team names for your pick."); return; }
+    setError("");
+    const nextMatchdays = league.matchdays.map((m) => {
+      if (m.id !== md.id) return m;
+      const allPicks = { ...(m.bonanzaPicks || {}) };
+      allPicks[viewerId] = {
+        ...(allPicks[viewerId] || {}),
+        [slotIdx]: {
+          id: `bonanza__${md.id}__${viewerId}__${slotIdx}__${Date.now()}`,
+          home: draftEntry.home.trim(),
+          away: draftEntry.away.trim(),
+          outcome: null,
+        },
+      };
+      return { ...m, bonanzaPicks: allPicks };
+    });
+    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
+  };
+
   return (
     <div className="space-y-6">
       {!viewerId && (
@@ -1504,7 +1575,15 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
         const isBye = viewerId && md.pairings?.bye === viewerId;
         const hostId = myPairing ? myPairing.home : null;
         const hostStadium = hostId ? league.participants.find((p) => p.id === hostId)?.stadium : null;
-        const hasFreeSlot = md.freeMatchIndex !== null && md.freeMatchIndex !== undefined;
+        const hasFreeSlot = !md.bonanza && md.freeMatchIndex !== null && md.freeMatchIndex !== undefined;
+        const bonanzaSlots = viewerId ? bonanzaSlotsFor(md, viewerId) : null; // null unless this is a Bonanza matchday I'm part of
+        // What each Bonanza slot allows, per the league rules: home
+        // contestants outside the Premier League get one any-division slot
+        // (Match 3); every other free slot is a Premier League match.
+        const bonanzaRuleFor = (slotIdx) =>
+          leagueKey !== "league1" && slotIdx === 2
+            ? "Any match of your choice, from the Premier League down to the National League."
+            : "Any Premier League match of your choice.";
         const isHomeInPairing = myPairing && myPairing.home === viewerId;
         const myCustomMatch = myPairing ? md.customMatches?.[myPairing.home] : null;
         const matches = viewerId ? effectiveMatchesFor(md, viewerId) : md.matches;
@@ -1525,9 +1604,58 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
             </p>
           )}
           {!opponentName && !isBye && <div className="mb-4" />}
+          {bonanzaSlots && (
+            <div className="flex items-start gap-2 bg-amber-400/10 border border-amber-400/30 text-amber-700 text-sm rounded-lg px-3 py-2.5 mb-4">
+              <Sparkles size={16} className="shrink-0 mt-0.5 text-amber-500" />
+              <span>
+                <strong className="font-display">Bonanza matchday!</strong>{" "}
+                {bonanzaSlots.length === 3
+                  ? (leagueKey === "league1"
+                      ? "You're at home — pick any 3 Premier League matches to predict."
+                      : "You're at home — pick 2 Premier League matches, plus Match 3 from any division (Premier League down to the National League).")
+                  : "Pick any 2 Premier League matches to predict — Match 3 is set for you below."}
+                {" "}Choose carefully: a pick can't be changed once set (your organizer can clear one if you make a mistake).
+              </span>
+            </div>
+          )}
           <div className="space-y-3">
             {matches.map((m, idx) => {
               const isFreeSlot = hasFreeSlot && idx === md.freeMatchIndex && isHomeInPairing;
+              const isBonanzaSlot = bonanzaSlots ? bonanzaSlots.includes(idx) : false;
+              const bonanzaPickSet = isBonanzaSlot && !!md.bonanzaPicks?.[viewerId]?.[idx];
+
+              // Bonanza: a free slot without a saved pick yet — show the
+              // per-slot picker instead of a prediction row. Once the pick
+              // is saved it becomes a normal prediction row (with the
+              // chosen teams) via effectiveMatchesFor.
+              if (isBonanzaSlot && !bonanzaPickSet) {
+                const bKey = `${md.id}__${idx}`;
+                const bDraft = bonanzaDraft[bKey] || { home: "", away: "" };
+                return (
+                  <div key={`bonanza-${md.id}-${idx}`} className="border border-amber-400/30 bg-amber-400/5 rounded-xl p-4 space-y-2">
+                    <div className="text-xs font-semibold text-amber-300 uppercase tracking-wide flex items-center gap-1.5"><Sparkles size={12} /> Match {idx + 1} — your Bonanza pick</div>
+                    <p className="text-[11px] text-stone-500">{bonanzaRuleFor(idx)}</p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        value={bDraft.home}
+                        onChange={(e) => setBonanzaDraft((d) => ({ ...d, [bKey]: { ...bDraft, home: e.target.value } }))}
+                        placeholder="Home team"
+                        className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                      />
+                      <span className="text-stone-500 text-xs">v</span>
+                      <input
+                        value={bDraft.away}
+                        onChange={(e) => setBonanzaDraft((d) => ({ ...d, [bKey]: { ...bDraft, away: e.target.value } }))}
+                        placeholder="Away team"
+                        className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                      />
+                      <button onClick={() => saveBonanzaPick(md, idx)} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
+                        Set match
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
 
               // The home contestant hasn't chosen their own match yet — show
               // the picker instead of a normal prediction row. Their
@@ -1571,7 +1699,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                 <div key={m.id} className="border border-stone-200 rounded-xl p-4 bg-white">
                   <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
                     <div className="text-xs text-stone-500 flex items-center gap-1">
-                      {isFreeSlot ? <><Landmark size={12} /> Your own match</> : <><Clock size={12} /> {fmtDateTime(m.kickoff)}</>}
+                      {(isFreeSlot || bonanzaPickSet) ? <><Landmark size={12} /> Your own match</> : <><Clock size={12} /> {fmtDateTime(m.kickoff)}</>}
                     </div>
                     {already && <span className="text-xs text-emerald-700 flex items-center gap-1 font-medium"><CheckCircle2 size={13} /> submitted</span>}
                   </div>
@@ -2078,10 +2206,14 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
     const m = effectiveMatchesFor(matchday, pid)[matchIdx];
     const pred = predictions[`${m.id}__${pid}`];
     const isSelf = pid === viewerId;
-    const isFree = matchday.freeMatchIndex === matchIdx;
-    const isCustomPick = isFree && m.id.startsWith("custom__");
+    // A slot where this contestant's fixture can differ from the default:
+    // the normal free slot, or their own Bonanza pick slots.
+    const isFree = matchday.bonanza
+      ? (bonanzaSlotsFor(matchday, pid)?.includes(matchIdx) ?? false)
+      : matchday.freeMatchIndex === matchIdx;
+    const isCustomPick = isFree && (m.id.startsWith("custom__") || m.id.startsWith("bonanza__"));
     const canSeePick = adminMode || matchday.resultsPublished || isSelf;
-    const canSeeVal = isFree ? canSeePick : (released || isSelf);
+    const canSeeVal = isCustomPick ? canSeePick : (released || isSelf);
     return (
       <div className="flex-1 min-w-0 text-center">
         {isCustomPick && (
@@ -2092,6 +2224,8 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
           )
         )}
         {isFree && !isCustomPick && (
+          // A pick slot where the contestant never chose — they fall back
+          // to the admin's default fixture, shown plainly.
           <div className="text-[10px] text-stone-500 leading-tight truncate">{m.home} v {m.away}</div>
         )}
         {pred ? (
@@ -2144,12 +2278,23 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
               </div>
             </div>
             {matchday.matches.map((defaultMatch, idx) => {
-              const isFree = matchday.freeMatchIndex === idx;
+              const isFree = !matchday.bonanza && matchday.freeMatchIndex === idx;
               return (
                 <div key={defaultMatch.id} className="flex items-center gap-2 px-3 py-2 border-t border-stone-100">
                   {sideCell(pair.home, idx)}
                   <div className="w-28 shrink-0 text-center text-[10px] text-stone-500 leading-tight">
-                    {isFree ? (
+                    {matchday.bonanza && idx < 2 ? (
+                      <span className="italic flex items-center justify-center gap-1"><Sparkles size={9} /> Bonanza picks</span>
+                    ) : matchday.bonanza && idx === 2 ? (
+                      <>
+                        <div className="truncate">{defaultMatch.home}</div>
+                        <div className="truncate">v {defaultMatch.away}</div>
+                        <div className="italic text-stone-400">anchor — home picks own</div>
+                        {defaultMatch.outcome && canSeeResults && (
+                          <div className="text-amber-500 font-mono-num">FT {defaultMatch.outcome.home}–{defaultMatch.outcome.away}</div>
+                        )}
+                      </>
+                    ) : isFree ? (
                       <span className="italic flex items-center justify-center gap-1"><Landmark size={9} /> Free match</span>
                     ) : (
                       <>
@@ -2271,12 +2416,21 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                     <th className="text-right px-3 py-3 font-semibold min-w-[70px] text-amber-300">Pts</th>
                     {md.matches.map((m, idx) => {
                       const isFreeCol = md.freeMatchIndex === idx;
+                      const isBonanzaFreeCol = md.bonanza && idx < 2;
+                      const isBonanzaAnchorCol = md.bonanza && idx === 2;
                       return (
                         <th key={m.id} className="text-center px-3 py-3 font-semibold min-w-[130px] text-amber-300">
-                          {isFreeCol ? (
+                          {isBonanzaAnchorCol ? (
+                            <div className="flex flex-col items-center gap-0.5">
+                              <div>{m.home}</div>
+                              <div className="text-stone-300 font-normal normal-case text-[11px]">v {m.away}</div>
+                              <span className="text-stone-300 font-normal normal-case text-[10px]" title="Away contestants predict this anchor match; home contestants pick their own">anchor — home contestants pick their own</span>
+                              {m.outcome && (adminMode || md.resultsPublished) && <div className="text-amber-300 font-mono-num text-[11px] mt-0.5">{m.outcome.home}–{m.outcome.away}</div>}
+                            </div>
+                          ) : (isFreeCol || isBonanzaFreeCol) ? (
                             <div className="flex flex-col items-center gap-0.5">
                               <span>Match {idx + 1}</span>
-                              <span className="text-stone-300 font-normal normal-case text-[10px]" title="Each pairing's home contestant may have swapped this for their own match">varies by contestant</span>
+                              <span className="text-stone-300 font-normal normal-case text-[10px]" title={isBonanzaFreeCol ? "Bonanza — every contestant picks their own match here" : "Each pairing's home contestant may have swapped this for their own match"}>varies by contestant</span>
                             </div>
                           ) : (
                             <>
@@ -2302,25 +2456,39 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                       <td className="px-3 py-3 text-right font-mono-num text-amber-300 font-semibold">{boardById[p.id]?.totalPoints ?? 0}</td>
                       {md.matches.map((defaultMatch, colIdx) => {
                         const isFreeCol = md.freeMatchIndex === colIdx;
+                        // Columns where the fixture can vary per contestant:
+                        // the normal free slot, or (on a Bonanza matchday)
+                        // every slot.
+                        const isPickCol = isFreeCol || md.bonanza;
                         // Each row's actual match at this slot — the default
-                        // fixture, unless this row's contestant is a pairing's
-                        // home contestant who's swapped it for their own.
-                        const m = isFreeCol ? effectiveMatchesFor(md, p.id)[colIdx] : defaultMatch;
+                        // fixture, unless this row's contestant has swapped
+                        // it for their own (free match or Bonanza pick).
+                        const m = isPickCol ? effectiveMatchesFor(md, p.id)[colIdx] : defaultMatch;
+                        // A contestant's OWN chosen fixture (never the admin
+                        // default) — these get the stricter hiding below.
+                        const isOwnPick = m.id.startsWith("custom__") || m.id.startsWith("bonanza__");
                         const pred = data.predictions[`${m.id}__${p.id}`];
                         const isSelf = p.id === viewerId;
-                        // The free slot is stricter than the normal reveal:
-                        // a home contestant's own pick — WHICH match they
+                        // Own picks are stricter than the normal reveal:
+                        // a contestant's chosen match — WHICH match they
                         // chose, not just their scoreline — stays hidden
                         // from everyone else until the matchday's results
                         // are published, not merely until the reveal time.
                         const canSeeCustomPick = adminMode || md.resultsPublished || isSelf;
-                        const canSeeValue = isFreeCol ? canSeeCustomPick : (released || isSelf);
+                        const canSeeValue = isOwnPick ? canSeeCustomPick : (released || isSelf);
                         const status = cellStatus(md, !!pred);
                         const Icon = STATUS_ICON[status];
                         return (
                           <td key={defaultMatch.id} className="px-3 py-3 text-center">
-                            {isFreeCol && (
-                              canSeeCustomPick ? (
+                            {isPickCol && (
+                              !isOwnPick ? (
+                                colIdx !== 2 || !md.bonanza ? (
+                                  <div className="text-[10px] text-stone-500 leading-tight mb-1">
+                                    {m.home} v {m.away}
+                                    {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
+                                  </div>
+                                ) : null /* the anchor column header already names the fixture */
+                              ) : canSeeCustomPick ? (
                                 <div className="text-[10px] text-stone-500 leading-tight mb-1">
                                   {m.home} v {m.away}
                                   {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
@@ -2380,11 +2548,15 @@ function computeMatchStats(match, predictions) {
 }
 
 function MatchStatsPanel({ matchday, predictions }) {
-  const statsMatches = matchday.matches.filter((_, idx) => idx !== matchday.freeMatchIndex);
+  const statsMatches = matchday.bonanza
+    ? matchday.matches.filter((_, idx) => idx === 2) // only the anchor is a shared fixture on a Bonanza matchday
+    : matchday.matches.filter((_, idx) => idx !== matchday.freeMatchIndex);
   return (
     <div className="border border-stone-200 rounded-2xl p-4 bg-white">
       <h4 className="text-xs font-semibold text-stone-500 uppercase tracking-wide mb-3 flex items-center gap-1.5"><BarChart3 size={13} /> What the league predicted</h4>
-      {matchday.freeMatchIndex !== null && matchday.freeMatchIndex !== undefined && (
+      {matchday.bonanza ? (
+        <p className="text-[11px] text-stone-500 mb-3">Bonanza matchday — everyone picked their own matches, so only the anchor match (predicted by away contestants) can be summarized.</p>
+      ) : (matchday.freeMatchIndex !== null && matchday.freeMatchIndex !== undefined) && (
         <p className="text-[11px] text-stone-500 mb-3">The free match slot is skipped here — it's a different fixture for each home contestant, so it can't be summarized as one match.</p>
       )}
       <div className="grid sm:grid-cols-3 gap-4">
@@ -3423,6 +3595,8 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       scheduledDate: league.h2hSchedule[roundIndex]?.scheduledDate ?? null,
       freeMatchIndex: null,
       customMatches: {},
+      bonanza: false,
+      bonanzaPicks: {},
       matches: picked.map((f) => ({ id: f.id, home: f.home, away: f.away, kickoff: f.kickoff, outcome: null })),
     };
     await updateLeague({
@@ -3707,6 +3881,17 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
     });
     return out;
   });
+  // Bonanza picks' outcomes, keyed "participantId__slot" — same pattern as
+  // customOutcomes but per slot, since one contestant can have up to 3 picks.
+  const [bonanzaOutcomes, setBonanzaOutcomes] = useState(() => {
+    const out = {};
+    Object.entries(matchday.bonanzaPicks || {}).forEach(([pid, slots]) => {
+      Object.entries(slots).forEach(([slot, pick]) => {
+        out[`${pid}__${slot}`] = { outcomeHome: pick.outcome?.home ?? "", outcomeAway: pick.outcome?.away ?? "" };
+      });
+    });
+    return out;
+  });
   const [saved, setSaved] = useState(false);
 
   const setMatchField = (idx, field, val) =>
@@ -3714,6 +3899,22 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
 
   const setCustomOutcomeField = (homeId, field, val) =>
     setCustomOutcomes((o) => ({ ...o, [homeId]: { ...o[homeId], [field]: val } }));
+
+  const setBonanzaOutcomeField = (key, field, val) =>
+    setBonanzaOutcomes((o) => ({ ...o, [key]: { ...o[key], [field]: val } }));
+
+  // Admin's escape hatch for a mistyped Bonanza pick: clears the pick (the
+  // contestant can then choose again). Any prediction made against the old
+  // pick is simply orphaned — pick ids are unique per choice, so it can
+  // never re-attach to the replacement.
+  const clearBonanzaPick = (pid, slot) => {
+    const next = JSON.parse(JSON.stringify(matchday.bonanzaPicks || {}));
+    if (next[pid]) {
+      delete next[pid][slot];
+      if (Object.keys(next[pid]).length === 0) delete next[pid];
+    }
+    onUpdate({ bonanzaPicks: next });
+  };
 
   const save = () => {
     const nextMatches = matches.map((m) => ({
@@ -3731,6 +3932,17 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
         outcome: o.outcomeHome !== "" && o.outcomeAway !== "" ? { home: Number(o.outcomeHome), away: Number(o.outcomeAway) } : null,
       };
     });
+    const nextBonanzaPicks = JSON.parse(JSON.stringify(matchday.bonanzaPicks || {}));
+    Object.entries(bonanzaOutcomes).forEach(([key, o]) => {
+      const sep = key.lastIndexOf("__");
+      const pid = key.slice(0, sep);
+      const slot = key.slice(sep + 2);
+      if (!nextBonanzaPicks[pid] || !nextBonanzaPicks[pid][slot]) return; // pick was cleared since — skip
+      nextBonanzaPicks[pid][slot] = {
+        ...nextBonanzaPicks[pid][slot],
+        outcome: o.outcomeHome !== "" && o.outcomeAway !== "" ? { home: Number(o.outcomeHome), away: Number(o.outcomeAway) } : null,
+      };
+    });
     onUpdate({
       label,
       scheduledDate: scheduledDate || null,
@@ -3739,15 +3951,17 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
       scoring,
       blog,
       matches: nextMatches,
-      freeMatchIndex,
+      freeMatchIndex: matchday.bonanza ? null : freeMatchIndex,
       customMatches: nextCustomMatches,
+      bonanzaPicks: nextBonanzaPicks,
     });
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
   };
 
   const allScored = matchday.matches.every((m) => m.outcome)
-    && Object.values(matchday.customMatches || {}).every((c) => c.outcome);
+    && Object.values(matchday.customMatches || {}).every((c) => c.outcome)
+    && Object.values(matchday.bonanzaPicks || {}).every((slots) => Object.values(slots).every((pick) => pick.outcome));
   const preview = useMemo(
     () => (allScored && !matchday.resultsPublished ? computeMatchdayPoints(matchday, predictions, participants) : null),
     [allScored, matchday, predictions, participants]
@@ -3782,6 +3996,21 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
           </button>
         </div>
       )}
+
+      <div className={cx("rounded-lg px-3 py-2.5 border", matchday.bonanza ? "border-amber-400/40 bg-amber-400/10" : "border-stone-200 bg-stone-50")}>
+        <label className="flex items-center gap-2 text-sm font-medium">
+          <input
+            type="checkbox"
+            checked={!!matchday.bonanza}
+            onChange={(e) => onUpdate(e.target.checked ? { bonanza: true, freeMatchIndex: null } : { bonanza: false })}
+            className="accent-violet-700"
+          />
+          <Sparkles size={14} className="text-amber-500" /> Bonanza matchday
+        </label>
+        <p className="text-[11px] text-stone-500 mt-1">
+          Every contestant picks their own matches: pairing homes pick all 3 (Premier League home contestants: any 3 PL matches; other divisions' homes: 2 PL matches + Match 3 from any division down to the National League). Away contestants and byes pick matches 1–2 (PL) and predict <strong>Match 3 below as the anchor</strong>. Your three fixtures stay as fallbacks — anyone who never picks a slot is scored on your fixture there, so enter results for all three. Supersedes the free-match slot.
+        </p>
+      </div>
 
       {matchday.pairings ? (
         <div className="border border-stone-200 rounded-lg px-3 py-2 bg-stone-50">
@@ -3847,9 +4076,16 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
       </div>
 
       <div className="space-y-2">
-        <label className="text-xs text-stone-500">Fixtures — optionally mark one as the "free" match each pairing's home contestant can swap out</label>
+        <label className="text-xs text-stone-500">
+          {matchday.bonanza
+            ? "Fixtures — fallbacks for unpicked Bonanza slots; Match 3 is the anchor away contestants predict"
+            : "Fixtures — optionally mark one as the \"free\" match each pairing's home contestant can swap out"}
+        </label>
         {matches.map((m, idx) => (
           <div key={m.id} className="flex flex-wrap items-center gap-2 border border-stone-200 rounded-xl p-3 bg-white">
+            {matchday.bonanza ? (
+              idx === 2 && <span className="text-[10px] text-amber-600 font-semibold uppercase tracking-wide shrink-0" title="Away contestants predict this match">Anchor</span>
+            ) : (
             <label className="flex items-center gap-1.5 text-[10px] text-stone-500" title="Home contestants can replace this match with their own">
               <input
                 type="radio"
@@ -3860,6 +4096,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
               />
               Free
             </label>
+            )}
             <input value={m.home} onChange={(e) => setMatchField(idx, "home", e.target.value)} className="bg-transparent text-sm font-medium w-36 focus:outline-none border-b border-transparent focus:border-stone-400" />
             <span className="text-stone-500 text-xs">vs</span>
             <input value={m.away} onChange={(e) => setMatchField(idx, "away", e.target.value)} className="bg-transparent text-sm font-medium w-36 focus:outline-none border-b border-transparent focus:border-stone-400" />
@@ -3872,12 +4109,55 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
             </div>
           </div>
         ))}
-        {freeMatchIndex !== null && (
+        {!matchday.bonanza && freeMatchIndex !== null && (
           <button onClick={() => setFreeMatchIndex(null)} className="text-xs text-stone-500 hover:text-stone-900">Turn off free match for this matchday</button>
         )}
       </div>
 
-      {freeMatchIndex !== null && matchday.pairings && (
+      {matchday.bonanza && matchday.pairings && (
+        <div>
+          <label className="text-xs text-stone-500">Bonanza picks — every contestant's chosen matches; enter their real results here</label>
+          <div className="space-y-2 mt-1.5">
+            {participants.map((p) => {
+              const slots = bonanzaSlotsFor(matchday, p.id);
+              if (!slots) return null;
+              const picks = matchday.bonanzaPicks?.[p.id] || {};
+              return (
+                <div key={p.id} className="border border-stone-200 rounded-xl p-3 bg-stone-50 space-y-2">
+                  <div className="text-xs font-semibold">{p.name} <span className="text-stone-500 font-normal">— picks {slots.length} of 3{slots.length === 2 ? " (Match 3 is the anchor)" : ""}</span></div>
+                  {slots.map((slot) => {
+                    const pick = picks[slot];
+                    if (!pick) {
+                      return (
+                        <div key={slot} className="text-xs text-stone-500 border border-stone-200 rounded-lg px-3 py-2 bg-white">
+                          Match {slot + 1}: not picked yet — falls back to your fixture above if it stays that way.
+                        </div>
+                      );
+                    }
+                    const oKey = `${p.id}__${slot}`;
+                    const o = bonanzaOutcomes[oKey] || { outcomeHome: "", outcomeAway: "" };
+                    return (
+                      <div key={slot} className="flex flex-wrap items-center gap-2 border border-stone-200 rounded-xl p-3 bg-white">
+                        <span className="text-[10px] text-stone-500 shrink-0">Match {slot + 1}:</span>
+                        <span className="text-sm font-medium">{pick.home} <span className="text-stone-500">v</span> {pick.away}</span>
+                        <button onClick={() => clearBonanzaPick(p.id, slot)} className="text-[10px] text-stone-400 hover:text-rose-600" title="Clear this pick so the contestant can choose again (their prediction on it is discarded)">clear pick</button>
+                        <div className="flex items-center gap-1 ml-auto">
+                          <span className="text-[10px] text-stone-500 mr-1">Result</span>
+                          <input type="number" min="0" value={o.outcomeHome} onChange={(e) => setBonanzaOutcomeField(oKey, "outcomeHome", e.target.value)} className="w-12 text-center bg-white border border-stone-300 rounded-lg px-1 py-1 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                          <span className="text-stone-500">–</span>
+                          <input type="number" min="0" value={o.outcomeAway} onChange={(e) => setBonanzaOutcomeField(oKey, "outcomeAway", e.target.value)} className="w-12 text-center bg-white border border-stone-300 rounded-lg px-1 py-1 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {!matchday.bonanza && freeMatchIndex !== null && matchday.pairings && (
         <div>
           <label className="text-xs text-stone-500">Custom matches chosen by home contestants — enter their real results here too</label>
           <div className="space-y-2 mt-1.5">
@@ -3988,6 +4268,8 @@ function NewMatchdayForm({ league, onCreate, onCancel }) {
       scheduledDate: league.h2hSchedule[roundIndex]?.scheduledDate ?? null,
       freeMatchIndex: null,
       customMatches: {},
+      bonanza: false,
+      bonanzaPicks: {},
       matches: fixtures.map((f, i) => ({
         id: `m_${Date.now()}_${i}`,
         home: f.home.trim(),
@@ -4122,6 +4404,7 @@ function computeLeaderboardWithPredictions(participants, matchdays, predictions,
 function allMatchIdsForMatchday(md) {
   const ids = md.matches.map((m) => m.id);
   Object.keys(md.customMatches || {}).forEach((homeId) => ids.push(`custom__${md.id}__${homeId}`));
+  Object.values(md.bonanzaPicks || {}).forEach((slots) => Object.values(slots).forEach((pick) => ids.push(pick.id)));
   return ids;
 }
 
