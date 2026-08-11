@@ -129,6 +129,7 @@ function emptyLeagueSlot(name, maxParticipants, minParticipants) {
     participants: [],
     matchdays: [],
     fixturePool: [],
+    adjustments: [],
   };
 }
 
@@ -555,6 +556,7 @@ function migrateData(data) {
     });
     if (!league.fixturePool) league.fixturePool = [];
     if (!Array.isArray(league.h2hSchedule)) league.h2hSchedule = [];
+    if (!Array.isArray(league.adjustments)) league.adjustments = []; // manual standings corrections — see AdjustmentsCard
     league.h2hSchedule.forEach((round) => {
       if (typeof round.scheduledDate === "undefined") round.scheduledDate = null;
     });
@@ -596,6 +598,7 @@ function splitData(data) {
       h2hSchedule: league.h2hSchedule,
       matchdays: league.matchdays,
       fixturePool: league.fixturePool,
+      adjustments: league.adjustments ?? [],
     };
     rosterLeagues[key] = { participants: league.participants.map(stripPhoto) };
     league.participants.forEach((p) => {
@@ -1257,7 +1260,7 @@ function ForecastRoomApp() {
 
 function Header({ data, leagueKey }) {
   const league = data.leagues[leagueKey];
-  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
   const leader = board[0];
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-10 pb-6 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
@@ -2047,11 +2050,147 @@ function FixtureListView({ league, viewerId }) {
   );
 }
 
+// -----------------------------------------------------------------------------
+// HEAD-TO-HEAD CARDS — the pairing-first view of a matchday: one card per
+// match-up, with both contestants' predictions aligned side by side,
+// match by match, and the head-to-head outcome once results are published.
+// This replaces the old "scan the big grid for your opponent's row"
+// experience; the full grid is still available behind a toggle. Your own
+// pairing is highlighted and sorted to the front. All the same visibility
+// rules apply: other people's picks hide until the reveal time, and free-
+// match selections (fixture AND scoreline) hide until results are published.
+// -----------------------------------------------------------------------------
+function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, now }) {
+  if (!matchday.pairings) return null;
+  const released = adminMode || isReleased(matchday, now);
+  const canSeeResults = adminMode || matchday.resultsPublished;
+  const byId = Object.fromEntries(league.participants.map((p) => [p.id, p]));
+  const h2h = canSeeResults ? computeH2HResultsForMatchday(matchday, predictions, league.participants) : null;
+
+  // Your own pairing first, then roster order.
+  const pairings = [...matchday.pairings.pairings].sort((a, b) => {
+    const aMine = viewerId && (a.home === viewerId || a.away === viewerId) ? 0 : 1;
+    const bMine = viewerId && (b.home === viewerId || b.away === viewerId) ? 0 : 1;
+    return aMine - bMine;
+  });
+
+  const sideCell = (pid, matchIdx) => {
+    const m = effectiveMatchesFor(matchday, pid)[matchIdx];
+    const pred = predictions[`${m.id}__${pid}`];
+    const isSelf = pid === viewerId;
+    const isFree = matchday.freeMatchIndex === matchIdx;
+    const isCustomPick = isFree && m.id.startsWith("custom__");
+    const canSeePick = adminMode || matchday.resultsPublished || isSelf;
+    const canSeeVal = isFree ? canSeePick : (released || isSelf);
+    return (
+      <div className="flex-1 min-w-0 text-center">
+        {isCustomPick && (
+          canSeePick ? (
+            <div className="text-[10px] text-stone-500 leading-tight truncate">{m.home} v {m.away}</div>
+          ) : (
+            <div className="text-[10px] text-stone-400 italic leading-tight flex items-center justify-center gap-1"><EyeOff size={9} /> pick hidden</div>
+          )
+        )}
+        {isFree && !isCustomPick && (
+          <div className="text-[10px] text-stone-500 leading-tight truncate">{m.home} v {m.away}</div>
+        )}
+        {pred ? (
+          canSeeVal
+            ? <span className="font-mono-num text-sm font-semibold text-stone-900">{pred.home}–{pred.away}</span>
+            : <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-medium"><CheckCircle2 size={10} /> submitted</span>
+        ) : (
+          <span className="text-[10px] text-stone-400">{matchday.locked ? "no pick" : "pending"}</span>
+        )}
+        {isCustomPick && canSeePick && canSeeResults && m.outcome && (
+          <div className="text-[10px] text-amber-500 font-mono-num">FT {m.outcome.home}–{m.outcome.away}</div>
+        )}
+      </div>
+    );
+  };
+
+  const nameOf = (pid) => byId[pid]?.name ?? "?";
+
+  return (
+    <div className="grid sm:grid-cols-2 gap-3">
+      {pairings.map((pair, i) => {
+        const mine = viewerId && (pair.home === viewerId || pair.away === viewerId);
+        const home = byId[pair.home];
+        const away = byId[pair.away];
+        const result = h2h?.[pair.home];
+        let resultLine = null;
+        let resultTone = "text-stone-500";
+        if (result && result.ownRaw !== null && result.opponentRaw !== null) {
+          if (result.outcome === "draw") {
+            resultLine = `Draw ${result.ownRaw}–${result.opponentRaw} · 1 pt each`;
+          } else if (result.outcome === "win") {
+            resultLine = `${nameOf(pair.home)} won ${result.ownRaw}–${result.opponentRaw} · 3 pts`;
+            resultTone = "text-emerald-700";
+          } else {
+            resultLine = `${nameOf(pair.away)} won ${result.opponentRaw}–${result.ownRaw} · 3 pts`;
+            resultTone = "text-emerald-700";
+          }
+        }
+        return (
+          <div key={i} className={cx("border rounded-2xl bg-white overflow-hidden", mine ? "border-amber-400/50" : "border-stone-200")}>
+            <div className={cx("flex items-center gap-2 px-3 py-2", mine ? "bg-amber-400/10" : "bg-stone-50")}>
+              <div className="flex items-center gap-2 flex-1 min-w-0">
+                <Avatar name={home?.name ?? "?"} photo={home?.photo} size={26} />
+                <span className={cx("font-medium text-sm truncate", pair.home === viewerId && "text-amber-600")}>{nameOf(pair.home)}</span>
+              </div>
+              <span className="text-[10px] text-stone-400 font-display shrink-0">V</span>
+              <div className="flex items-center gap-2 flex-1 min-w-0 justify-end">
+                <span className={cx("font-medium text-sm truncate text-right", pair.away === viewerId && "text-amber-600")}>{nameOf(pair.away)}</span>
+                <Avatar name={away?.name ?? "?"} photo={away?.photo} size={26} />
+              </div>
+            </div>
+            {matchday.matches.map((defaultMatch, idx) => {
+              const isFree = matchday.freeMatchIndex === idx;
+              return (
+                <div key={defaultMatch.id} className="flex items-center gap-2 px-3 py-2 border-t border-stone-100">
+                  {sideCell(pair.home, idx)}
+                  <div className="w-28 shrink-0 text-center text-[10px] text-stone-500 leading-tight">
+                    {isFree ? (
+                      <span className="italic flex items-center justify-center gap-1"><Landmark size={9} /> Free match</span>
+                    ) : (
+                      <>
+                        <div className="truncate">{defaultMatch.home}</div>
+                        <div className="truncate">v {defaultMatch.away}</div>
+                        {defaultMatch.outcome && canSeeResults && (
+                          <div className="text-amber-500 font-mono-num">FT {defaultMatch.outcome.home}–{defaultMatch.outcome.away}</div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  {sideCell(pair.away, idx)}
+                </div>
+              );
+            })}
+            {resultLine && (
+              <div className={cx("px-3 py-2 border-t border-stone-100 bg-stone-50 text-xs font-medium text-center", resultTone)}>
+                <Trophy size={11} className="inline mr-1 -mt-0.5 text-amber-400" />{resultLine}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {matchday.pairings.bye && (
+        <div className={cx("border rounded-2xl bg-white px-3 py-4 flex items-center justify-center gap-2 text-sm", viewerId === matchday.pairings.bye ? "border-amber-400/50 text-amber-600 font-medium" : "border-stone-200 text-stone-500")}>
+          <Sparkles size={14} className="text-amber-400" /> {nameOf(matchday.pairings.bye)} has a bye — automatic win
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MatrixView({ league, data, viewerId, adminMode, now }) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+  // Which matchdays have their full prediction grid expanded — for matchdays
+  // with head-to-head pairings, the cards are the default view and the grid
+  // is opt-in; matchdays without pairings show the grid as before.
+  const [openTables, setOpenTables] = useState({});
 
-  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
   const boardById = useMemo(() => Object.fromEntries(board.map((r) => [r.id, r])), [board]);
   const nameById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.name])), [league.participants]);
 
@@ -2107,26 +2246,7 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
               </span>
             </div>
             {md.pairings && (
-              <div className="border border-stone-200 rounded-xl px-3 py-2 bg-stone-50">
-                <div className="text-[11px] text-stone-500 uppercase tracking-wide mb-1">Head-to-head pairings this matchday</div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
-                  {md.pairings.pairings.map((p, i) => {
-                    const mine = viewerId && (p.home === viewerId || p.away === viewerId);
-                    const stadium = nameById[p.home] && league.participants.find((x) => x.id === p.home)?.stadium;
-                    return (
-                      <span key={i} className={mine ? "text-amber-300 font-medium" : "text-stone-700"}>
-                        {nameById[p.home] ?? "?"} v {nameById[p.away] ?? "?"}
-                        {stadium && <span className="opacity-70"> · {stadium}</span>}
-                      </span>
-                    );
-                  })}
-                  {md.pairings.bye && (
-                    <span className={viewerId === md.pairings.bye ? "text-amber-300 font-medium" : "text-stone-500"}>
-                      Bye: {nameById[md.pairings.bye] ?? "?"}
-                    </span>
-                  )}
-                </div>
-              </div>
+              <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} />
             )}
             {released && md.blog && md.blog.trim() && (
               <div className="border border-amber-400/20 bg-amber-400/5 rounded-2xl p-4">
@@ -2134,6 +2254,15 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                 <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.blog}</p>
               </div>
             )}
+            {md.pairings && (
+              <button
+                onClick={() => setOpenTables((t) => ({ ...t, [md.id]: !t[md.id] }))}
+                className="text-xs text-stone-500 hover:text-stone-900 flex items-center gap-1"
+              >
+                <BarChart3 size={12} /> {openTables[md.id] ? "Hide full prediction grid" : "Show full prediction grid"}
+              </button>
+            )}
+            {(!md.pairings || openTables[md.id]) && (
             <div className="overflow-x-auto border border-stone-200 rounded-2xl">
               <table className="min-w-full text-sm">
                 <thead>
@@ -2214,6 +2343,7 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                 </tbody>
               </table>
             </div>
+            )}
             {released && <MatchStatsPanel matchday={md} predictions={data.predictions} />}
           </div>
         );
@@ -2802,15 +2932,121 @@ function RoomSettingsCard({ currentPin, onUpdatePin }) {
   );
 }
 
+// Manual standings corrections — for when a mistake slips through during
+// the season. Deliberately built as a layer of adjustments applied ON TOP
+// of the computed standings (see computeLeaderboardWithPredictions), never
+// by editing the underlying results: the record stays intact, every
+// correction carries a note saying why, and any of them can be removed
+// again to undo it.
+function AdjustmentsCard({ league, leagueKey, data, persist }) {
+  const [participantId, setParticipantId] = useState("");
+  const [pointsDelta, setPointsDelta] = useState("");
+  const [diffDelta, setDiffDelta] = useState("");
+  const [note, setNote] = useState("");
+  const [error, setError] = useState("");
+  const nameById = Object.fromEntries(league.participants.map((p) => [p.id, p.name]));
+  const adjustments = league.adjustments || [];
+
+  const fmtDelta = (n, suffix) => `${n > 0 ? "+" : ""}${n} ${suffix}`;
+
+  const add = async () => {
+    if (!participantId) { setError("Choose a contestant."); return; }
+    const lp = Number(pointsDelta) || 0;
+    const sd = Number(diffDelta) || 0;
+    if (lp === 0 && sd === 0) { setError("Enter a non-zero league points and/or score difference change."); return; }
+    if (!note.trim()) { setError("Add a short note saying what this corrects — so it's always clear later why the table doesn't match the raw results."); return; }
+    setError("");
+    const entry = { id: `adj_${Date.now()}`, participantId, leaguePoints: lp, scoreDiff: sd, note: note.trim(), createdAt: new Date().toISOString() };
+    const ok = await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, adjustments: [...adjustments, entry] } } });
+    if (ok) { setParticipantId(""); setPointsDelta(""); setDiffDelta(""); setNote(""); }
+  };
+
+  const remove = async (id) => {
+    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, adjustments: adjustments.filter((a) => a.id !== id) } } });
+  };
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5 space-y-4">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Target size={18} className="text-amber-400" /> Standings corrections — {league.name}</h2>
+      <p className="text-xs text-stone-500">
+        Applies a manual change to a contestant's league points and/or score difference, on top of the computed standings — for correcting mistakes without touching the underlying results. Each correction shows here with its note, and removing it undoes it. Corrections are cleared automatically when a season ends (they're archived inside that season's final standings).
+      </p>
+
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+
+      {adjustments.length > 0 && (
+        <div className="space-y-2">
+          {adjustments.map((adj) => (
+            <div key={adj.id} className="flex flex-wrap items-center gap-3 border border-stone-200 rounded-xl px-3 py-2 bg-stone-50">
+              <span className="font-medium text-sm">{nameById[adj.participantId] ?? "(removed contestant)"}</span>
+              {(adj.leaguePoints || 0) !== 0 && (
+                <span className={cx("font-mono-num text-sm font-semibold", adj.leaguePoints > 0 ? "text-emerald-600" : "text-rose-600")}>{fmtDelta(adj.leaguePoints, "pts")}</span>
+              )}
+              {(adj.scoreDiff || 0) !== 0 && (
+                <span className={cx("font-mono-num text-sm", adj.scoreDiff > 0 ? "text-emerald-600" : "text-rose-600")}>{fmtDelta(adj.scoreDiff, "diff")}</span>
+              )}
+              <span className="text-xs text-stone-500 flex-1 min-w-[140px]">{adj.note} <span className="text-stone-400">· {fmtDateTime(adj.createdAt)}</span></span>
+              <button onClick={() => remove(adj.id)} className="text-stone-500 hover:text-rose-600 shrink-0" title="Remove this correction (undoes it)"><X size={15} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-end gap-2">
+        <div>
+          <label className="text-[10px] text-stone-500">Contestant</label>
+          <select value={participantId} onChange={(e) => setParticipantId(e.target.value)} className="block bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50">
+            <option value="">— choose —</option>
+            {league.participants.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-[10px] text-stone-500">League pts (+/−)</label>
+          <input type="number" step="1" value={pointsDelta} onChange={(e) => setPointsDelta(e.target.value)} placeholder="e.g. -3" className="block w-24 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <div>
+          <label className="text-[10px] text-stone-500">Score diff (+/−)</label>
+          <input type="number" step="1" value={diffDelta} onChange={(e) => setDiffDelta(e.target.value)} placeholder="e.g. 2" className="block w-24 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm font-mono-num focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <div className="flex-1 min-w-[180px]">
+          <label className="text-[10px] text-stone-500">Why? (required)</label>
+          <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. MD4 result entered wrong — corrected" className="block w-full bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <button onClick={add} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+          <Plus size={15} /> Apply correction
+        </button>
+      </div>
+    </section>
+  );
+}
+
 // One roster entry: name, registration status, invite code, badge upload,
 // and admin actions. Badge upload reuses the same client-side resize used
 // for profile photos, so a big source image never bloats storage.
-function RosterRow({ participant, claimed, copied, copyFailed, onCopyCode, onRegenerateCode, pendingRemove, onRequestRemove, onConfirmRemove, onCancelRemove, onSetBadge, onSetStadium, onMoveLeague, moveOptions }) {
+function RosterRow({ participant, claimed, copied, copyFailed, onCopyCode, onRegenerateCode, pendingRemove, onRequestRemove, onConfirmRemove, onCancelRemove, onSetBadge, onSetStadium, onMoveLeague, moveOptions, resetCode, onGenerateResetCode, onCancelResetCode }) {
   const fileInputRef = useRef(null);
   const [uploading, setUploading] = useState(false);
   const [stadiumDraft, setStadiumDraft] = useState(participant.stadium ?? "");
+  const [confirmingReset, setConfirmingReset] = useState(false);
+  const [resetCopied, setResetCopied] = useState(false);
 
   useEffect(() => { setStadiumDraft(participant.stadium ?? ""); }, [participant.id, participant.stadium]);
+  useEffect(() => { if (resetCode) setConfirmingReset(false); }, [resetCode]);
+
+  const copyResetCode = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard API unavailable");
+      await navigator.clipboard.writeText(resetCode);
+      setResetCopied(true);
+      setTimeout(() => setResetCopied(false), 1500);
+    } catch {
+      /* the code is visible on screen to select manually */
+    }
+  };
 
   const handleFile = async (e) => {
     const file = e.target.files?.[0];
@@ -2856,6 +3092,11 @@ function RosterRow({ participant, claimed, copied, copyFailed, onCopyCode, onReg
         <button onClick={onRegenerateCode} className="text-xs text-stone-500 hover:text-stone-900" title="Invalidate the old code and issue a new one">
           Regenerate
         </button>
+        {claimed && !resetCode && !confirmingReset && (
+          <button onClick={() => setConfirmingReset(true)} className="text-xs text-stone-500 hover:text-stone-900" title="Generate a one-time password reset code for this contestant">
+            Reset password
+          </button>
+        )}
         {moveOptions && moveOptions.length > 0 && (
           moveOptions.length === 1 ? (
             <button onClick={() => onMoveLeague(moveOptions[0].key)} className="text-xs text-stone-500 hover:text-stone-900" title={`Move to ${moveOptions[0].name}`}>
@@ -2887,6 +3128,25 @@ function RosterRow({ participant, claimed, copied, copyFailed, onCopyCode, onReg
           className="text-xs bg-transparent text-stone-500 focus:text-stone-900 placeholder:text-stone-400 focus:outline-none border-b border-transparent focus:border-stone-400 w-52"
         />
       </div>
+      {confirmingReset && !resetCode && (
+        <div className="mt-2 flex items-center gap-2 bg-amber-400/5 border border-amber-400/20 rounded-lg px-3 py-2 flex-wrap">
+          <span className="text-xs text-amber-700">
+            Generate a one-time password reset code for {participant.name}? Their current password keeps working until they use the code — so this is safe to cancel later if they remember it.
+          </span>
+          <button onClick={onGenerateResetCode} className="ml-auto text-xs bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded px-2 py-1 shrink-0">Yes, generate</button>
+          <button onClick={() => setConfirmingReset(false)} className="text-xs text-stone-500 hover:text-stone-900 shrink-0">Cancel</button>
+        </div>
+      )}
+      {resetCode && (
+        <div className="mt-2 flex items-center gap-2 bg-violet-700/5 border border-violet-700/20 rounded-lg px-3 py-2 flex-wrap">
+          <KeyRound size={12} className="text-violet-700 shrink-0" />
+          <span className="text-xs text-stone-600">Reset code:</span>
+          <code className="font-mono-num text-sm text-violet-700 bg-white border border-violet-700/20 rounded px-2 py-0.5 tracking-widest">{resetCode}</code>
+          <button onClick={copyResetCode} className="text-xs text-stone-500 hover:text-stone-900">{resetCopied ? "Copied!" : "Copy"}</button>
+          <span className="text-[11px] text-stone-500 flex-1 min-w-[160px]">Send this privately to {participant.name} — they use it via "Forgotten your password?" on the login screen. Works once, then disappears.</span>
+          <button onClick={onCancelResetCode} className="text-xs text-stone-500 hover:text-rose-600 shrink-0">Cancel reset</button>
+        </div>
+      )}
       {pendingRemove && (
         <div className="mt-2 flex items-center gap-2 bg-rose-50 border border-rose-300/20 rounded-lg px-3 py-2">
           <span className="text-xs text-rose-700">
@@ -2957,6 +3217,31 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
   const [moveError, setMoveError] = useState("");
   const atCap = league.participants.length >= league.maxParticipants;
   const claimedIds = useMemo(() => new Set(Object.values(data.accounts).map((a) => a.participantId)), [data.accounts]);
+  // Account lookup by contestant, for the password-reset flow: admin
+  // generates a one-time code here; the contestant uses it on the login
+  // screen's "Forgotten your password?" form to set a new password. Their
+  // old password keeps working until the code is used — so a reset that
+  // turns out to be unnecessary (they remembered it after all) costs
+  // nothing and can simply be cancelled.
+  const accountByParticipantId = useMemo(() => {
+    const map = {};
+    Object.entries(data.accounts).forEach(([email, acc]) => { map[acc.participantId] = { ...acc, email }; });
+    return map;
+  }, [data.accounts]);
+
+  const generateResetCode = async (participantId) => {
+    const acc = accountByParticipantId[participantId];
+    if (!acc) return;
+    const code = randomInviteCode(8);
+    await persist({ ...data, accounts: { ...data.accounts, [acc.email]: { ...data.accounts[acc.email], resetCode: code } } });
+  };
+
+  const cancelResetCode = async (participantId) => {
+    const acc = accountByParticipantId[participantId];
+    if (!acc) return;
+    const { resetCode, ...rest } = data.accounts[acc.email];
+    await persist({ ...data, accounts: { ...data.accounts, [acc.email]: rest } });
+  };
 
   const updatePin = async (newPin) => {
     await persist({ ...data, adminPin: newPin });
@@ -3020,7 +3305,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       ...data,
       accounts: nextAccounts,
       predictions: nextPredictions,
-      leagues: { ...data.leagues, [leagueKey]: { ...league, participants: league.participants.filter((p) => p.id !== id) } },
+      leagues: { ...data.leagues, [leagueKey]: { ...league, participants: league.participants.filter((p) => p.id !== id), adjustments: (league.adjustments || []).filter((a) => a.participantId !== id) } },
     });
     setPendingRemoveId(null);
   };
@@ -3153,6 +3438,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       <SeasonCard data={data} persist={persist} />
       <DivisionsCard data={data} persist={persist} />
       <RoomSettingsCard currentPin={data.adminPin} onUpdatePin={updatePin} />
+      <AdjustmentsCard league={league} leagueKey={leagueKey} data={data} persist={persist} />
 
       {/* Participants */}
       <section className="bg-white border border-stone-200 rounded-2xl p-5">
@@ -3179,6 +3465,9 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
               onCancelRemove={() => setPendingRemoveId(null)}
               onSetBadge={(badge) => setBadge(p.id, badge)}
               onSetStadium={(stadium) => setStadium(p.id, stadium)}
+              resetCode={accountByParticipantId[p.id]?.resetCode ?? null}
+              onGenerateResetCode={() => generateResetCode(p.id)}
+              onCancelResetCode={() => cancelResetCode(p.id)}
               moveOptions={claimedIds.has(p.id) ? [] : otherLeagueKeys.map((k) => ({ key: k, name: data.leagues[k].name }))}
               onMoveLeague={(targetKey) => moveToLeague(p.id, targetKey)}
             />
@@ -3761,7 +4050,12 @@ function publishedMatchdays(league) {
 // loses (0) — see computeH2HResultsForMatchday. Table order is league
 // points, then cumulative score difference, then alphabetical — exactly
 // the tiebreak chain requested, so ties are (almost) always fully resolved.
-function computeLeaderboardWithPredictions(participants, matchdays, predictions) {
+//
+// `adjustments` are the admin's manual corrections (see AdjustmentsCard) —
+// applied as a layer ON TOP of the computed results, never by editing them,
+// so the underlying record stays intact and any correction is visible and
+// reversible.
+function computeLeaderboardWithPredictions(participants, matchdays, predictions, adjustments = []) {
   const stats = {};
   participants.forEach((p) => {
     stats[p.id] = { id: p.id, name: p.name, leaguePoints: 0, scoreDifference: 0, wins: 0, draws: 0, losses: 0, predictedPointsTotal: 0, correctCount: 0, evaluatedCount: 0 };
@@ -3789,6 +4083,14 @@ function computeLeaderboardWithPredictions(participants, matchdays, predictions)
       else if (h2h.outcome === "draw") stats[pid].draws += 1;
       else if (h2h.outcome === "loss") stats[pid].losses += 1;
     });
+  });
+
+  // Manual corrections layer on top of everything computed above.
+  (adjustments || []).forEach((adj) => {
+    const s = stats[adj.participantId];
+    if (!s) return; // adjustment for someone no longer in the league
+    s.leaguePoints += adj.leaguePoints || 0;
+    s.scoreDifference += adj.scoreDiff || 0;
   });
 
   const rows = participants.map((p) => {
@@ -3851,13 +4153,13 @@ function endSeason(data, newSeasonLabel) {
       participants: league.participants.map((p) => ({ id: p.id, name: p.name, supports: p.supports || null, badge: p.badge || null })),
       matchdays: JSON.parse(JSON.stringify(league.matchdays)),
       predictions: leaguePredictions,
-      finalStandings: computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions),
+      finalStandings: computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments),
     };
   });
 
   const nextLeagues = {};
   Object.entries(data.leagues).forEach(([key, league]) => {
-    nextLeagues[key] = { ...league, matchdays: [], fixturePool: [] };
+    nextLeagues[key] = { ...league, matchdays: [], fixturePool: [], adjustments: [] };
   });
 
   const remainingPredictions = {};
@@ -3892,7 +4194,7 @@ function suggestNextSeasonLabel(label) {
 }
 
 function LeaderboardView({ league, data }) {
-  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
   const podium = board.filter((r) => r.leaguePoints > 0).slice(0, 3);
   const visibleMatchdays = league.matchdays.filter((md) => !md.draft);
   const totalMatches = visibleMatchdays.reduce((n, md) => n + md.matches.length, 0);
@@ -4384,7 +4686,7 @@ function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, save
         </div>
 
         {mode === "login"
-          ? <LoginForm data={data} onLogin={onLogin} />
+          ? <LoginForm data={data} persist={persist} onLogin={onLogin} />
           : <RegisterForm data={data} persist={persist} onLogin={onLogin} />}
 
         <div className="mt-6 pt-4 border-t border-stone-200 text-center">
@@ -4414,9 +4716,13 @@ function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, save
   );
 }
 
-function LoginForm({ data, onLogin }) {
+function LoginForm({ data, persist, onLogin }) {
+  const [view, setView] = useState("login"); // "login" | "reset"
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [resetCode, setResetCode] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNew, setConfirmNew] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -4438,6 +4744,84 @@ function LoginForm({ data, onLogin }) {
       setBusy(false);
     }
   };
+
+  // Uses the one-time reset code the organizer generated from the roster
+  // (Admin → roster → "Reset password") to set a new password. The old
+  // password stays valid right up until this succeeds, and the code is
+  // consumed on use — it can't be replayed to change the password again.
+  const submitReset = async () => {
+    setError("");
+    const key = email.trim().toLowerCase();
+    const cleaned = resetCode.replace(/\s+/g, "").toUpperCase();
+    if (!key) { setError("Enter your email address."); return; }
+    if (!cleaned) { setError("Enter the reset code your organizer gave you."); return; }
+    const account = data.accounts[key];
+    if (!account) { setError("No account found for that email."); return; }
+    if (!account.resetCode || account.resetCode !== cleaned) { setError("That reset code isn't right, or has already been used — ask your organizer to generate a new one."); return; }
+    if (newPassword.length < 6) { setError("New password must be at least 6 characters."); return; }
+    if (newPassword !== confirmNew) { setError("Passwords don't match."); return; }
+    setBusy(true);
+    try {
+      const salt = randomSaltHex();
+      const hash = await hashPassword(newPassword, salt);
+      const { resetCode: _used, ...rest } = account;
+      const ok = await persist({ ...data, accounts: { ...data.accounts, [key]: { ...rest, salt, hash } } });
+      if (!ok) { setError("Couldn't save your new password — check your connection and try again."); return; }
+      const league = data.leagues[account.leagueKey];
+      const participant = league?.participants.find((p) => p.id === account.participantId);
+      if (!participant) { setError("Password saved, but your contestant record is missing — ask the organizer to check the roster."); return; }
+      onLogin({ email: key, name: participant.name, leagueKey: account.leagueKey, participantId: account.participantId });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (view === "reset") {
+    return (
+      <div className="space-y-3">
+        {error && (
+          <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+            <AlertCircle size={16} /> {error}
+          </div>
+        )}
+        <p className="text-xs text-stone-500">
+          Ask your organizer for a one-time reset code, then set a new password here. Your old password keeps working until you do.
+        </p>
+        <div className="relative">
+          <Mail size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <input
+          value={resetCode}
+          onChange={(e) => setResetCode(e.target.value)}
+          placeholder="Reset code from your organizer"
+          autoCapitalize="characters"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck="false"
+          className="w-full bg-white border border-stone-300 rounded-lg px-3 py-2.5 text-sm tracking-widest uppercase focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        />
+        <div className="relative">
+          <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+          <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="New password (6+ characters)" className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <div className="relative">
+          <KeyRound size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-stone-500" />
+          <input type="password" value={confirmNew} onChange={(e) => setConfirmNew(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submitReset()} placeholder="Confirm new password" className="w-full bg-white border border-stone-300 rounded-lg pl-9 pr-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+        </div>
+        <button
+          onClick={submitReset}
+          disabled={busy}
+          className="w-full bg-amber-400 hover:bg-amber-300 disabled:opacity-60 text-black font-display font-semibold rounded-lg py-2.5 text-sm"
+        >
+          {busy ? "Saving…" : "Set new password & log in"}
+        </button>
+        <button onClick={() => { setView("login"); setError(""); }} className="w-full text-xs text-stone-500 hover:text-stone-700 py-1">
+          Back to log in
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-3">
@@ -4474,6 +4858,9 @@ function LoginForm({ data, onLogin }) {
         className="w-full bg-amber-400 hover:bg-amber-300 disabled:opacity-60 text-black font-display font-semibold rounded-lg py-2.5 text-sm"
       >
         {busy ? "Signing in…" : "Log in"}
+      </button>
+      <button onClick={() => { setView("reset"); setError(""); }} className="w-full text-xs text-stone-500 hover:text-stone-700 py-1">
+        Forgotten your password?
       </button>
     </div>
   );
@@ -4654,7 +5041,7 @@ function computeContestantStats(participant, league, predictions) {
   const round1 = (n) => Math.round(n * 10) / 10;
   const round2 = (n) => Math.round(n * 100) / 100;
 
-  const h2h = computeLeaderboardWithPredictions(league.participants, pubs, predictions).find((r) => r.id === participant.id);
+  const h2h = computeLeaderboardWithPredictions(league.participants, pubs, predictions, league.adjustments).find((r) => r.id === participant.id);
 
   return {
     totalPoints: round1(totalPoints),
@@ -4691,7 +5078,7 @@ function computeContestantStats(participant, league, predictions) {
 function computeRankHistory(league, predictions) {
   const pubs = publishedMatchdays(league);
   return pubs.map((md, idx) => {
-    const board = computeLeaderboardWithPredictions(league.participants, pubs.slice(0, idx + 1), predictions);
+    const board = computeLeaderboardWithPredictions(league.participants, pubs.slice(0, idx + 1), predictions, league.adjustments);
     const row = { matchday: idx + 1, label: md.label };
     board.forEach((r) => { row[r.id] = r.rank; });
     return row;
@@ -4882,7 +5269,7 @@ function StatsProfileView({ participant, league, leagueKey, data, onBack }) {
 
 function StatsView({ league, leagueKey, data }) {
   const [selectedId, setSelectedId] = useState(null);
-  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions), [league, data.predictions]);
+  const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
   const selected = selectedId ? league.participants.find((p) => p.id === selectedId) : null;
 
   if (selected) {
