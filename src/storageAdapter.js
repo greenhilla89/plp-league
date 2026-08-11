@@ -44,6 +44,23 @@ async function set(key, value, _shared) {
   return { key, value, shared: true };
 }
 
+// Atomic compare-and-swap: updates `key` to newValue ONLY if its current
+// value is still exactly expectedValue — the database itself enforces this
+// in one operation, so two tabs racing to save can never both win. Returns
+// true if the swap happened, false if someone else changed the value first.
+// Used by the app's stale-write protection (see REV_KEY in App.jsx).
+async function compareAndSwap(key, expectedValue, newValue) {
+  const url = `${REST}?key=eq.${encodeURIComponent(key)}&value=eq.${encodeURIComponent(expectedValue)}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { ...HEADERS, Prefer: "return=representation" },
+    body: JSON.stringify({ value: newValue, updated_at: new Date().toISOString() }),
+  });
+  if (!res.ok) throw new Error(`Storage update failed (${res.status})`);
+  const rows = await res.json();
+  return rows.length > 0;
+}
+
 // The app never deletes or lists keys, but the old interface had these, so
 // they exist for completeness. Deletes are blocked by the database's access
 // rules on purpose — see the table setup SQL.
@@ -58,4 +75,4 @@ async function list(prefix = "", _shared) {
   return { keys: rows.map((r) => r.key), prefix, shared: true };
 }
 
-export const storage = { get, set, delete: del, list };
+export const storage = { get, set, delete: del, list, compareAndSwap };

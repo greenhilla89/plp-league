@@ -705,6 +705,49 @@ async function writeSplitData(data) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// STALE-WRITE PROTECTION — every full save is stamped with a version ("rev").
+// Each open tab remembers the rev its data came from; before saving, it
+// checks the database still holds that same rev, and claims the next one
+// with an atomic compare-and-swap. A tab whose data is out of date (because
+// someone else — or another tab on the same machine — saved in the
+// meantime) is refused with a "refresh first" message instead of silently
+// overwriting the newer data with its stale copy. Prediction submissions
+// are exempt from the check (they already read-merge-write safely and must
+// never be blocked by unrelated admin edits) but they still bump the rev,
+// so any other open tab knows its full copy of the world is now stale.
+// -----------------------------------------------------------------------------
+const REV_KEY = "plp-2026-27-rev-v1";
+const STALE_SAVE_MESSAGE =
+  "Your change wasn't saved because this page's data is out of date — someone else (or another tab) has saved changes since this page last loaded. Refresh the page to pick up the latest data, then redo your change.";
+
+async function readRevValue() {
+  const res = await window.storage.get(REV_KEY, true);
+  return res && res.value ? res.value : null;
+}
+
+function nextRevValue(currentValue) {
+  let rev = 0;
+  try {
+    rev = currentValue ? (JSON.parse(currentValue).rev ?? 0) : 0;
+  } catch {
+    rev = 0;
+  }
+  return JSON.stringify({ rev: rev + 1, token: randomSaltHex(4), updatedAt: new Date().toISOString() });
+}
+
+// Claims the next rev. When the database supports it (our adapter does),
+// this is a genuinely atomic compare-and-swap — two racing tabs can never
+// both succeed. Falls back to a plain write for a first-ever rev (nothing
+// to compare against yet) or if the adapter lacks the operation.
+async function claimRev(currentValue, newValue) {
+  if (currentValue !== null && typeof window.storage.compareAndSwap === "function") {
+    return window.storage.compareAndSwap(REV_KEY, currentValue, newValue);
+  }
+  await window.storage.set(REV_KEY, newValue, true);
+  return true;
+}
+
 // --- Password hashing (Web Crypto SHA-256 + a random per-account salt) ---
 // Passwords are never stored in plain text. This is still client-side
 // hashing with no server-side auth layer to keep secrets away from a
@@ -826,6 +869,7 @@ function ForecastRoomApp() {
   const [saveError, setSaveError] = useState(null); // non-null whenever the most recent save genuinely failed
   const dataRef = useRef(null);
   const snapshotsRef = useRef([]);
+  const revRef = useRef(null); // the save-version stamp this tab's data came from — see REV_KEY above
   // Chains every save so only one is ever actually in flight at a time —
   // without this, rapidly triggering several saves in a row (e.g. removing
   // multiple contestants back to back) can start a new save before the
@@ -858,7 +902,11 @@ function ForecastRoomApp() {
         const archivesRes = await window.storage.get(SEASON_ARCHIVES_KEY, true);
         const badgesRes = await window.storage.get(BADGES_KEY, true);
         const historyRes = await window.storage.get(HISTORY_KEY, true);
+        const revRes = await window.storage.get(REV_KEY, true);
         if (cancelled) return;
+        // Remember which save-version this data came from — every future
+        // save from this tab is checked against it (stale-write protection).
+        revRef.current = revRes && revRes.value ? revRes.value : null;
 
         if (coreRes && coreRes.value) {
           // Already on the split-storage format.
@@ -884,6 +932,9 @@ function ForecastRoomApp() {
           const migrated = migrateData(JSON.parse(legacyRes.value));
           setData(migrated);
           await writeSplitData(migrated);
+          const initialRev = nextRevValue(revRef.current);
+          await window.storage.set(REV_KEY, initialRev, true);
+          revRef.current = initialRev;
           return;
         }
 
@@ -892,6 +943,9 @@ function ForecastRoomApp() {
         const seed = seedData();
         setData(seed);
         await writeSplitData(seed);
+        const initialRev = nextRevValue(revRef.current);
+        await window.storage.set(REV_KEY, initialRev, true);
+        revRef.current = initialRev;
       } catch {
         if (!cancelled) {
           setData(seedData());
@@ -951,6 +1005,30 @@ function ForecastRoomApp() {
     // Queue this save behind whatever's already running, rather than
     // starting it immediately — see persistQueueRef above for why.
     const run = persistQueueRef.current.then(async () => {
+      // STALE-WRITE PROTECTION — before anything is written (or even shown
+      // on screen as saved), confirm this tab's data is still current, and
+      // atomically claim the next save-version so no other tab can save
+      // over the top of this one. A tab holding out-of-date data is refused
+      // here, which is what stops it from silently wiping newer changes.
+      try {
+        const currentRev = await readRevValue();
+        if ((revRef.current ?? null) !== (currentRev ?? null)) {
+          setSaveError(STALE_SAVE_MESSAGE);
+          return false;
+        }
+        const newRev = nextRevValue(currentRev);
+        const claimed = await claimRev(currentRev, newRev);
+        if (!claimed) {
+          // Another tab beat us to the claim in the tiny window since the
+          // check above — same situation, same remedy.
+          setSaveError(STALE_SAVE_MESSAGE);
+          return false;
+        }
+        revRef.current = newRev;
+      } catch {
+        setSaveError("Your last change didn't save — check your connection and try again.");
+        return false;
+      }
       const previous = dataRef.current;
       setData(next); // optimistic UI update, applied only once it's actually this save's turn
       try {
@@ -986,10 +1064,28 @@ function ForecastRoomApp() {
   const submitPredictions = useCallback((newEntries) => {
     const run = persistQueueRef.current.then(async () => {
       try {
+        // Predictions deliberately skip the stale-write check — this
+        // read-merge-write is already safe against clobbering others, and a
+        // contestant's submission must never be refused just because admin
+        // saved something unrelated. But it still bumps the save-version
+        // below, so every OTHER open tab knows its full copy of the data
+        // (which includes a predictions blob) is now out of date.
+        const currentRev = await readRevValue();
+        const wasFresh = (revRef.current ?? null) === (currentRev ?? null);
         const latest = await window.storage.get(PREDICTIONS_KEY, true);
         const latestPredictions = latest && latest.value ? JSON.parse(latest.value).predictions : {};
         const mergedPredictions = { ...latestPredictions, ...newEntries };
         await window.storage.set(PREDICTIONS_KEY, JSON.stringify({ predictions: mergedPredictions }), true);
+        try {
+          const newRev = nextRevValue(currentRev);
+          const claimed = await claimRev(currentRev, newRev);
+          // Only advance our own tab's stamp if it was fresh to begin with —
+          // a tab that was already stale must stay stale, or its next full
+          // save would slip past the protection.
+          if (claimed && wasFresh) revRef.current = newRev;
+        } catch {
+          /* best-effort — the prediction itself is already safely saved */
+        }
         setSaveError(null);
         setData((prev) => (prev ? { ...prev, predictions: mergedPredictions } : prev));
         return true;
@@ -1966,9 +2062,12 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
     .slice()
     .sort((a, b) => (boardById[b.id]?.totalPoints ?? 0) - (boardById[a.id]?.totalPoints ?? 0));
 
+  // Newest matchday first — the current round is what people open this tab
+  // for, so it shouldn't be a season's worth of scrolling away.
   const matchdays = league.matchdays
     .filter((md) => adminMode || !md.draft)
-    .filter((md) => statusFilter === "all" || matchdayDisplayStatus(md, adminMode) === statusFilter);
+    .filter((md) => statusFilter === "all" || matchdayDisplayStatus(md, adminMode) === statusFilter)
+    .reverse();
 
   return (
     <div className="space-y-8">
@@ -2080,16 +2179,28 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                         const m = isFreeCol ? effectiveMatchesFor(md, p.id)[colIdx] : defaultMatch;
                         const pred = data.predictions[`${m.id}__${p.id}`];
                         const isSelf = p.id === viewerId;
-                        const canSeeValue = released || isSelf;
+                        // The free slot is stricter than the normal reveal:
+                        // a home contestant's own pick — WHICH match they
+                        // chose, not just their scoreline — stays hidden
+                        // from everyone else until the matchday's results
+                        // are published, not merely until the reveal time.
+                        const canSeeCustomPick = adminMode || md.resultsPublished || isSelf;
+                        const canSeeValue = isFreeCol ? canSeeCustomPick : (released || isSelf);
                         const status = cellStatus(md, !!pred);
                         const Icon = STATUS_ICON[status];
                         return (
                           <td key={defaultMatch.id} className="px-3 py-3 text-center">
                             {isFreeCol && (
-                              <div className="text-[10px] text-stone-500 leading-tight mb-1">
-                                {m.home} v {m.away}
-                                {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
-                              </div>
+                              canSeeCustomPick ? (
+                                <div className="text-[10px] text-stone-500 leading-tight mb-1">
+                                  {m.home} v {m.away}
+                                  {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-stone-400 italic leading-tight mb-1 flex items-center justify-center gap-1">
+                                  <EyeOff size={9} /> pick hidden until results are published
+                                </div>
+                              )
                             )}
                             <span className={cx("inline-flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-medium", STATUS_STYLES[status])}>
                               <Icon size={12} />
@@ -3975,7 +4086,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
     setError("");
     const nextParticipants = league.participants.map((p) =>
       p.id === editTargetId
-        ? { ...p, name: adminMode ? name.trim() : p.name, supports: supports.trim(), dob, residence: residence.trim(), bio: bio.trim(), photo, stadium: stadiumLocked ? p.stadium : stadium.trim() }
+        ? { ...p, name: adminMode ? name.trim() : p.name, supports: supports.trim(), dob, residence: residence.trim(), bio: bio.trim(), photo: adminMode ? photo : p.photo, stadium: stadiumLocked ? p.stadium : stadium.trim() }
         : p
     );
     await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, participants: nextParticipants } } });
@@ -4017,22 +4128,33 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
 
           <div className="flex flex-col sm:flex-row gap-6">
             <div className="flex flex-col items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="relative group"
-                title="Upload a photo"
-              >
-                <Avatar name={name} photo={photo} size={88} />
-                <span className="absolute -bottom-1 -right-1 bg-amber-400 text-black rounded-full p-1.5 border-2 border-zinc-900 group-hover:bg-amber-300">
-                  <Camera size={13} />
-                </span>
-              </button>
-              <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
-              {photo && (
-                <button onClick={() => setPhoto(null)} className="text-xs text-stone-500 hover:text-rose-600">Remove photo</button>
+              {/* Profile photos are admin-managed: contestants see their
+                  photo but only admin can upload, change, or remove it. */}
+              {adminMode ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="relative group"
+                    title="Upload a photo"
+                  >
+                    <Avatar name={name} photo={photo} size={88} />
+                    <span className="absolute -bottom-1 -right-1 bg-amber-400 text-black rounded-full p-1.5 border-2 border-zinc-900 group-hover:bg-amber-300">
+                      <Camera size={13} />
+                    </span>
+                  </button>
+                  <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
+                  {photo && (
+                    <button onClick={() => setPhoto(null)} className="text-xs text-stone-500 hover:text-rose-600">Remove photo</button>
+                  )}
+                  <span className="text-[11px] text-stone-500">Optional</span>
+                </>
+              ) : (
+                <>
+                  <Avatar name={name} photo={photo} size={88} />
+                  <span className="text-[11px] text-stone-500 text-center max-w-[100px]">Photo is set by your organizer</span>
+                </>
               )}
-              <span className="text-[11px] text-stone-500">Optional</span>
             </div>
 
             <div className="flex-1 grid sm:grid-cols-2 gap-4">
