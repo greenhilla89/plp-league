@@ -11,29 +11,12 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
 
-// The site mark: a scattered cluster of navy rings around a solid red
-// center, rendered as plain SVG (no embedded image asset needed).
+// The site mark — the official PLP logo (public/plp-logo.png), presented
+// on a white rounded card baked into the image itself, so the purple globe
+// reads clearly everywhere: on light pages and on the dark purple banner
+// alike. Callers size it with className exactly as before.
 function Logo({ className }) {
-  const rings = [
-    [50.6, 37.9, 2.4], [60.1, 59.9, 3.7], [36.6, 49.3, 3.6], [65.3, 37.6, 3.0],
-    [42.3, 68.4, 4.2], [43.4, 31.1, 2.4], [73.2, 56.8, 2.7], [31.1, 59.1, 5.0],
-    [60.0, 29.8, 4.4], [57.1, 73.8, 2.4], [28.2, 39.8, 4.5], [76.3, 42.7, 4.2],
-    [35.1, 74.2, 4.9], [43.7, 19.7, 4.2], [71.2, 72.4, 4.7], [19.9, 46.9, 2.6],
-    [74.3, 29.3, 2.7], [53.1, 83.1, 4.5], [27.7, 22.1, 5.2], [83.2, 56.5, 4.2],
-    [20.5, 71.1, 5.1], [58.3, 11.6, 4.5], [65.4, 81.1, 4.4], [12.3, 33.8, 3.2],
-    [85.4, 35.8, 2.3], [38.5, 87.6, 2.6], [40.1, 13.7, 2.6], [85.5, 67.2, 5.2],
-    [12.3, 60.6, 4.1], [77.6, 14.9, 5.1], [58.1, 90.9, 3.4], [17.8, 17.1, 2.7],
-    [91.8, 43.1, 3.0], [18.7, 82.1, 3.1],
-  ];
-  return (
-    <svg viewBox="0 0 100 100" className={className} aria-label="PLP">
-      <circle cx="50" cy="50" r="48" fill="#F3F6EF" />
-      {rings.map(([cx, cy, r], i) => (
-        <circle key={i} cx={cx} cy={cy} r={r} fill="none" stroke="#1B2A63" strokeWidth={r * 0.32} />
-      ))}
-      <circle cx="50" cy="50" r="9" fill="#C0392B" />
-    </svg>
-  );
+  return <img src="/plp-logo.png" alt="PLP" className={className} />;
 }
 
 /* ============================================================================
@@ -1314,7 +1297,7 @@ function Header({ data, leagueKey }) {
         <div className="flex items-center gap-2 text-amber-400/90 text-xs font-semibold tracking-[0.2em] uppercase mb-2">
           <Sparkles size={14} /> Live scoring room · Season {data.seasonLabel}
         </div>
-        <Logo className="h-16 sm:h-20 w-auto object-contain -ml-2" />
+        <Logo className="h-16 sm:h-20 w-auto object-contain" />
         <p className="text-stone-300 mt-1 text-sm">Predict scorelines, watch the table move — up to {league.matchdays[0] ? maxMatchPoints(league.matchdays[0].scoring) : 6} pts per match.</p>
       </div>
       {leader && leader.leaguePoints > 0 && (
@@ -2295,7 +2278,12 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
         ) : (
           <span className="text-[10px] text-stone-400">{matchday.locked ? "no pick" : "pending"}</span>
         )}
-        {isCustomPick && canSeePick && canSeeResults && m.outcome && (
+        {/* FT result for any match at a pick slot — the centre column can't
+            show it there (the fixture varies per side), so each side carries
+            its own. This covers chosen picks AND the default mandatory match
+            an away contestant predicts at the free slot, which previously
+            had no FT score anywhere on the card. */}
+        {isFree && canSeeResults && m.outcome && (!isCustomPick || canSeePick) && (
           <div className="text-[10px] text-amber-500 font-mono-num">FT {m.outcome.home}–{m.outcome.away}</div>
         )}
         {/* Once results are published: the points this prediction earned on
@@ -2335,16 +2323,25 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
         }
         return (
           <div key={i} className={cx("border rounded-2xl bg-white overflow-hidden", mine ? "border-amber-400/50" : "border-stone-200")}>
-            <div className={cx("flex items-center gap-2 px-3 py-2", mine ? "bg-amber-400/10" : "bg-stone-50")}>
-              <div className="flex items-center gap-2 flex-1 min-w-0">
-                <Avatar name={home?.name ?? "?"} photo={home?.photo} size={26} />
-                <span className={cx("font-medium text-sm truncate", pair.home === viewerId && "text-amber-600")}>{nameOf(pair.home)}</span>
+            <div className={cx("px-3 py-2", mine ? "bg-amber-400/10" : "bg-stone-50")}>
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-1 min-w-0">
+                  <Avatar name={home?.name ?? "?"} photo={home?.photo} size={26} />
+                  <span className={cx("font-medium text-sm truncate", pair.home === viewerId && "text-amber-600")}>{nameOf(pair.home)}</span>
+                </div>
+                <span className="text-[10px] text-stone-400 font-display shrink-0">V</span>
+                <div className="flex items-center gap-2 flex-1 min-w-0 justify-end">
+                  <span className={cx("font-medium text-sm truncate text-right", pair.away === viewerId && "text-amber-600")}>{nameOf(pair.away)}</span>
+                  <Avatar name={away?.name ?? "?"} photo={away?.photo} size={26} />
+                </div>
               </div>
-              <span className="text-[10px] text-stone-400 font-display shrink-0">V</span>
-              <div className="flex items-center gap-2 flex-1 min-w-0 justify-end">
-                <span className={cx("font-medium text-sm truncate text-right", pair.away === viewerId && "text-amber-600")}>{nameOf(pair.away)}</span>
-                <Avatar name={away?.name ?? "?"} photo={away?.photo} size={26} />
-              </div>
+              {/* The home contestant's stadium — this fixture is "played" at
+                  their ground, so it headlines the card like a real venue. */}
+              {home?.stadium && (
+                <div className="mt-1 text-[10px] text-stone-500 flex items-center justify-center gap-1">
+                  <Landmark size={9} className="shrink-0" /> <span className="truncate">{home.stadium}</span>
+                </div>
+              )}
             </div>
             {matchday.matches.map((defaultMatch, idx) => {
               const isFree = !matchday.bonanza && matchday.freeMatchIndex === idx;
@@ -4573,6 +4570,19 @@ function LeaderboardView({ league, data }) {
   const totalMatches = visibleMatchdays.reduce((n, md) => n + md.matches.length, 0);
   const scoredMatches = publishedMatchdays(league).reduce((n, md) => n + md.matches.length, 0);
 
+  // Each contestant's rank BEFORE the most recent published matchday, for
+  // the movement arrows — recomputed with the real standings calculation
+  // (including manual corrections) so the comparison always matches the
+  // live table's own tiebreak logic. Needs at least two published
+  // matchdays to have a "previous table" to compare against; until then
+  // everyone shows a dash.
+  const prevRankById = useMemo(() => {
+    const pubs = publishedMatchdays(league);
+    if (pubs.length < 2) return null;
+    const prevBoard = computeLeaderboardWithPredictions(league.participants, pubs.slice(0, -1), data.predictions, league.adjustments);
+    return Object.fromEntries(prevBoard.map((r) => [r.id, r.rank]));
+  }, [league, data.predictions]);
+
   return (
     <div className="space-y-8">
       <div className="flex items-center justify-between flex-wrap gap-2">
@@ -4595,6 +4605,7 @@ function LeaderboardView({ league, data }) {
             <tr style={{ background: "#3D1F5C" }} className="text-left">
               <th className="px-4 py-3 font-semibold w-16 text-amber-300">Rank</th>
               <th className="px-4 py-3 font-semibold text-amber-300">Participant</th>
+              <th className="px-2 py-3 font-semibold text-center w-10 text-amber-300" title="Movement since the most recent matchday">±</th>
               <th className="px-4 py-3 font-semibold text-right text-amber-300">W</th>
               <th className="px-4 py-3 font-semibold text-right text-amber-300">D</th>
               <th className="px-4 py-3 font-semibold text-right text-amber-300">L</th>
@@ -4609,6 +4620,19 @@ function LeaderboardView({ league, data }) {
                   <span className="inline-flex items-center gap-1">{row.rank === 1 && row.leaguePoints > 0 && <Crown size={14} className="text-amber-400" />}#{row.rank}</span>
                 </td>
                 <td className="px-4 py-3 font-medium">{row.name}</td>
+                <td className="px-2 py-3 text-center">
+                  {(() => {
+                    const prevRank = prevRankById?.[row.id];
+                    const movement = prevRank ? prevRank - row.rank : 0;
+                    if (prevRankById && movement > 0) {
+                      return <span className="text-emerald-600 text-[10px]" title={`Up ${movement} place${movement === 1 ? "" : "s"} (was #${prevRank})`}>▲</span>;
+                    }
+                    if (prevRankById && movement < 0) {
+                      return <span className="text-rose-600 text-[10px]" title={`Down ${-movement} place${movement === -1 ? "" : "s"} (was #${prevRank})`}>▼</span>;
+                    }
+                    return <span className="text-stone-400" title="No change since the most recent matchday">–</span>;
+                  })()}
+                </td>
                 <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.wins}</td>
                 <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.draws}</td>
                 <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.losses}</td>
