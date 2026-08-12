@@ -606,6 +606,7 @@ function migrateData(data) {
     league.matchdays.forEach((md) => {
       if (typeof md.draft !== "boolean") md.draft = false;
       if (typeof md.blog !== "string") md.blog = "";
+      if (typeof md.closingBlog !== "string") md.closingBlog = ""; // the results-day review — see MatrixView
       if (typeof md.pairings === "undefined") md.pairings = null;
       if (typeof md.scheduledDate === "undefined") md.scheduledDate = null;
       if (typeof md.freeMatchIndex === "undefined") md.freeMatchIndex = null;
@@ -1456,6 +1457,8 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
   const [draft, setDraft] = useState({});
   const [customDraft, setCustomDraft] = useState({}); // matchdayId -> { home, away }
   const [bonanzaDraft, setBonanzaDraft] = useState({}); // "matchdayId__slot" -> { home, away }
+  const [editingCustom, setEditingCustom] = useState({}); // matchdayId -> true while re-picking the free match
+  const [editingBonanza, setEditingBonanza] = useState({}); // "matchdayId__slot" -> true while re-picking
   const [confirmation, setConfirmation] = useState(null);
   const [error, setError] = useState("");
 
@@ -1508,21 +1511,36 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
     if (ok) setConfirmation(`Submitted all 3 predictions for ${md.label}.`);
   };
 
+  // Saves (or CHANGES) the free-selection match. Changeable right up until
+  // admin locks the matchday — a matchday only appears on this tab while
+  // it's open, so anything visible here is still fair game. Custom-match
+  // ids are deterministic (unlike Bonanza picks), so when the teams change
+  // the old prediction is explicitly cleared — otherwise a scoreline typed
+  // against the old fixture would silently apply to the new one.
   const saveCustomMatch = async (md) => {
     const draftEntry = customDraft[md.id] || { home: "", away: "" };
     if (!draftEntry.home.trim() || !draftEntry.away.trim()) { setError("Enter both team names for your own match."); return; }
     setError("");
+    const prev = md.customMatches?.[viewerId];
+    const teamsChanged = prev && (prev.home !== draftEntry.home.trim() || prev.away !== draftEntry.away.trim());
     const nextMatchdays = league.matchdays.map((m) =>
       m.id === md.id
         ? { ...m, customMatches: { ...(m.customMatches || {}), [viewerId]: { home: draftEntry.home.trim(), away: draftEntry.away.trim(), outcome: null } } }
         : m
     );
-    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
+    const staleKey = `custom__${md.id}__${viewerId}__${viewerId}`;
+    const nextPredictions = teamsChanged
+      ? Object.fromEntries(Object.entries(data.predictions).filter(([k]) => k !== staleKey))
+      : data.predictions;
+    const ok = await persist({ ...data, predictions: nextPredictions, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
+    if (ok) setEditingCustom((e) => ({ ...e, [md.id]: false }));
   };
 
-  // Saves one Bonanza pick (one slot). Each pick gets a unique id stamped
-  // now, so its predictions can never bleed onto a different pick if the
-  // admin later clears this one and the slot is re-picked.
+  // Saves (or CHANGES) one Bonanza pick (one slot) — changeable right up
+  // until admin locks the matchday, same as the free-selection match. Each
+  // pick gets a unique id stamped now, so a prediction made against a
+  // previous pick is orphaned automatically and can never bleed onto the
+  // replacement.
   const saveBonanzaPick = async (md, slotIdx) => {
     const key = `${md.id}__${slotIdx}`;
     const draftEntry = bonanzaDraft[key] || { home: "", away: "" };
@@ -1542,7 +1560,8 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
       };
       return { ...m, bonanzaPicks: allPicks };
     });
-    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
+    const ok = await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
+    if (ok) setEditingBonanza((e) => ({ ...e, [key]: false }));
   };
 
   return (
@@ -1614,7 +1633,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                       ? "You're at home — pick any 3 Premier League matches to predict."
                       : "You're at home — pick 2 Premier League matches, plus Match 3 from any division (Premier League down to the National League).")
                   : "Pick any 2 Premier League matches to predict — Match 3 is set for you below."}
-                {" "}Choose carefully: a pick can't be changed once set (your organizer can clear one if you make a mistake).
+                {" "}You can change any of your picks right up until predictions close for this matchday.
               </span>
             </div>
           )}
@@ -1624,11 +1643,12 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
               const isBonanzaSlot = bonanzaSlots ? bonanzaSlots.includes(idx) : false;
               const bonanzaPickSet = isBonanzaSlot && !!md.bonanzaPicks?.[viewerId]?.[idx];
 
-              // Bonanza: a free slot without a saved pick yet — show the
+              // Bonanza: a free slot without a saved pick yet — or one the
+              // contestant is changing their mind about — shows the
               // per-slot picker instead of a prediction row. Once the pick
               // is saved it becomes a normal prediction row (with the
               // chosen teams) via effectiveMatchesFor.
-              if (isBonanzaSlot && !bonanzaPickSet) {
+              if (isBonanzaSlot && (!bonanzaPickSet || editingBonanza[`${md.id}__${idx}`])) {
                 const bKey = `${md.id}__${idx}`;
                 const bDraft = bonanzaDraft[bKey] || { home: "", away: "" };
                 return (
@@ -1652,17 +1672,25 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                       <button onClick={() => saveBonanzaPick(md, idx)} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
                         Set match
                       </button>
+                      {bonanzaPickSet && (
+                        <button onClick={() => setEditingBonanza((e) => ({ ...e, [bKey]: false }))} className="text-sm text-stone-500 hover:text-stone-900 px-2 shrink-0">
+                          Cancel
+                        </button>
+                      )}
                     </div>
+                    {bonanzaPickSet && (
+                      <p className="text-[11px] text-stone-500">Changing your pick clears any scoreline you'd already entered for the old one — you'll predict the new match fresh.</p>
+                    )}
                   </div>
                 );
               }
 
-              // The home contestant hasn't chosen their own match yet — show
-              // the picker instead of a normal prediction row. Their
-              // opponent always sees the admin's pre-determined match here,
-              // unaffected by this — so this branch only ever applies to
-              // the home contestant.
-              if (isFreeSlot && !myCustomMatch) {
+              // The home contestant hasn't chosen their own match yet — or
+              // is changing their mind — so show the picker instead of a
+              // normal prediction row. Their opponent always sees the
+              // admin's pre-determined match here, unaffected by this — so
+              // this branch only ever applies to the home contestant.
+              if (isFreeSlot && (!myCustomMatch || editingCustom[md.id])) {
                 return (
                   <div key={`free-${md.id}`} className="border border-amber-400/30 bg-amber-400/5 rounded-xl p-4 space-y-2">
                     <div className="text-xs font-semibold text-amber-300 uppercase tracking-wide flex items-center gap-1.5"><Landmark size={12} /> Your home match — pick your own</div>
@@ -1688,7 +1716,15 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                       <button onClick={() => saveCustomMatch(md)} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
                         Set match
                       </button>
+                      {myCustomMatch && (
+                        <button onClick={() => setEditingCustom((e) => ({ ...e, [md.id]: false }))} className="text-sm text-stone-500 hover:text-stone-900 px-2 shrink-0">
+                          Cancel
+                        </button>
+                      )}
                     </div>
+                    {myCustomMatch && (
+                      <p className="text-[11px] text-stone-500">Changing your match clears any scoreline you'd already entered for the old one — you'll predict the new match fresh.</p>
+                    )}
                   </div>
                 );
               }
@@ -1699,7 +1735,27 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                 <div key={m.id} className="border border-stone-200 rounded-xl p-4 bg-white">
                   <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
                     <div className="text-xs text-stone-500 flex items-center gap-1">
-                      {(isFreeSlot || bonanzaPickSet) ? <><Landmark size={12} /> Your own match</> : <><Clock size={12} /> {fmtDateTime(m.kickoff)}</>}
+                      {(isFreeSlot || bonanzaPickSet) ? (
+                        <>
+                          <Landmark size={12} /> Your own match
+                          {isFreeSlot && (
+                            <button
+                              onClick={() => { setCustomDraft((d) => ({ ...d, [md.id]: { home: m.home, away: m.away } })); setEditingCustom((e) => ({ ...e, [md.id]: true })); }}
+                              className="text-violet-700 hover:underline ml-1"
+                            >
+                              Change match
+                            </button>
+                          )}
+                          {bonanzaPickSet && (
+                            <button
+                              onClick={() => { setBonanzaDraft((d) => ({ ...d, [`${md.id}__${idx}`]: { home: m.home, away: m.away } })); setEditingBonanza((e) => ({ ...e, [`${md.id}__${idx}`]: true })); }}
+                              className="text-violet-700 hover:underline ml-1"
+                            >
+                              Change pick
+                            </button>
+                          )}
+                        </>
+                      ) : <><Clock size={12} /> {fmtDateTime(m.kickoff)}</>}
                     </div>
                     {already && <span className="text-xs text-emerald-700 flex items-center gap-1 font-medium"><CheckCircle2 size={13} /> submitted</span>}
                   </div>
@@ -2184,9 +2240,11 @@ function FixtureListView({ league, viewerId }) {
 // match by match, and the head-to-head outcome once results are published.
 // This replaces the old "scan the big grid for your opponent's row"
 // experience; the full grid is still available behind a toggle. Your own
-// pairing is highlighted and sorted to the front. All the same visibility
-// rules apply: other people's picks hide until the reveal time, and free-
-// match selections (fixture AND scoreline) hide until results are published.
+// pairing is highlighted and sorted to the front. Visibility matches the
+// grid: everything — normal predictions AND chosen matches (free selection
+// or Bonanza picks) — hides until the reveal time, then shows in full.
+// Once results are published, each prediction also shows the points it
+// earned, and the card footer shows the head-to-head outcome.
 // -----------------------------------------------------------------------------
 function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, now }) {
   if (!matchday.pairings) return null;
@@ -2212,8 +2270,10 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
       ? (bonanzaSlotsFor(matchday, pid)?.includes(matchIdx) ?? false)
       : matchday.freeMatchIndex === matchIdx;
     const isCustomPick = isFree && (m.id.startsWith("custom__") || m.id.startsWith("bonanza__"));
-    const canSeePick = adminMode || matchday.resultsPublished || isSelf;
-    const canSeeVal = isCustomPick ? canSeePick : (released || isSelf);
+    // Picks follow the same reveal as scorelines: hidden before the reveal
+    // time, fully visible (match and prediction) from then on.
+    const canSeePick = adminMode || released || isSelf;
+    const canSeeVal = released || isSelf;
     return (
       <div className="flex-1 min-w-0 text-center">
         {isCustomPick && (
@@ -2237,6 +2297,15 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
         )}
         {isCustomPick && canSeePick && canSeeResults && m.outcome && (
           <div className="text-[10px] text-amber-500 font-mono-num">FT {m.outcome.home}–{m.outcome.away}</div>
+        )}
+        {/* Once results are published: the points this prediction earned on
+            this match — one per side, adding up to the totals in the card's
+            footer. Shown even for a missed prediction (0 pts), so the sums
+            always visibly reconcile. */}
+        {canSeeResults && canSeeVal && m.outcome && (
+          <div className={cx("text-[10px] font-mono-num font-semibold mt-0.5", scoreMatch(m, pred, matchday.scoring).points > 0 ? "text-violet-700" : "text-stone-400")}>
+            +{scoreMatch(m, pred, matchday.scoring).points} pts
+          </div>
         )}
       </div>
     );
@@ -2393,10 +2462,18 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
             {md.pairings && (
               <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} />
             )}
-            {released && md.blog && md.blog.trim() && (
+            {/* Opening blog: from the reveal time until results are published.
+                Closing blog: from publish onward. Admin sees both, always. */}
+            {(adminMode || (released && !md.resultsPublished)) && md.blog && md.blog.trim() && (
               <div className="border border-amber-400/20 bg-amber-400/5 rounded-2xl p-4">
                 <h4 className="text-xs font-semibold text-amber-300 uppercase tracking-wide mb-2">Matchday blog</h4>
                 <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.blog}</p>
+              </div>
+            )}
+            {(adminMode || md.resultsPublished) && md.closingBlog && md.closingBlog.trim() && (
+              <div className="border border-violet-700/20 bg-violet-700/5 rounded-2xl p-4">
+                <h4 className="text-xs font-semibold text-violet-700 uppercase tracking-wide mb-2">Matchday review</h4>
+                <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.closingBlog}</p>
               </div>
             )}
             {md.pairings && (
@@ -2469,13 +2546,13 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                         const isOwnPick = m.id.startsWith("custom__") || m.id.startsWith("bonanza__");
                         const pred = data.predictions[`${m.id}__${p.id}`];
                         const isSelf = p.id === viewerId;
-                        // Own picks are stricter than the normal reveal:
-                        // a contestant's chosen match — WHICH match they
-                        // chose, not just their scoreline — stays hidden
-                        // from everyone else until the matchday's results
-                        // are published, not merely until the reveal time.
-                        const canSeeCustomPick = adminMode || md.resultsPublished || isSelf;
-                        const canSeeValue = isOwnPick ? canSeeCustomPick : (released || isSelf);
+                        // Own picks follow the same reveal as everyone's
+                        // scorelines: hidden before the reveal time (so
+                        // nobody can copy a pick), then fully visible —
+                        // WHICH match was chosen and the scoreline — from
+                        // the moment predictions are revealed.
+                        const canSeeCustomPick = adminMode || released || isSelf;
+                        const canSeeValue = released || isSelf;
                         const status = cellStatus(md, !!pred);
                         const Icon = STATUS_ICON[status];
                         return (
@@ -2495,7 +2572,7 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                                 </div>
                               ) : (
                                 <div className="text-[10px] text-stone-400 italic leading-tight mb-1 flex items-center justify-center gap-1">
-                                  <EyeOff size={9} /> pick hidden until results are published
+                                  <EyeOff size={9} /> pick hidden until predictions are revealed
                                 </div>
                               )
                             )}
@@ -3872,6 +3949,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
   const [locked, setLocked] = useState(matchday.locked);
   const [scoring, setScoring] = useState(matchday.scoring);
   const [blog, setBlog] = useState(matchday.blog || "");
+  const [closingBlog, setClosingBlog] = useState(matchday.closingBlog || "");
   const [matches, setMatches] = useState(matchday.matches.map((m) => ({ ...m, outcomeHome: m.outcome?.home ?? "", outcomeAway: m.outcome?.away ?? "" })));
   const [freeMatchIndex, setFreeMatchIndex] = useState(matchday.freeMatchIndex ?? null);
   const [customOutcomes, setCustomOutcomes] = useState(() => {
@@ -3950,6 +4028,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
       locked,
       scoring,
       blog,
+      closingBlog,
       matches: nextMatches,
       freeMatchIndex: matchday.bonanza ? null : freeMatchIndex,
       customMatches: nextCustomMatches,
@@ -4043,12 +4122,23 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
       </div>
 
       <div>
-        <label className="text-xs text-stone-500">Matchday blog (private until picks are revealed above)</label>
+        <label className="text-xs text-stone-500">Opening blog (private until picks are revealed above; shows until results are published)</label>
         <textarea
           value={blog}
           onChange={(e) => setBlog(e.target.value)}
           rows={3}
-          placeholder="Write your commentary for this matchday — only you can see this until the reveal time above, then it appears alongside the Predictions Matrix for everyone."
+          placeholder="Your preview for this matchday — only you can see this until the reveal time above, then it appears alongside the Predictions Matrix until the results go out."
+          className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        />
+      </div>
+
+      <div>
+        <label className="text-xs text-stone-500">Closing blog (private until results are published — then it replaces the opening blog)</label>
+        <textarea
+          value={closingBlog}
+          onChange={(e) => setClosingBlog(e.target.value)}
+          rows={3}
+          placeholder="Your review of how the matchday went — write it as you enter the results; it appears alongside the Predictions Matrix the moment you publish."
           className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
         />
       </div>
