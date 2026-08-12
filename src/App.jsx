@@ -1298,7 +1298,7 @@ function Header({ data, leagueKey }) {
           <Sparkles size={14} /> Live scoring room · Season {data.seasonLabel}
         </div>
         <Logo className="h-16 sm:h-20 w-auto object-contain" />
-        <p className="text-stone-300 mt-1 text-sm">Predict scorelines, watch the table move — up to {league.matchdays[0] ? maxMatchPoints(league.matchdays[0].scoring) : 6} pts per match.</p>
+        <p className="text-stone-300 mt-1 text-sm">Same game, same friends, new world</p>
       </div>
       {leader && leader.leaguePoints > 0 && (
         <div className="flex items-center gap-3 bg-white/10 border border-amber-400/30 rounded-xl px-4 py-3">
@@ -1425,7 +1425,7 @@ function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId
             ? <AdminView league={league} leagueKey={leagueKey} data={data} persist={persist} snapshots={snapshots} onRestoreSnapshot={onRestoreSnapshot} now={now} />
             : <LockedAdminNotice />
         )}
-        {tab === "leaderboard" && <LeaderboardView league={league} data={data} />}
+        {tab === "leaderboard" && <LeaderboardView league={league} leagueKey={leagueKey} data={data} />}
         {tab === "profiles" && <ProfilesView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} adminMode={adminMode} persist={persist} />}
         {tab === "stats" && <StatsView league={league} leagueKey={leagueKey} data={data} />}
       </main>
@@ -4563,12 +4563,36 @@ function suggestNextSeasonLabel(label) {
   return `${nextStart}-${nextEndShort}`;
 }
 
-function LeaderboardView({ league, data }) {
+function LeaderboardView({ league, leagueKey, data }) {
   const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
-  const podium = board.filter((r) => r.leaguePoints > 0).slice(0, 3);
+  // Premier League celebrates the top 4; every other division the top 2.
+  const podium = board.filter((r) => r.leaguePoints > 0).slice(0, leagueKey === "league1" ? 4 : 2);
   const visibleMatchdays = league.matchdays.filter((md) => !md.draft);
   const totalMatches = visibleMatchdays.reduce((n, md) => n + md.matches.length, 0);
   const scoredMatches = publishedMatchdays(league).reduce((n, md) => n + md.matches.length, 0);
+
+  // Finishing-position zones, colouring the table like a real league:
+  //   Premier League — 1st keeps its gold highlight, 2nd–4th light blue,
+  //   bottom three light red. Other divisions — 1st gold, 2nd a subtly
+  //   different pale gold, 3rd–8th light blue, bottom three light red.
+  //   The red (bottom-three) zone wins wherever a small roster would make
+  //   zones overlap. Below 7 contestants, zones switch off entirely and
+  //   only the leader's existing highlight remains — and nothing is
+  //   coloured until at least one matchday's points are on the board.
+  const zonesActive = league.participants.length >= 7 && board.some((r) => r.leaguePoints > 0);
+  const rowZoneClass = (row) => {
+    if (row.rank === 1 && row.leaguePoints > 0) return "bg-amber-400/5"; // the existing leader highlight
+    if (!zonesActive) return null;
+    const n = league.participants.length;
+    if (row.rank > n - 3) return "bg-rose-400/10"; // bottom three
+    if (leagueKey === "league1") {
+      if (row.rank >= 2 && row.rank <= 4) return "bg-sky-400/10";
+    } else {
+      if (row.rank === 2) return "bg-yellow-200/20";
+      if (row.rank >= 3 && row.rank <= 8) return "bg-sky-400/10";
+    }
+    return null;
+  };
 
   // Each contestant's rank BEFORE the most recent published matchday, for
   // the movement arrows — recomputed with the real standings calculation
@@ -4614,8 +4638,10 @@ function LeaderboardView({ league, data }) {
             </tr>
           </thead>
           <tbody>
-            {board.map((row, idx) => (
-              <tr key={row.id} className={cx("border-t border-stone-200", row.rank === 1 && row.leaguePoints > 0 && "bg-amber-400/5", idx % 2 === 1 && "bg-white")}>
+            {board.map((row, idx) => {
+              const zone = rowZoneClass(row);
+              return (
+              <tr key={row.id} className={cx("border-t border-stone-200", zone ?? (idx % 2 === 1 && "bg-white"))}>
                 <td className="px-4 py-3 font-mono-num text-stone-500">
                   <span className="inline-flex items-center gap-1">{row.rank === 1 && row.leaguePoints > 0 && <Crown size={14} className="text-amber-400" />}#{row.rank}</span>
                 </td>
@@ -4641,7 +4667,8 @@ function LeaderboardView({ league, data }) {
                 </td>
                 <td className="px-4 py-3 text-right font-mono-num font-semibold text-amber-300">{row.leaguePoints}</td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -4649,10 +4676,31 @@ function LeaderboardView({ league, data }) {
   );
 }
 
+// Flexible podium: 2 places (lower divisions), the classic 3, or 4 (Premier
+// League) — winner always on the tallest step, arranged podium-style.
 function Podium({ podium }) {
-  const order = [podium[1], podium[0], podium[2]];
-  const heights = { 0: "h-24", 1: "h-32", 2: "h-16" };
-  const medalColor = (place) => (place === 1 ? "text-amber-400" : place === 2 ? "text-stone-700" : "text-orange-400");
+  const n = podium.length;
+  let order, heights;
+  if (n >= 4) {
+    order = [podium[1], podium[0], podium[2], podium[3]];
+    heights = ["h-24", "h-32", "h-16", "h-12"];
+  } else if (n === 3) {
+    order = [podium[1], podium[0], podium[2]];
+    heights = ["h-24", "h-32", "h-16"];
+  } else if (n === 2) {
+    order = [podium[0], podium[1]];
+    heights = ["h-32", "h-24"];
+  } else {
+    order = [...podium];
+    heights = ["h-32"];
+  }
+  const medalColor = (place) =>
+    place === 1 ? "text-amber-400" : place === 2 ? "text-stone-700" : place === 3 ? "text-orange-400" : "text-sky-600";
+  const stepStyle = (place) =>
+    place === 1 ? "bg-gradient-to-b from-amber-400/40 to-amber-400/10 text-amber-300 border border-amber-400/40"
+      : place === 2 ? "bg-gradient-to-b from-zinc-400/30 to-zinc-400/5 text-stone-700 border border-zinc-500/40"
+      : place === 3 ? "bg-gradient-to-b from-orange-500/30 to-orange-500/5 text-orange-300 border border-orange-500/40"
+      : "bg-gradient-to-b from-sky-500/30 to-sky-500/5 text-sky-600 border border-sky-500/40";
   return (
     <div className="flex items-end justify-center gap-3 sm:gap-6 py-4">
       {order.map((row, i) => {
@@ -4666,9 +4714,7 @@ function Podium({ podium }) {
             <div className={cx(
               "w-full rounded-t-lg flex items-start justify-center pt-2 font-display font-bold text-lg",
               heights[i],
-              place === 1 ? "bg-gradient-to-b from-amber-400/40 to-amber-400/10 text-amber-300 border border-amber-400/40"
-                : place === 2 ? "bg-gradient-to-b from-zinc-400/30 to-zinc-400/5 text-stone-700 border border-zinc-500/40"
-                : "bg-gradient-to-b from-orange-500/30 to-orange-500/5 text-orange-300 border border-orange-500/40"
+              stepStyle(place)
             )}>
               #{place}
             </div>
