@@ -92,11 +92,19 @@ const EXPORT_REMINDER_MS = 72 * 60 * 60 * 1000; // nudge admin to download a man
 // defaults to 24 since that was specified as its ceiling, but any of
 // these can be changed).
 const LEAGUE_DEFS = [
-  { key: "league1", defaultName: "PLP Premier League", defaultMaxParticipants: 20, defaultMinParticipants: 4, alwaysEnabled: true },
-  { key: "league2", defaultName: "PLP Championship", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false },
-  { key: "league3", defaultName: "PLP League One", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false },
-  { key: "league4", defaultName: "PLP League Two", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false },
+  { key: "league1", defaultName: "PLP Premier League", defaultMaxParticipants: 20, defaultMinParticipants: 4, alwaysEnabled: true, accent: "#FBBF24" },
+  { key: "league2", defaultName: "PLP Championship", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false, accent: "#38BDF8" },
+  { key: "league3", defaultName: "PLP League One", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false, accent: "#34D399" },
+  { key: "league4", defaultName: "PLP League Two", defaultMaxParticipants: 24, defaultMinParticipants: 2, alwaysEnabled: false, accent: "#FB7185" },
 ];
+
+// Each division's signature colour — Premier League keeps the site's amber;
+// Championship sky blue, League One green, League Two rose — used on the
+// division switcher, the banner's accent strip, and the tab underlines, so
+// each division feels like its own competition.
+function leagueAccent(key) {
+  return LEAGUE_DEFS.find((d) => d.key === key)?.accent ?? "#FBBF24";
+}
 
 function enabledLeagueKeys(data) {
   return LEAGUE_DEFS.map((d) => d.key).filter((key) => data.leagues[key]?.enabled);
@@ -505,21 +513,33 @@ function isReleased(matchday, now) {
   return new Date(matchday.releaseAt).getTime() <= now;
 }
 
+// Whether predictions are closed for a matchday: closed manually by admin
+// (the locked flag, kept as an override for locking early or in special
+// circumstances) or automatically once the matchday's "predictions close
+// at" deadline passes. The deadline needs nobody to be online to take
+// effect — every view computes it live against the clock, and submissions
+// double-check it at the moment of saving. To reopen after a deadline has
+// passed, admin extends or clears the deadline in the matchday card.
+function isPredictionsClosed(matchday, now = Date.now()) {
+  if (matchday.locked) return true;
+  return !!matchday.predictionsCloseAt && new Date(matchday.predictionsCloseAt).getTime() <= now;
+}
+
 // `adminMode` only affects the label shown for a fully-scored-but-unpublished
 // matchday: admins see "pending publish" (a nudge to go confirm it), while
 // contestants just see it as still "locked" until the admin publishes.
-function matchdayDisplayStatus(matchday, adminMode = false) {
+function matchdayDisplayStatus(matchday, adminMode = false, now = Date.now()) {
   if (matchday.draft) return "draft";
   const allScored = matchday.matches.every((m) => m.outcome);
   if (allScored && matchday.resultsPublished) return "completed";
   if (allScored && !matchday.resultsPublished) return adminMode ? "pending publish" : "locked";
-  if (matchday.locked) return "locked";
+  if (isPredictionsClosed(matchday, now)) return "locked";
   return "open";
 }
 
-function cellStatus(matchday, hasPrediction) {
+function cellStatus(matchday, hasPrediction, now = Date.now()) {
   if (hasPrediction) return "submitted";
-  if (matchday.locked) return "locked";
+  if (isPredictionsClosed(matchday, now)) return "locked";
   return "pending";
 }
 
@@ -590,6 +610,7 @@ function migrateData(data) {
       if (typeof md.draft !== "boolean") md.draft = false;
       if (typeof md.blog !== "string") md.blog = "";
       if (typeof md.closingBlog !== "string") md.closingBlog = ""; // the results-day review — see MatrixView
+      if (typeof md.predictionsCloseAt === "undefined") md.predictionsCloseAt = null; // auto-lock deadline — see isPredictionsClosed()
       if (typeof md.pairings === "undefined") md.pairings = null;
       if (typeof md.scheduledDate === "undefined") md.scheduledDate = null;
       if (typeof md.freeMatchIndex === "undefined") md.freeMatchIndex = null;
@@ -1194,8 +1215,9 @@ function ForecastRoomApp() {
               onClick={() => { setLeagueKey(k); setGlobalView(null); }}
               className={cx(
                 "px-4 py-2 rounded-xl border text-sm font-display font-semibold flex items-center gap-2 transition-colors",
-                !globalView && safeLeagueKey === k ? "bg-amber-400 text-black border-amber-400" : "border-white/20 text-stone-200 hover:border-white/40"
+                !globalView && safeLeagueKey === k ? "text-black" : "border-white/20 text-stone-200 hover:border-white/40"
               )}
+              style={!globalView && safeLeagueKey === k ? { background: leagueAccent(k), borderColor: leagueAccent(k) } : undefined}
             >
               {data.leagues[k].name}
               <span className={cx("text-xs px-1.5 py-0.5 rounded-full", !globalView && safeLeagueKey === k ? "bg-black/20" : "bg-white/10")}>
@@ -1226,6 +1248,9 @@ function ForecastRoomApp() {
             <History size={13} /> History
           </button>
         </div>
+
+        {/* The current division's signature colour, as a strip under the banner. */}
+        <div style={{ height: 4, background: leagueAccent(safeLeagueKey) }} />
       </div>
 
       {saveError && (
@@ -1377,14 +1402,15 @@ function LockedAdminNotice() {
   );
 }
 
-function TabButton({ icon: Icon, label, active, onClick }) {
+function TabButton({ icon: Icon, label, active, onClick, accent }) {
   return (
     <button
       onClick={onClick}
       className={cx(
         "flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap",
-        active ? "border-amber-400 text-amber-300" : "border-transparent text-stone-300 hover:text-white"
+        !active && "border-transparent text-stone-300 hover:text-white"
       )}
+      style={active ? { borderColor: accent ?? "#FBBF24", color: accent ?? "#FBBF24" } : undefined}
     >
       <Icon size={16} /> {label}
     </button>
@@ -1398,23 +1424,24 @@ function TabButton({ icon: Icon, label, active, onClick }) {
 // Matrix, Standings, Profiles, Stats and Admin panel itself — is the same).
 function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId, adminMode, now, snapshots, onRestoreSnapshot, allowSubmit }) {
   const [tab, setTab] = useState(allowSubmit ? "submit" : "matrix");
+  const accent = leagueAccent(leagueKey);
   return (
     <>
       <nav style={{ background: "#3D1F5C" }} className="border-b border-white/10 sticky top-0 z-20">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 flex gap-1 overflow-x-auto">
-          {allowSubmit && <TabButton icon={Send} label="Submit" active={tab === "submit"} onClick={() => setTab("submit")} />}
-          <TabButton icon={BarChart3} label="Predictions Matrix" active={tab === "matrix"} onClick={() => setTab("matrix")} />
-          <TabButton icon={Calendar} label="Fixture List" active={tab === "fixtures"} onClick={() => setTab("fixtures")} />
-          <TabButton icon={Settings2} label="Outcomes & Admin" active={tab === "admin"} onClick={() => setTab("admin")} />
-          <TabButton icon={Trophy} label="Standings" active={tab === "leaderboard"} onClick={() => setTab("leaderboard")} />
-          <TabButton icon={UserCircle2} label="Profiles" active={tab === "profiles"} onClick={() => setTab("profiles")} />
-          <TabButton icon={TrendingUp} label="Stats" active={tab === "stats"} onClick={() => setTab("stats")} />
+          {allowSubmit && <TabButton icon={Send} label="Submit" active={tab === "submit"} onClick={() => setTab("submit")} accent={accent} />}
+          <TabButton icon={BarChart3} label="Predictions Matrix" active={tab === "matrix"} onClick={() => setTab("matrix")} accent={accent} />
+          <TabButton icon={Calendar} label="Fixture List" active={tab === "fixtures"} onClick={() => setTab("fixtures")} accent={accent} />
+          <TabButton icon={Settings2} label="Outcomes & Admin" active={tab === "admin"} onClick={() => setTab("admin")} accent={accent} />
+          <TabButton icon={Trophy} label="Standings" active={tab === "leaderboard"} onClick={() => setTab("leaderboard")} accent={accent} />
+          <TabButton icon={UserCircle2} label="Profiles" active={tab === "profiles"} onClick={() => setTab("profiles")} accent={accent} />
+          <TabButton icon={TrendingUp} label="Stats" active={tab === "stats"} onClick={() => setTab("stats")} accent={accent} />
         </div>
       </nav>
 
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
         {allowSubmit && tab === "submit" && (
-          <SubmitView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} submitPredictions={submitPredictions} persist={persist} />
+          <SubmitView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} submitPredictions={submitPredictions} persist={persist} now={now} />
         )}
         {tab === "matrix" && (
           <MatrixView league={league} data={data} viewerId={viewerId} adminMode={adminMode} now={now} />
@@ -1433,10 +1460,38 @@ function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId
   );
 }
 
+// Live ticking countdown to a matchday's prediction deadline. Ticks every
+// second on its own local timer (the app-wide clock only ticks every 30s,
+// too coarse for a countdown), warming from grey to amber inside 24h to
+// red inside the final hour.
+function DeadlineCountdown({ closeAt }) {
+  const [tick, setTick] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const ms = new Date(closeAt).getTime() - tick;
+  if (ms <= 0) {
+    return <span className="text-rose-600 font-mono-num text-xs font-semibold flex items-center gap-1"><Lock size={11} /> Predictions closed</span>;
+  }
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const text = d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m ${String(sec).padStart(2, "0")}s` : `${m}m ${String(sec).padStart(2, "0")}s`;
+  const tone = ms < 60 * 60 * 1000 ? "text-rose-600" : ms < 24 * 60 * 60 * 1000 ? "text-amber-600" : "text-stone-600";
+  return (
+    <span className={cx("font-mono-num text-xs font-semibold flex items-center gap-1", tone)}>
+      <Clock size={11} /> Predictions close in {text}
+    </span>
+  );
+}
+
 // -----------------------------------------------------------------------------
 // SUBMIT VIEW
 // -----------------------------------------------------------------------------
-function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, persist }) {
+function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, persist, now }) {
   const [draft, setDraft] = useState({});
   const [customDraft, setCustomDraft] = useState({}); // matchdayId -> { home, away }
   const [bonanzaDraft, setBonanzaDraft] = useState({}); // "matchdayId__slot" -> { home, away }
@@ -1445,7 +1500,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
   const [confirmation, setConfirmation] = useState(null);
   const [error, setError] = useState("");
 
-  const openMatchdays = league.matchdays.filter((md) => matchdayDisplayStatus(md) === "open");
+  const openMatchdays = league.matchdays.filter((md) => matchdayDisplayStatus(md, false, now) === "open");
   const participant = league.participants.find((p) => p.id === viewerId);
 
   useEffect(() => {
@@ -1468,8 +1523,9 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
     pair && pair.home !== "" && pair.away !== "" && Number(pair.home) >= 0 && Number(pair.away) >= 0 &&
     Number.isInteger(Number(pair.home)) && Number.isInteger(Number(pair.away));
 
-  const submitMatch = async (matchId) => {
+  const submitMatch = async (md, matchId) => {
     if (!viewerId) { setError("You're not registered in this league, so this can't be saved."); return; }
+    if (isPredictionsClosed(md)) { setError(`Predictions have closed for ${md.label}.`); return; }
     const pair = draft[matchId];
     if (!validPair(pair)) { setError("Enter a whole-number score for both teams."); return; }
     setError("");
@@ -1481,6 +1537,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
 
   const submitMatchday = async (md) => {
     if (!viewerId) { setError("You're not registered in this league, so this can't be saved."); return; }
+    if (isPredictionsClosed(md)) { setError(`Predictions have closed for ${md.label}.`); return; }
     const matches = effectiveMatchesFor(md, viewerId);
     const bad = matches.some((m) => !validPair(draft[m.id]));
     if (bad) { setError(`Fill in a score for all 3 matches in ${md.label} first.`); return; }
@@ -1501,6 +1558,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
   // the old prediction is explicitly cleared — otherwise a scoreline typed
   // against the old fixture would silently apply to the new one.
   const saveCustomMatch = async (md) => {
+    if (isPredictionsClosed(md)) { setError(`Predictions have closed for ${md.label}.`); return; }
     const draftEntry = customDraft[md.id] || { home: "", away: "" };
     if (!draftEntry.home.trim() || !draftEntry.away.trim()) { setError("Enter both team names for your own match."); return; }
     setError("");
@@ -1525,6 +1583,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
   // previous pick is orphaned automatically and can never bleed onto the
   // replacement.
   const saveBonanzaPick = async (md, slotIdx) => {
+    if (isPredictionsClosed(md)) { setError(`Predictions have closed for ${md.label}.`); return; }
     const key = `${md.id}__${slotIdx}`;
     const draftEntry = bonanzaDraft[key] || { home: "", away: "" };
     if (!draftEntry.home.trim() || !draftEntry.away.trim()) { setError("Enter both team names for your pick."); return; }
@@ -1597,7 +1656,10 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
               {md.label}
               {md.scheduledDate && <span className="text-xs font-normal normal-case text-violet-700 flex items-center gap-1"><Calendar size={12} /> {fmtDateOnly(md.scheduledDate)}</span>}
             </h2>
-            <span className="text-xs text-stone-500 flex items-center gap-1"><Calendar size={13} /> reveals {fmtDateTime(md.releaseAt)}</span>
+            <div className="flex flex-col items-end gap-1">
+              <span className="text-xs text-stone-500 flex items-center gap-1"><Calendar size={13} /> reveals {fmtDateTime(md.releaseAt)}</span>
+              {md.predictionsCloseAt && <DeadlineCountdown closeAt={md.predictionsCloseAt} />}
+            </div>
           </div>
           {(opponentName || isBye) && (
             <p className="text-xs text-amber-300 mb-4 flex items-center gap-1">
@@ -1742,15 +1804,18 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                     </div>
                     {already && <span className="text-xs text-emerald-700 flex items-center gap-1 font-medium"><CheckCircle2 size={13} /> submitted</span>}
                   </div>
-                  <div className="flex items-center justify-center gap-3">
-                    <span className="flex-1 text-right font-medium truncate">{m.home}</span>
-                    <ScoreInput value={pair.home} onChange={(v) => setField(m.id, "home", v)} />
-                    <span className="text-stone-500 font-mono-num">–</span>
-                    <ScoreInput value={pair.away} onChange={(v) => setField(m.id, "away", v)} />
-                    <span className="flex-1 text-left font-medium truncate">{m.away}</span>
+                  {/* Phones: two stacked rows (full team name + its score box),
+                      so long names never truncate. Larger screens: the
+                      original single centred line, via sm: order classes. */}
+                  <div className="grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2 sm:flex sm:justify-center">
+                    <span className="min-w-0 font-medium sm:order-1 sm:flex-1 sm:text-right">{m.home}</span>
+                    <span className="sm:order-2"><ScoreInput value={pair.home} onChange={(v) => setField(m.id, "home", v)} /></span>
+                    <span className="hidden sm:inline text-stone-500 font-mono-num sm:order-3">–</span>
+                    <span className="min-w-0 font-medium sm:order-5 sm:flex-1 sm:text-left">{m.away}</span>
+                    <span className="sm:order-4"><ScoreInput value={pair.away} onChange={(v) => setField(m.id, "away", v)} /></span>
                   </div>
                   <div className="flex justify-end mt-3">
-                    <button onClick={() => submitMatch(m.id)} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">Save</button>
+                    <button onClick={() => submitMatch(md, m.id)} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">Save</button>
                   </div>
                 </div>
               );
@@ -2261,7 +2326,7 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
       <div className="flex-1 min-w-0 text-center">
         {isCustomPick && (
           canSeePick ? (
-            <div className="text-[10px] text-stone-500 leading-tight truncate">{m.home} v {m.away}</div>
+            <div className="text-[10px] text-stone-500 leading-tight">{m.home} v {m.away}</div>
           ) : (
             <div className="text-[10px] text-stone-400 italic leading-tight flex items-center justify-center gap-1"><EyeOff size={9} /> pick hidden</div>
           )
@@ -2269,14 +2334,14 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
         {isFree && !isCustomPick && (
           // A pick slot where the contestant never chose — they fall back
           // to the admin's default fixture, shown plainly.
-          <div className="text-[10px] text-stone-500 leading-tight truncate">{m.home} v {m.away}</div>
+          <div className="text-[10px] text-stone-500 leading-tight">{m.home} v {m.away}</div>
         )}
         {pred ? (
           canSeeVal
             ? <span className="font-mono-num text-sm font-semibold text-stone-900">{pred.home}–{pred.away}</span>
             : <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-medium"><CheckCircle2 size={10} /> submitted</span>
         ) : (
-          <span className="text-[10px] text-stone-400">{matchday.locked ? "no pick" : "pending"}</span>
+          <span className="text-[10px] text-stone-400">{isPredictionsClosed(matchday, now) ? "no pick" : "pending"}</span>
         )}
         {/* FT result for any match at a pick slot — the centre column can't
             show it there (the fixture varies per side), so each side carries
@@ -2348,13 +2413,13 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
               return (
                 <div key={defaultMatch.id} className="flex items-center gap-2 px-3 py-2 border-t border-stone-100">
                   {sideCell(pair.home, idx)}
-                  <div className="w-28 shrink-0 text-center text-[10px] text-stone-500 leading-tight">
+                  <div className="w-20 sm:w-28 shrink-0 text-center text-[10px] text-stone-500 leading-tight">
                     {matchday.bonanza && idx < 2 ? (
                       <span className="italic flex items-center justify-center gap-1"><Sparkles size={9} /> Bonanza picks</span>
                     ) : matchday.bonanza && idx === 2 ? (
                       <>
-                        <div className="truncate">{defaultMatch.home}</div>
-                        <div className="truncate">v {defaultMatch.away}</div>
+                        <div>{defaultMatch.home}</div>
+                        <div>v {defaultMatch.away}</div>
                         <div className="italic text-stone-400">anchor — home picks own</div>
                         {defaultMatch.outcome && canSeeResults && (
                           <div className="text-amber-500 font-mono-num">FT {defaultMatch.outcome.home}–{defaultMatch.outcome.away}</div>
@@ -2364,8 +2429,8 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
                       <span className="italic flex items-center justify-center gap-1"><Landmark size={9} /> Free match</span>
                     ) : (
                       <>
-                        <div className="truncate">{defaultMatch.home}</div>
-                        <div className="truncate">v {defaultMatch.away}</div>
+                        <div>{defaultMatch.home}</div>
+                        <div>v {defaultMatch.away}</div>
                         {defaultMatch.outcome && canSeeResults && (
                           <div className="text-amber-500 font-mono-num">FT {defaultMatch.outcome.home}–{defaultMatch.outcome.away}</div>
                         )}
@@ -2416,7 +2481,7 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
   // for, so it shouldn't be a season's worth of scrolling away.
   const matchdays = league.matchdays
     .filter((md) => adminMode || !md.draft)
-    .filter((md) => statusFilter === "all" || matchdayDisplayStatus(md, adminMode) === statusFilter)
+    .filter((md) => statusFilter === "all" || matchdayDisplayStatus(md, adminMode, now) === statusFilter)
     .reverse();
 
   return (
@@ -2447,8 +2512,8 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
               <div className="flex items-center gap-2">
                 <h3 className="font-display font-semibold">{md.label}</h3>
                 {md.scheduledDate && <span className="text-xs font-normal normal-case text-violet-700 flex items-center gap-1"><Calendar size={12} /> {fmtDateOnly(md.scheduledDate)}</span>}
-                <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(md, adminMode)])}>
-                  {matchdayDisplayStatus(md, adminMode)}
+                <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(md, adminMode, now)])}>
+                  {matchdayDisplayStatus(md, adminMode, now)}
                 </span>
               </div>
               <span className={cx("text-xs flex items-center gap-1", released ? "text-emerald-600" : "text-stone-500")}>
@@ -2462,16 +2527,24 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
             {/* Opening blog: from the reveal time until results are published.
                 Closing blog: from publish onward. Admin sees both, always. */}
             {(adminMode || (released && !md.resultsPublished)) && md.blog && md.blog.trim() && (
-              <div className="border border-amber-400/20 bg-amber-400/5 rounded-2xl p-4">
-                <h4 className="text-xs font-semibold text-amber-300 uppercase tracking-wide mb-2">Matchday blog</h4>
+              <article className="border border-amber-400/20 bg-amber-400/5 rounded-2xl p-5">
+                <div className="text-[10px] font-semibold text-amber-500 uppercase tracking-[0.2em] mb-1">Matchday programme</div>
+                <h4 className="font-display font-bold text-lg text-stone-900 leading-tight">
+                  {md.label}{md.scheduledDate ? ` · ${fmtDateOnly(md.scheduledDate)}` : ""}
+                </h4>
+                <div className="text-[11px] text-stone-400 mb-3 pb-2 border-b border-amber-400/20">By Admin</div>
                 <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.blog}</p>
-              </div>
+              </article>
             )}
             {(adminMode || md.resultsPublished) && md.closingBlog && md.closingBlog.trim() && (
-              <div className="border border-violet-700/20 bg-violet-700/5 rounded-2xl p-4">
-                <h4 className="text-xs font-semibold text-violet-700 uppercase tracking-wide mb-2">Matchday review</h4>
+              <article className="border border-violet-700/20 bg-violet-700/5 rounded-2xl p-5">
+                <div className="text-[10px] font-semibold text-violet-700 uppercase tracking-[0.2em] mb-1">The full-time review</div>
+                <h4 className="font-display font-bold text-lg text-stone-900 leading-tight">
+                  {md.label}{md.scheduledDate ? ` · ${fmtDateOnly(md.scheduledDate)}` : ""}
+                </h4>
+                <div className="text-[11px] text-stone-400 mb-3 pb-2 border-b border-violet-700/20">By Admin</div>
                 <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.closingBlog}</p>
-              </div>
+              </article>
             )}
             {md.pairings && (
               <button
@@ -2550,7 +2623,7 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                         // the moment predictions are revealed.
                         const canSeeCustomPick = adminMode || released || isSelf;
                         const canSeeValue = released || isSelf;
-                        const status = cellStatus(md, !!pred);
+                        const status = cellStatus(md, !!pred, now);
                         const Icon = STATUS_ICON[status];
                         return (
                           <td key={defaultMatch.id} className="px-3 py-3 text-center">
@@ -3943,6 +4016,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
   const [label, setLabel] = useState(matchday.label);
   const [scheduledDate, setScheduledDate] = useState(matchday.scheduledDate ? matchday.scheduledDate.slice(0, 10) : "");
   const [releaseAt, setReleaseAt] = useState(toLocalInputValue(matchday.releaseAt));
+  const [predictionsCloseAt, setPredictionsCloseAt] = useState(toLocalInputValue(matchday.predictionsCloseAt));
   const [locked, setLocked] = useState(matchday.locked);
   const [scoring, setScoring] = useState(matchday.scoring);
   const [blog, setBlog] = useState(matchday.blog || "");
@@ -4022,6 +4096,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
       label,
       scheduledDate: scheduledDate || null,
       releaseAt: releaseAt ? new Date(releaseAt).toISOString() : null,
+      predictionsCloseAt: predictionsCloseAt ? new Date(predictionsCloseAt).toISOString() : null,
       locked,
       scoring,
       blog,
@@ -4105,15 +4180,20 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
         <p className="text-xs text-stone-500">No head-to-head pairings attached to this matchday — generate a season fixture list above before creating new matchdays so standings can be calculated.</p>
       )}
 
-      <div className="grid sm:grid-cols-2 gap-3">
+      <div className="grid sm:grid-cols-3 gap-3">
+        <div>
+          <label className="text-xs text-stone-500">Predictions close at (auto-locks — contestants see a live countdown)</label>
+          <input type="datetime-local" value={predictionsCloseAt} onChange={(e) => setPredictionsCloseAt(e.target.value)} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <span className="text-[10px] text-stone-500">Blank = manual locking only. To reopen after a deadline passes, extend or clear it here.</span>
+        </div>
         <div>
           <label className="text-xs text-stone-500">Reveal picks at</label>
           <input type="datetime-local" value={releaseAt} onChange={(e) => setReleaseAt(e.target.value)} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
         </div>
-        <div className="flex items-end">
+        <div className="flex items-end pb-1">
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={locked} onChange={(e) => setLocked(e.target.checked)} className="accent-violet-700" />
-            Predictions locked (closed for entry)
+            Locked (manual override)
           </label>
         </div>
       </div>
@@ -4594,6 +4674,29 @@ function LeaderboardView({ league, leagueKey, data }) {
     return null;
   };
 
+  // Form guide: each contestant's head-to-head outcome over the last four
+  // published matchdays (oldest first), with a tooltip naming the opponent
+  // and the raw score. Byes appear as "B" — automatic wins by rule, but
+  // honestly labelled rather than dressed up as beaten opponents.
+  const formById = useMemo(() => {
+    const last = publishedMatchdays(league).slice(-4);
+    const nameById = Object.fromEntries(league.participants.map((p) => [p.id, p.name]));
+    const map = {};
+    league.participants.forEach((p) => { map[p.id] = []; });
+    last.forEach((md) => {
+      const res = computeH2HResultsForMatchday(md, data.predictions, league.participants);
+      league.participants.forEach((p) => {
+        const r = res[p.id];
+        if (!r) return;
+        map[p.id].push({
+          outcome: r.outcome,
+          title: `${md.label}: ${r.outcome === "bye" ? "bye — automatic win" : `${r.outcome === "win" ? "beat" : r.outcome === "loss" ? "lost to" : "drew with"} ${nameById[r.opponentId] ?? "?"} ${r.ownRaw}–${r.opponentRaw}`}`,
+        });
+      });
+    });
+    return map;
+  }, [league, data.predictions]);
+
   // Each contestant's rank BEFORE the most recent published matchday, for
   // the movement arrows — recomputed with the real standings calculation
   // (including manual corrections) so the comparison always matches the
@@ -4620,7 +4723,7 @@ function LeaderboardView({ league, leagueKey, data }) {
       {podium.length === 0 ? (
         <p className="text-stone-500 text-sm">No results have been entered yet — the board will populate once matches are scored.</p>
       ) : (
-        <Podium podium={podium} />
+        <Podium podium={podium} participants={league.participants} />
       )}
 
       <div className="border border-stone-200 rounded-2xl overflow-hidden">
@@ -4630,11 +4733,12 @@ function LeaderboardView({ league, leagueKey, data }) {
               <th className="px-4 py-3 font-semibold w-16 text-amber-300">Rank</th>
               <th className="px-4 py-3 font-semibold text-amber-300">Participant</th>
               <th className="px-2 py-3 font-semibold text-center w-10 text-amber-300" title="Movement since the most recent matchday">±</th>
-              <th className="px-4 py-3 font-semibold text-right text-amber-300">W</th>
-              <th className="px-4 py-3 font-semibold text-right text-amber-300">D</th>
-              <th className="px-4 py-3 font-semibold text-right text-amber-300">L</th>
-              <th className="px-4 py-3 font-semibold text-right text-amber-300">Score diff</th>
-              <th className="px-4 py-3 font-semibold text-right text-amber-300">Pts</th>
+              <th className="px-2 py-3 font-semibold text-center text-amber-300" title="Last four matchdays, oldest first">Form</th>
+              <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">W</th>
+              <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">D</th>
+              <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">L</th>
+              <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">Score diff</th>
+              <th className="px-4 py-3 font-display font-bold text-right text-amber-300 bg-white/10">Pts</th>
             </tr>
           </thead>
           <tbody>
@@ -4645,7 +4749,17 @@ function LeaderboardView({ league, leagueKey, data }) {
                 <td className="px-4 py-3 font-mono-num text-stone-500">
                   <span className="inline-flex items-center gap-1">{row.rank === 1 && row.leaguePoints > 0 && <Crown size={14} className="text-amber-400" />}#{row.rank}</span>
                 </td>
-                <td className="px-4 py-3 font-medium">{row.name}</td>
+                <td className="px-4 py-3 font-medium">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="relative shrink-0">
+                      <Avatar name={row.name} photo={league.participants.find((p) => p.id === row.id)?.photo} size={26} />
+                      {league.participants.find((p) => p.id === row.id)?.badge && (
+                        <img src={league.participants.find((p) => p.id === row.id).badge} alt="" className="absolute -bottom-1 -right-1 w-3.5 h-3.5 rounded-full border border-white bg-white object-contain" />
+                      )}
+                    </div>
+                    <span className="truncate">{row.name}</span>
+                  </div>
+                </td>
                 <td className="px-2 py-3 text-center">
                   {(() => {
                     const prevRank = prevRankById?.[row.id];
@@ -4659,13 +4773,34 @@ function LeaderboardView({ league, leagueKey, data }) {
                     return <span className="text-stone-400" title="No change since the most recent matchday">–</span>;
                   })()}
                 </td>
-                <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.wins}</td>
-                <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.draws}</td>
-                <td className="px-4 py-3 text-right font-mono-num text-stone-700">{row.losses}</td>
-                <td className={cx("px-4 py-3 text-right font-mono-num", row.scoreDifference > 0 ? "text-emerald-600" : row.scoreDifference < 0 ? "text-rose-600" : "text-stone-500")}>
+                <td className="px-2 py-3">
+                  <div className="flex gap-0.5 justify-center">
+                    {(formById[row.id] ?? []).map((f, fi) => (
+                      <span
+                        key={fi}
+                        title={f.title}
+                        className={cx(
+                          "w-4 h-4 rounded-sm text-white text-[9px] font-bold flex items-center justify-center",
+                          f.outcome === "loss" ? "bg-rose-500" : f.outcome === "draw" ? "bg-zinc-500" : "bg-emerald-500"
+                        )}
+                      >
+                        {f.outcome === "bye" ? "B" : f.outcome === "win" ? "W" : f.outcome === "draw" ? "D" : "L"}
+                      </span>
+                    ))}
+                    {(formById[row.id] ?? []).length === 0 && <span className="text-stone-400 text-xs">–</span>}
+                  </div>
+                </td>
+                <td className="hidden sm:table-cell px-4 py-3 text-right font-mono-num text-stone-700">{row.wins}</td>
+                <td className="hidden sm:table-cell px-4 py-3 text-right font-mono-num text-stone-700">{row.draws}</td>
+                <td className="hidden sm:table-cell px-4 py-3 text-right font-mono-num text-stone-700">{row.losses}</td>
+                {/* Score difference deliberately demoted to muted grey — points
+                    are the standings' primary currency and should read first. */}
+                <td className="hidden sm:table-cell px-4 py-3 text-right font-mono-num text-stone-500">
                   {row.scoreDifference > 0 ? "+" : ""}{row.scoreDifference}
                 </td>
-                <td className="px-4 py-3 text-right font-mono-num font-semibold text-amber-300">{row.leaguePoints}</td>
+                <td className="px-4 py-3 text-right bg-amber-400/5">
+                  <span className="font-display font-bold text-lg text-amber-500">{row.leaguePoints}</span>
+                </td>
               </tr>
               );
             })}
@@ -4678,7 +4813,7 @@ function LeaderboardView({ league, leagueKey, data }) {
 
 // Flexible podium: 2 places (lower divisions), the classic 3, or 4 (Premier
 // League) — winner always on the tallest step, arranged podium-style.
-function Podium({ podium }) {
+function Podium({ podium, participants }) {
   const n = podium.length;
   let order, heights;
   if (n >= 4) {
@@ -4706,9 +4841,16 @@ function Podium({ podium }) {
       {order.map((row, i) => {
         if (!row) return <div key={i} className="w-24" />;
         const place = row.rank;
+        const p = participants?.find((x) => x.id === row.id);
         return (
           <div key={row.id} className="flex flex-col items-center w-24 sm:w-28">
             <Medal size={22} className={cx("mb-1", medalColor(place))} />
+            <div className="relative mb-1.5">
+              <Avatar name={row.name} photo={p?.photo} size={44} />
+              {p?.badge && (
+                <img src={p.badge} alt="" className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full border-2 border-white bg-white object-contain" />
+              )}
+            </div>
             <div className="font-medium text-sm text-center truncate w-full">{row.name}</div>
             <div className="font-mono-num text-xs text-stone-500 mb-2">{row.totalPoints} pts</div>
             <div className={cx(
@@ -5617,6 +5759,129 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
   );
 }
 
+// One contestant's record against every opponent they've actually faced,
+// built from published matchdays only. Byes aren't meetings, so they don't
+// appear here.
+function computeH2HRecords(participantId, league, predictions) {
+  const records = {}; // opponentId -> { wins, draws, losses, pointsFor, pointsAgainst, meetings: [] }
+  publishedMatchdays(league).forEach((md) => {
+    const res = computeH2HResultsForMatchday(md, predictions, league.participants);
+    const r = res[participantId];
+    if (!r || !r.opponentId) return;
+    const rec = records[r.opponentId] ?? (records[r.opponentId] = { wins: 0, draws: 0, losses: 0, pointsFor: 0, pointsAgainst: 0, meetings: [] });
+    if (r.outcome === "win") rec.wins += 1;
+    else if (r.outcome === "loss") rec.losses += 1;
+    else rec.draws += 1;
+    rec.pointsFor += r.ownRaw ?? 0;
+    rec.pointsAgainst += r.opponentRaw ?? 0;
+    rec.meetings.push({ md: md.label, outcome: r.outcome, ownRaw: r.ownRaw, opponentRaw: r.opponentRaw });
+  });
+  return records;
+}
+
+// Head-to-head records on a contestant's stats profile: a summary table
+// against every opponent faced so far, plus a picker to zoom into one
+// rivalry — full record, prediction points for/against, and every meeting
+// listed matchday by matchday.
+function H2HRecordsSection({ participant, league, predictions }) {
+  const [opponentId, setOpponentId] = useState("");
+  const records = useMemo(() => computeH2HRecords(participant.id, league, predictions), [participant.id, league, predictions]);
+  const nameById = Object.fromEntries(league.participants.map((p) => [p.id, p.name]));
+  const opponents = league.participants.filter((p) => p.id !== participant.id);
+  const faced = opponents.filter((o) => records[o.id]);
+  const selected = opponentId ? records[opponentId] : null;
+
+  const outcomeChip = (outcome) => (
+    <span className={cx(
+      "w-4 h-4 rounded-sm text-white text-[9px] font-bold inline-flex items-center justify-center shrink-0",
+      outcome === "win" ? "bg-emerald-500" : outcome === "loss" ? "bg-rose-500" : "bg-zinc-500"
+    )}>
+      {outcome === "win" ? "W" : outcome === "loss" ? "L" : "D"}
+    </span>
+  );
+
+  return (
+    <div>
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-2">
+        <h3 className="font-display font-semibold text-sm">Head-to-head records</h3>
+        <select
+          value={opponentId}
+          onChange={(e) => setOpponentId(e.target.value)}
+          className="bg-white border border-stone-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+        >
+          <option value="">All opponents</option>
+          {opponents.map((o) => <option key={o.id} value={o.id}>vs {o.name}</option>)}
+        </select>
+      </div>
+
+      {opponentId === "" ? (
+        faced.length === 0 ? (
+          <p className="text-xs text-stone-500">No head-to-head meetings published yet — records appear as matchdays are confirmed.</p>
+        ) : (
+          <div className="border border-stone-200 rounded-2xl bg-white overflow-hidden">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="bg-stone-50 text-left text-[11px] uppercase tracking-wide text-stone-500">
+                  <th className="px-4 py-2 font-semibold">Opponent</th>
+                  <th className="px-3 py-2 font-semibold text-center">P</th>
+                  <th className="px-3 py-2 font-semibold text-center">W-D-L</th>
+                  <th className="hidden sm:table-cell px-3 py-2 font-semibold text-right">Pts for–against</th>
+                </tr>
+              </thead>
+              <tbody>
+                {faced.map((o) => {
+                  const rec = records[o.id];
+                  return (
+                    <tr key={o.id} className="border-t border-stone-100">
+                      <td className="px-4 py-2.5">
+                        <button onClick={() => setOpponentId(o.id)} className="font-medium hover:text-violet-700 hover:underline text-left">
+                          {o.name}
+                        </button>
+                      </td>
+                      <td className="px-3 py-2.5 text-center font-mono-num text-stone-500">{rec.meetings.length}</td>
+                      <td className="px-3 py-2.5 text-center font-mono-num">{rec.wins}-{rec.draws}-{rec.losses}</td>
+                      <td className="hidden sm:table-cell px-3 py-2.5 text-right font-mono-num text-stone-500">{rec.pointsFor}–{rec.pointsAgainst}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
+      ) : !selected ? (
+        <p className="text-xs text-stone-500">{participant.name} hasn't faced {nameById[opponentId] ?? "?"} yet this season.</p>
+      ) : (
+        <div className="border border-stone-200 rounded-2xl bg-white p-4 space-y-3">
+          <div className="flex flex-wrap items-center gap-4">
+            <div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wide">{participant.name} v {nameById[opponentId] ?? "?"}</div>
+              <div className="font-display font-bold text-2xl">{selected.wins}–{selected.draws}–{selected.losses}</div>
+              <div className="text-[11px] text-stone-500">W–D–L</div>
+            </div>
+            <div>
+              <div className="text-[11px] text-stone-500 uppercase tracking-wide">Prediction points</div>
+              <div className="font-mono-num text-lg">{selected.pointsFor}–{selected.pointsAgainst}</div>
+              <div className="text-[11px] text-stone-500">for–against</div>
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            {selected.meetings.map((mt, i) => (
+              <div key={i} className="flex items-center gap-2 text-xs border-t border-stone-100 pt-1.5">
+                {outcomeChip(mt.outcome)}
+                <span className="text-stone-500 w-28 shrink-0">{mt.md}</span>
+                <span className="font-mono-num">{mt.ownRaw}–{mt.opponentRaw}</span>
+                <span className="text-stone-500">
+                  {mt.outcome === "win" ? "won" : mt.outcome === "loss" ? "lost" : "drew"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StatTile({ icon: Icon, label, value, sub }) {
   return (
     <div className="border border-stone-200 rounded-xl p-3 bg-stone-50">
@@ -5699,6 +5964,8 @@ function StatsProfileView({ participant, league, leagueKey, data, onBack }) {
               <div className="font-mono-num text-rose-700 text-sm">{stats.worst?.points ?? 0} pts</div>
             </div>
           </div>
+
+          <H2HRecordsSection participant={participant} league={league} predictions={data.predictions} />
         </>
       )}
 
