@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
-  Trophy, Lock, Unlock, CheckCircle2, Clock, Search, Plus, Send,
+  Trophy, Lock, Unlock, CheckCircle2, Clock, Plus, Send,
   AlertCircle, Users, BarChart3, Settings2, X, Crown, Medal,
   Eye, EyeOff, ShieldCheck, Loader2, Trash2, Calendar, Sparkles,
   UserCircle2, Camera, MapPin, Cake, Shirt, Mail, KeyRound, LogOut,
   TrendingUp, ArrowLeft, Target, Flame, Award, Archive, History, Landmark,
-  Upload,
+  Upload, Share2,
 } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
@@ -1269,12 +1269,13 @@ function ForecastRoomApp() {
           <UserCircle2 size={14} className="text-amber-400" />
           <span className="text-stone-500">Signed in as</span>
           <span className="font-medium text-stone-900">{currentUser.name}</span>
-          <span className="text-stone-500">· {data.leagues[currentUser.leagueKey].name}</span>
           <button onClick={() => setCurrentUser(null)} className="ml-1 text-stone-500 hover:text-rose-600" title="Log out">
             <LogOut size={14} />
           </button>
         </div>
-        <AdminGate data={data} adminMode={adminMode} setAdminMode={setAdminMode} persist={persist} />
+        {/* Admin management lives exclusively behind the "Admin access"
+            entrance on the login screen — logged-in contestants see no
+            admin controls at all. */}
       </div>
 
       {globalView === "honours" ? (
@@ -1320,7 +1321,7 @@ function Header({ data, leagueKey }) {
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-10 pb-6 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
       <div>
         <div className="flex items-center gap-2 text-amber-400/90 text-xs font-semibold tracking-[0.2em] uppercase mb-2">
-          <Sparkles size={14} /> Live scoring room · Season {data.seasonLabel}
+          <Sparkles size={14} /> Season {data.seasonLabel}
         </div>
         <Logo className="h-16 sm:h-20 w-auto object-contain" />
         <p className="text-stone-300 mt-1 text-sm">Same game, same friends, new world</p>
@@ -1432,7 +1433,7 @@ function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId
           {allowSubmit && <TabButton icon={Send} label="Submit" active={tab === "submit"} onClick={() => setTab("submit")} accent={accent} />}
           <TabButton icon={BarChart3} label="Predictions Matrix" active={tab === "matrix"} onClick={() => setTab("matrix")} accent={accent} />
           <TabButton icon={Calendar} label="Fixture List" active={tab === "fixtures"} onClick={() => setTab("fixtures")} accent={accent} />
-          <TabButton icon={Settings2} label="Outcomes & Admin" active={tab === "admin"} onClick={() => setTab("admin")} accent={accent} />
+          {adminMode && <TabButton icon={Settings2} label="Outcomes & Admin" active={tab === "admin"} onClick={() => setTab("admin")} accent={accent} />}
           <TabButton icon={Trophy} label="Standings" active={tab === "leaderboard"} onClick={() => setTab("leaderboard")} accent={accent} />
           <TabButton icon={UserCircle2} label="Profiles" active={tab === "profiles"} onClick={() => setTab("profiles")} accent={accent} />
           <TabButton icon={TrendingUp} label="Stats" active={tab === "stats"} onClick={() => setTab("stats")} accent={accent} />
@@ -1516,8 +1517,10 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewerId, league]);
 
-  const setField = (matchId, side, val) =>
+  const setField = (matchId, side, val) => {
     setDraft((d) => ({ ...d, [matchId]: { ...d[matchId], [side]: val } }));
+    setConfirmation(null); // editing anything retires the "saved" banner until Save is pressed again
+  };
 
   const validPair = (pair) =>
     pair && pair.home !== "" && pair.away !== "" && Number(pair.home) >= 0 && Number(pair.away) >= 0 &&
@@ -1649,6 +1652,14 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
         const myCustomMatch = myPairing ? md.customMatches?.[myPairing.home] : null;
         const matches = viewerId ? effectiveMatchesFor(md, viewerId) : md.matches;
         const cDraft = customDraft[md.id] || { home: "", away: "" };
+        // Every match saved AND untouched since saving — drives the
+        // submit-all button's "done" state below. Editing any scoreline
+        // makes this false again, so the button reverts automatically.
+        const allSaved = !!viewerId && matches.length > 0 && matches.every((m) => {
+          const stored = data.predictions[`${m.id}__${viewerId}`];
+          const p = draft[m.id];
+          return !!stored && !!p && String(stored.home) === p.home && String(stored.away) === p.away;
+        });
         return (
         <section key={md.id} className="bg-white border border-stone-200 rounded-2xl p-5">
           <div className="flex items-center justify-between flex-wrap gap-2 mb-1">
@@ -1774,8 +1785,12 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                 );
               }
 
-              const already = viewerId && data.predictions[`${m.id}__${viewerId}`];
+              const stored = viewerId ? data.predictions[`${m.id}__${viewerId}`] : null;
               const pair = draft[m.id] || { home: "", away: "" };
+              // "submitted" shows only while the boxes still hold exactly
+              // what's saved — the moment a scoreline is edited, the tick
+              // vanishes until Save is pressed again.
+              const already = !!stored && String(stored.home) === pair.home && String(stored.away) === pair.away;
               return (
                 <div key={m.id} className="border border-stone-200 rounded-xl p-4 bg-white">
                   <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
@@ -1823,9 +1838,13 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
           </div>
           <button
             onClick={() => submitMatchday(md)}
-            className="mt-4 w-full sm:w-auto flex items-center justify-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-5 py-2.5 text-sm"
+            disabled={allSaved}
+            className={cx(
+              "mt-4 w-full sm:w-auto flex items-center justify-center gap-2 font-semibold rounded-lg px-5 py-2.5 text-sm",
+              allSaved ? "bg-stone-300 text-stone-600 cursor-default" : "bg-violet-700 hover:bg-violet-600 text-white"
+            )}
           >
-            <Send size={16} /> Submit all 3 for {md.label}
+            {allSaved ? <><CheckCircle2 size={16} /> Predictions Submitted</> : <><Send size={16} /> Submit all 3 for {md.label}</>}
           </button>
         </section>
         );
@@ -2223,6 +2242,7 @@ function HistoryView({ data, adminMode, persist }) {
 function FixtureListView({ league, viewerId }) {
   const nameById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.name])), [league.participants]);
   const stadiumById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.stadium])), [league.participants]);
+  const byId = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p])), [league.participants]);
 
   if (league.h2hSchedule.length === 0) {
     return (
@@ -2263,14 +2283,22 @@ function FixtureListView({ league, viewerId }) {
                   const stadium = stadiumById[p.home];
                   return (
                     <div key={j} className={cx("text-xs rounded px-2 py-1", mine ? "bg-amber-400/10 text-amber-300 font-medium" : "text-stone-500")}>
-                      <div>{nameById[p.home] ?? "?"} v {nameById[p.away] ?? "?"}</div>
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <BadgeAvatar participant={byId[p.home]} name={nameById[p.home] ?? "?"} size={16} />
+                        <span className="truncate">{nameById[p.home] ?? "?"}</span>
+                        <span className="opacity-60 shrink-0">v</span>
+                        <span className="truncate">{nameById[p.away] ?? "?"}</span>
+                        <BadgeAvatar participant={byId[p.away]} name={nameById[p.away] ?? "?"} size={16} />
+                      </div>
                       {stadium && <div className="text-[10px] opacity-70 flex items-center gap-1 mt-0.5"><Landmark size={10} /> {stadium}</div>}
                     </div>
                   );
                 })}
                 {round.bye && (
-                  <div className={cx("text-xs rounded px-2 py-1", viewerId === round.bye ? "bg-amber-400/10 text-amber-300 font-medium" : "text-stone-500")}>
-                    Bye: {nameById[round.bye] ?? "?"}
+                  <div className={cx("text-xs rounded px-2 py-1 flex items-center gap-1.5", viewerId === round.bye ? "bg-amber-400/10 text-amber-300 font-medium" : "text-stone-500")}>
+                    <span>Bye:</span>
+                    <BadgeAvatar participant={byId[round.bye]} name={nameById[round.bye] ?? "?"} size={16} />
+                    <span className="truncate">{nameById[round.bye] ?? "?"}</span>
                   </div>
                 )}
               </div>
@@ -2391,13 +2419,13 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
             <div className={cx("px-3 py-2", mine ? "bg-amber-400/10" : "bg-stone-50")}>
               <div className="flex items-center gap-2">
                 <div className="flex items-center gap-2 flex-1 min-w-0">
-                  <Avatar name={home?.name ?? "?"} photo={home?.photo} size={26} />
+                  <BadgeAvatar participant={home} name={home?.name ?? "?"} size={26} />
                   <span className={cx("font-medium text-sm truncate", pair.home === viewerId && "text-amber-600")}>{nameOf(pair.home)}</span>
                 </div>
                 <span className="text-[10px] text-stone-400 font-display shrink-0">V</span>
                 <div className="flex items-center gap-2 flex-1 min-w-0 justify-end">
                   <span className={cx("font-medium text-sm truncate text-right", pair.away === viewerId && "text-amber-600")}>{nameOf(pair.away)}</span>
-                  <Avatar name={away?.name ?? "?"} photo={away?.photo} size={26} />
+                  <BadgeAvatar participant={away} name={away?.name ?? "?"} size={26} />
                 </div>
               </div>
               {/* The home contestant's stadium — this fixture is "played" at
@@ -2459,7 +2487,6 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
 }
 
 function MatrixView({ league, data, viewerId, adminMode, now }) {
-  const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   // Which matchdays have their full prediction grid expanded — for matchdays
   // with head-to-head pairings, the cards are the default view and the grid
@@ -2473,7 +2500,6 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
   // Rows: participants ordered by accumulated points so far (highest first),
   // matching the leaderboard's ranking.
   const participants = league.participants
-    .filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     .slice()
     .sort((a, b) => (boardById[b.id]?.totalPoints ?? 0) - (boardById[a.id]?.totalPoints ?? 0));
 
@@ -2489,10 +2515,6 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
       <div className="flex flex-wrap gap-3 items-center justify-between">
         <h2 className="font-display font-semibold text-lg flex items-center gap-2"><BarChart3 size={18} className="text-amber-400" /> Predictions Matrix — {league.name}</h2>
         <div className="flex gap-2 flex-wrap">
-          <div className="relative">
-            <Search size={15} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-500" />
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search participant" className="bg-white border border-stone-300 rounded-lg pl-8 pr-3 py-1.5 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
-          </div>
           <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="bg-white border border-stone-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50">
             <option value="all">All matchdays</option>
             <option value="open">Open</option>
@@ -4643,7 +4665,90 @@ function suggestNextSeasonLabel(label) {
   return `${nextStart}-${nextEndShort}`;
 }
 
+// Renders the current standings as a shareable image (banner-purple card
+// with logo, zone colours and points) and hands it to the device's native
+// share sheet — on a phone that's two taps into the WhatsApp group. Where
+// no share sheet exists (laptops), the image downloads instead. The site
+// can't post into WhatsApp directly (WhatsApp doesn't allow that); the
+// person always chooses the destination.
+async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZoneClass) {
+  const width = 760;
+  const headerH = 128;
+  const rowH = 42;
+  const footerH = 44;
+  const height = headerH + board.length * rowH + footerH;
+  const canvas = document.createElement("canvas");
+  canvas.width = width * 2;
+  canvas.height = height * 2;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(2, 2);
+
+  ctx.fillStyle = "#3D1F5C";
+  ctx.fillRect(0, 0, width, height);
+
+  // Logo (best-effort — the card still works without it)
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = "/plp-logo.png";
+    });
+    const lh = 96;
+    ctx.drawImage(img, 24, 16, img.width * (lh / img.height), lh);
+  } catch { /* no logo, no problem */ }
+
+  const accent = leagueAccent(leagueKey);
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = accent;
+  ctx.font = "700 24px Oswald, ui-sans-serif, sans-serif";
+  ctx.fillText(league.name.toUpperCase(), 110, 62);
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.font = "500 13px Inter, ui-sans-serif, sans-serif";
+  ctx.fillText(`Season ${seasonLabel} · Standings`, 110, 84);
+
+  const ZONE_FILLS = {
+    "bg-amber-400/5": "rgba(251,191,36,0.14)",
+    "bg-yellow-200/20": "rgba(253,224,71,0.14)",
+    "bg-sky-400/10": "rgba(56,189,248,0.16)",
+    "bg-rose-400/10": "rgba(251,113,133,0.16)",
+  };
+
+  board.forEach((row, i) => {
+    const y = headerH + i * rowH;
+    const zone = rowZoneClass(row);
+    ctx.fillStyle = zone && ZONE_FILLS[zone] ? ZONE_FILLS[zone] : i % 2 === 0 ? "rgba(255,255,255,0.04)" : "transparent";
+    ctx.fillRect(16, y, width - 32, rowH);
+
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.font = "600 14px 'JetBrains Mono', ui-monospace, monospace";
+    ctx.fillText(`#${row.rank}`, 30, y + 27);
+
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "600 16px Inter, ui-sans-serif, sans-serif";
+    ctx.fillText(row.name, 78, y + 27);
+
+    ctx.textAlign = "right";
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "500 14px 'JetBrains Mono', ui-monospace, monospace";
+    ctx.fillText(`${row.wins}-${row.draws}-${row.losses}`, width - 190, y + 27);
+    ctx.fillText(`${row.scoreDifference > 0 ? "+" : ""}${row.scoreDifference}`, width - 110, y + 27);
+    ctx.fillStyle = accent;
+    ctx.font = "700 20px Oswald, ui-sans-serif, sans-serif";
+    ctx.fillText(String(row.leaguePoints), width - 34, y + 29);
+    ctx.textAlign = "left";
+  });
+
+  ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.font = "500 11px Inter, ui-sans-serif, sans-serif";
+  ctx.fillText("Same game, same friends, new world", 24, height - 18);
+
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+}
+
 function LeaderboardView({ league, leagueKey, data }) {
+  const [shareState, setShareState] = useState(null); // null | "busy" | "downloaded" | "failed"
+
   const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
   // Premier League celebrates the top 4; every other division the top 2.
   const podium = board.filter((r) => r.leaguePoints > 0).slice(0, leagueKey === "league1" ? 4 : 2);
@@ -4672,6 +4777,41 @@ function LeaderboardView({ league, leagueKey, data }) {
       if (row.rank >= 3 && row.rank <= 8) return "bg-sky-400/10";
     }
     return null;
+  };
+
+  const shareStandings = async () => {
+    setShareState("busy");
+    try {
+      const blob = await buildStandingsImage(league, leagueKey, data.seasonLabel, board, rowZoneClass);
+      if (!blob) throw new Error("no image");
+      const file = new File([blob], `plp-standings-${new Date().toISOString().slice(0, 10)}.png`, { type: "image/png" });
+      // Native share sheet where available (phones) — the person picks
+      // WhatsApp and the group there.
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file], title: `${league.name} standings` });
+          setShareState(null);
+          return;
+        } catch (err) {
+          if (err && err.name === "AbortError") { setShareState(null); return; } // person closed the sheet — not an error
+          /* fall through to download */
+        }
+      }
+      // Laptops (no share sheet): download the image to attach manually.
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setShareState("downloaded");
+      setTimeout(() => setShareState(null), 3000);
+    } catch {
+      setShareState("failed");
+      setTimeout(() => setShareState(null), 3000);
+    }
   };
 
   // Form guide: each contestant's head-to-head outcome over the last four
@@ -4714,7 +4854,18 @@ function LeaderboardView({ league, leagueKey, data }) {
     <div className="space-y-8">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Trophy size={18} className="text-amber-400" /> {league.name} Standings</h2>
-        <span className="text-xs text-stone-500">{scoredMatches} of {totalMatches} matches scored</span>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={shareStandings}
+            disabled={shareState === "busy"}
+            className="flex items-center gap-1.5 text-xs bg-stone-200 hover:bg-stone-300 disabled:opacity-50 border border-stone-300 rounded-lg px-3 py-1.5 font-medium"
+            title="Share the table as an image — on a phone this opens the share sheet (e.g. straight into WhatsApp); on a laptop it downloads the image"
+          >
+            <Share2 size={13} />
+            {shareState === "busy" ? "Preparing…" : shareState === "downloaded" ? "Image downloaded" : shareState === "failed" ? "Couldn't create image" : "Share standings"}
+          </button>
+          <span className="text-xs text-stone-500">{scoredMatches} of {totalMatches} matches scored</span>
+        </div>
       </div>
       <p className="text-xs text-stone-500 -mt-6">
         Head-to-head format: each matchday you're paired against another contestant — whoever scores more prediction points wins the matchup (3 pts), a tie draws (1 pt each). Ties in the table are broken by score difference, then alphabetically.
@@ -4733,11 +4884,11 @@ function LeaderboardView({ league, leagueKey, data }) {
               <th className="px-4 py-3 font-semibold w-16 text-amber-300">Rank</th>
               <th className="px-4 py-3 font-semibold text-amber-300">Participant</th>
               <th className="px-2 py-3 font-semibold text-center w-10 text-amber-300" title="Movement since the most recent matchday">±</th>
-              <th className="px-2 py-3 font-semibold text-center text-amber-300" title="Last four matchdays, oldest first">Form</th>
+              <th className="hidden sm:table-cell px-2 py-3 font-semibold text-center text-amber-300" title="Last four matchdays, oldest first">Form</th>
               <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">W</th>
               <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">D</th>
               <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">L</th>
-              <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">Score diff</th>
+              <th className="px-3 sm:px-4 py-3 font-semibold text-right text-amber-300">Score diff</th>
               <th className="px-4 py-3 font-display font-bold text-right text-amber-300 bg-white/10">Pts</th>
             </tr>
           </thead>
@@ -4751,12 +4902,7 @@ function LeaderboardView({ league, leagueKey, data }) {
                 </td>
                 <td className="px-4 py-3 font-medium">
                   <div className="flex items-center gap-2 min-w-0">
-                    <div className="relative shrink-0">
-                      <Avatar name={row.name} photo={league.participants.find((p) => p.id === row.id)?.photo} size={26} />
-                      {league.participants.find((p) => p.id === row.id)?.badge && (
-                        <img src={league.participants.find((p) => p.id === row.id).badge} alt="" className="absolute -bottom-1 -right-1 w-3.5 h-3.5 rounded-full border border-white bg-white object-contain" />
-                      )}
-                    </div>
+                    <BadgeAvatar participant={league.participants.find((p) => p.id === row.id)} name={row.name} size={26} />
                     <span className="truncate">{row.name}</span>
                   </div>
                 </td>
@@ -4773,7 +4919,7 @@ function LeaderboardView({ league, leagueKey, data }) {
                     return <span className="text-stone-400" title="No change since the most recent matchday">–</span>;
                   })()}
                 </td>
-                <td className="px-2 py-3">
+                <td className="hidden sm:table-cell px-2 py-3">
                   <div className="flex gap-0.5 justify-center">
                     {(formById[row.id] ?? []).map((f, fi) => (
                       <span
@@ -4795,7 +4941,7 @@ function LeaderboardView({ league, leagueKey, data }) {
                 <td className="hidden sm:table-cell px-4 py-3 text-right font-mono-num text-stone-700">{row.losses}</td>
                 {/* Score difference deliberately demoted to muted grey — points
                     are the standings' primary currency and should read first. */}
-                <td className="hidden sm:table-cell px-4 py-3 text-right font-mono-num text-stone-500">
+                <td className="px-3 sm:px-4 py-3 text-right font-mono-num text-stone-500">
                   {row.scoreDifference > 0 ? "+" : ""}{row.scoreDifference}
                 </td>
                 <td className="px-4 py-3 text-right bg-amber-400/5">
@@ -4829,8 +4975,6 @@ function Podium({ podium, participants }) {
     order = [...podium];
     heights = ["h-32"];
   }
-  const medalColor = (place) =>
-    place === 1 ? "text-amber-400" : place === 2 ? "text-stone-700" : place === 3 ? "text-orange-400" : "text-sky-600";
   const stepStyle = (place) =>
     place === 1 ? "bg-gradient-to-b from-amber-400/40 to-amber-400/10 text-amber-300 border border-amber-400/40"
       : place === 2 ? "bg-gradient-to-b from-zinc-400/30 to-zinc-400/5 text-stone-700 border border-zinc-500/40"
@@ -4844,12 +4988,9 @@ function Podium({ podium, participants }) {
         const p = participants?.find((x) => x.id === row.id);
         return (
           <div key={row.id} className="flex flex-col items-center w-24 sm:w-28">
-            <Medal size={22} className={cx("mb-1", medalColor(place))} />
-            <div className="relative mb-1.5">
-              <Avatar name={row.name} photo={p?.photo} size={44} />
-              {p?.badge && (
-                <img src={p.badge} alt="" className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full border-2 border-white bg-white object-contain" />
-              )}
+            {place === 1 && <Crown size={22} className="text-amber-400 mb-1" />}
+            <div className="mb-1.5">
+              <BadgeAvatar participant={p} name={row.name} size={44} />
             </div>
             <div className="font-medium text-sm text-center truncate w-full">{row.name}</div>
             <div className="font-mono-num text-xs text-stone-500 mb-2">{row.totalPoints} pts</div>
@@ -4916,6 +5057,24 @@ function Avatar({ name, photo, size = 56 }) {
       {initials}
     </div>
   );
+}
+
+// Roster identity chip used in standings, podiums and pairing cards: the
+// contestant's admin-uploaded team badge when one exists, otherwise a plain
+// initial disc. Deliberately badge-first — badges are the site's visual
+// identity for contestants; profile photos stay on the Profiles page only.
+function BadgeAvatar({ participant, name, size = 26 }) {
+  if (participant?.badge) {
+    return (
+      <img
+        src={participant.badge}
+        alt=""
+        style={{ width: size, height: size }}
+        className="rounded-full border border-stone-200 bg-white object-contain shrink-0"
+      />
+    );
+  }
+  return <Avatar name={name} size={size} />;
 }
 
 function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist }) {
@@ -5686,7 +5845,7 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
   return (
     <div className="border border-stone-200 rounded-2xl p-4 bg-white" style={{ height: 360 }}>
       <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={rows} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+        <LineChart data={rows} margin={{ top: 10, right: 20, left: 0, bottom: 24 }}>
           <CartesianGrid stroke="#27272a" strokeDasharray="3 3" />
           <XAxis
             dataKey="matchday"
@@ -5695,7 +5854,7 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
             allowDecimals={false}
             stroke="#a1a1aa"
             tick={{ fontSize: 11 }}
-            label={{ value: "Matchday", position: "insideBottom", offset: -4, fill: "#71717a", fontSize: 11 }}
+            label={{ value: "Matchday", position: "bottom", offset: 10, fill: "#71717a", fontSize: 11 }}
           />
           <YAxis
             reversed
