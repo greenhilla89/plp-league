@@ -11,12 +11,13 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
 
-// The site mark — the official PLP logo (public/plp-logo.png), presented
-// on a white rounded card baked into the image itself, so the purple globe
-// reads clearly everywhere: on light pages and on the dark purple banner
-// alike. Callers size it with className exactly as before.
-function Logo({ className }) {
-  return <img src="/plp-logo.png" alt="PLP" className={className} />;
+// The site mark — the official PLP logo, in two colourways generated from
+// the same artwork: "dark" (white marks on the banner purple, blending
+// seamlessly into the header) and "light" (purple marks on the login
+// page's exact background colour, blending into that instead). Callers
+// size it with className exactly as before.
+function Logo({ className, variant = "dark" }) {
+  return <img src={variant === "light" ? "/plp-logo-light.png" : "/plp-logo.png"} alt="PLP" className={className} />;
 }
 
 /* ============================================================================
@@ -5408,7 +5409,7 @@ function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, save
       `}</style>
       <div className="w-full max-w-sm">
         <div className="flex justify-center mb-8">
-          <Logo className="h-28 w-auto object-contain" />
+          <Logo variant="light" className="h-28 w-auto object-contain" />
         </div>
 
         <div className="flex gap-1 mb-5 bg-white border border-stone-200 rounded-lg p-1">
