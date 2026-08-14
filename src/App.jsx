@@ -1220,9 +1220,6 @@ function ForecastRoomApp() {
               style={!globalView && safeLeagueKey === k ? { background: leagueAccent(k), borderColor: leagueAccent(k) } : undefined}
             >
               {data.leagues[k].name}
-              <span className={cx("text-xs px-1.5 py-0.5 rounded-full", !globalView && safeLeagueKey === k ? "bg-black/20" : "bg-white/10")}>
-                {data.leagues[k].participants.length}/{data.leagues[k].maxParticipants}
-              </span>
             </button>
           ))}
         </div>
@@ -1332,7 +1329,7 @@ function Header({ data, leagueKey }) {
           <div>
             <div className="text-[11px] uppercase tracking-wider text-amber-300/80 font-semibold">{league.name} leader</div>
             <div className="font-display font-bold text-lg leading-tight text-white">{leader.name}</div>
-            <div className="font-mono-num text-amber-300 text-sm">{leader.leaguePoints} pts <span className="text-stone-300">({leader.wins}-{leader.draws}-{leader.losses})</span></div>
+            <div className="font-mono-num text-amber-300 text-sm">{leader.leaguePoints} pts <span className="text-stone-300">· {leader.scoreDifference > 0 ? "+" : ""}{leader.scoreDifference}</span></div>
           </div>
         </div>
       )}
