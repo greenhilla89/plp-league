@@ -2121,10 +2121,12 @@ function HonoursView({ data, adminMode, persist }) {
                   };
                   return legacyHonours.map((entry) => {
                   const winner = resolveLegacyWinner(entry, data);
+                  // Seasons alternate between a very light gold and a very
+                  // light purple wash — the site's two signature colours.
                   const banded = seasonOrder.indexOf(entry.season) % 2 === 1;
                   const primary = isPrimary(entry.competition);
                   return (
-                    <tr key={entry.id} className={cx("border-t border-stone-100 first:border-t-0", banded ? "bg-stone-100" : "bg-white")}>
+                    <tr key={entry.id} className={cx("border-t border-stone-100 first:border-t-0", banded ? "bg-violet-700/10" : "bg-amber-400/10")}>
                       <td className={cx("px-4 py-2.5 font-mono-num w-24", primary ? "font-bold text-stone-600" : "text-stone-400")}>{entry.season}</td>
                       <td className={cx("px-4 py-2.5", primary ? "font-bold text-stone-900" : "text-stone-700")}>{entry.competition}</td>
                       <td className="px-4 py-2.5">
