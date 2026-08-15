@@ -1061,6 +1061,177 @@ function ForecastRoomApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [!!data, maybeTakeSnapshot]);
 
+  // PROFILE SAVES — read-merge-write, like prediction submissions. Each
+  // contestant only ever edits their own record, so instead of a full save
+  // (which the stale-write protection would rightly refuse whenever
+  // anything else changed in the meantime), the latest roster is read
+  // fresh from storage and just this one participant's fields are applied
+  // to it. Any number of contestants can save their profiles at the same
+  // time — every change lands, nobody sees a stale-data error.
+  const mergeProfileSave = useCallback((targetLeagueKey, participantId, fields, badgePatch) => {
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const currentRev = await readRevValue();
+        const wasFresh = (revRef.current ?? null) === (currentRev ?? null);
+
+        const rosterRes = await window.storage.get(ROSTER_KEY, true);
+        const rosterBlob = rosterRes && rosterRes.value ? JSON.parse(rosterRes.value) : { leagues: {} };
+        const freshLeague = rosterBlob.leagues[targetLeagueKey];
+        if (!freshLeague || !freshLeague.participants.some((p) => p.id === participantId)) {
+          setSaveError("Your profile couldn't be saved — your contestant record wasn't found. Refresh the page and try again.");
+          return false;
+        }
+        freshLeague.participants = freshLeague.participants.map((p) => (p.id === participantId ? { ...p, ...fields } : p));
+        await window.storage.set(ROSTER_KEY, JSON.stringify(rosterBlob), true);
+
+        let freshBadges = null;
+        if (badgePatch) {
+          const badgesRes = await window.storage.get(BADGES_KEY, true);
+          const badgesBlob = badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} };
+          if (badgePatch.badge) badgesBlob.badges[participantId] = badgePatch.badge;
+          else delete badgesBlob.badges[participantId];
+          await window.storage.set(BADGES_KEY, JSON.stringify(badgesBlob), true);
+          freshBadges = badgesBlob.badges;
+        }
+
+        // Bump the save-version so other tabs know to refresh; only adopt
+        // it ourselves if this tab was fresh to begin with (same rule as
+        // prediction submissions — a stale tab must stay stale).
+        try {
+          const newRev = nextRevValue(currentRev);
+          const claimed = await claimRev(currentRev, newRev);
+          if (claimed && wasFresh) revRef.current = newRev;
+        } catch { /* best-effort — the profile itself is already saved */ }
+
+        // Fold the freshly-read roster into this tab's own view, so other
+        // people's just-saved profiles appear here too.
+        const prev = dataRef.current;
+        if (prev) {
+          const nextLeagues = { ...prev.leagues };
+          Object.entries(rosterBlob.leagues).forEach(([k, fresh]) => {
+            if (!nextLeagues[k]) return;
+            const prevById = Object.fromEntries(nextLeagues[k].participants.map((p) => [p.id, p]));
+            nextLeagues[k] = {
+              ...nextLeagues[k],
+              participants: fresh.participants.map((p) => ({
+                ...p,
+                photo: prevById[p.id]?.photo ?? null,
+                badge: freshBadges ? (freshBadges[p.id] ?? null) : (prevById[p.id]?.badge ?? null),
+              })),
+            };
+          });
+          setData({ ...prev, leagues: nextLeagues });
+        }
+        setSaveError(null);
+        return true;
+      } catch {
+        setSaveError("Your profile couldn't be saved — check your connection and try again.");
+        return false;
+      }
+    });
+    persistQueueRef.current = run.then(() => undefined).catch(() => {});
+    return run;
+  }, []);
+
+  // ACCOUNT REGISTRATION — read-merge-write on the accounts key alone, so
+  // two people registering at the same moment both succeed, and a refused
+  // save can never leave someone apparently "logged in" to an account that
+  // was never actually stored.
+  const registerAccount = useCallback((emailKey, record) => {
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const currentRev = await readRevValue();
+        const wasFresh = (revRef.current ?? null) === (currentRev ?? null);
+        const res = await window.storage.get(ACCOUNTS_KEY, true);
+        const blob = res && res.value ? JSON.parse(res.value) : { accounts: {} };
+        if (blob.accounts[emailKey]) return { ok: false, reason: "exists" };
+        blob.accounts[emailKey] = record;
+        await window.storage.set(ACCOUNTS_KEY, JSON.stringify(blob), true);
+        try {
+          const newRev = nextRevValue(currentRev);
+          const claimed = await claimRev(currentRev, newRev);
+          if (claimed && wasFresh) revRef.current = newRev;
+        } catch { /* best-effort */ }
+        const prev = dataRef.current;
+        if (prev) setData({ ...prev, accounts: { ...prev.accounts, [emailKey]: record } });
+        return { ok: true };
+      } catch {
+        return { ok: false, reason: "network" };
+      }
+    });
+    persistQueueRef.current = run.then(() => undefined).catch(() => {});
+    return run;
+  }, []);
+
+  // AUTO-REFRESH — re-reads everything from storage and adopts it. Used at
+  // login (so signing in always starts from the latest data) and whenever
+  // the page comes back into view (so a phone reopening the site from its
+  // home screen days later refreshes itself instead of showing stale data).
+  // Never seeds: if storage looks unreachable or empty, the current
+  // in-memory data stays exactly as it is.
+  const reloadInFlightRef = useRef(false);
+  const lastRevCheckRef = useRef(0);
+  const reloadFromStorage = useCallback(() => {
+    if (reloadInFlightRef.current) return persistQueueRef.current.then(() => dataRef.current);
+    reloadInFlightRef.current = true;
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const coreRes = await window.storage.get(CORE_KEY, true);
+        if (!coreRes || !coreRes.value) return dataRef.current;
+        const accountsRes = await window.storage.get(ACCOUNTS_KEY, true);
+        const rosterRes = await window.storage.get(ROSTER_KEY, true);
+        const photosRes = await window.storage.get(PHOTOS_KEY, true);
+        const predictionsRes = await window.storage.get(PREDICTIONS_KEY, true);
+        const archivesRes = await window.storage.get(SEASON_ARCHIVES_KEY, true);
+        const badgesRes = await window.storage.get(BADGES_KEY, true);
+        const historyRes = await window.storage.get(HISTORY_KEY, true);
+        const revRes = await window.storage.get(REV_KEY, true);
+        const merged = migrateData(mergeSplitData(
+          JSON.parse(coreRes.value),
+          accountsRes && accountsRes.value ? JSON.parse(accountsRes.value) : { accounts: {} },
+          rosterRes && rosterRes.value ? JSON.parse(rosterRes.value) : { leagues: {} },
+          photosRes && photosRes.value ? JSON.parse(photosRes.value) : { photos: {} },
+          predictionsRes && predictionsRes.value ? JSON.parse(predictionsRes.value) : { predictions: {} },
+          archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
+          badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
+          historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } }
+        ));
+        revRef.current = revRes && revRes.value ? revRes.value : null;
+        setData(merged);
+        setSaveError(null); // this tab is now fully fresh
+        return merged;
+      } catch {
+        return dataRef.current;
+      } finally {
+        reloadInFlightRef.current = false;
+      }
+    });
+    persistQueueRef.current = run.then(() => undefined).catch(() => {});
+    return run;
+  }, []);
+
+  // Cheap staleness check whenever the page becomes visible again: one tiny
+  // read of the save-version; a full reload only when it actually differs.
+  useEffect(() => {
+    const maybeRefresh = async () => {
+      if (document.visibilityState !== "visible") return;
+      if (!dataRef.current) return;
+      const nowTs = Date.now();
+      if (nowTs - lastRevCheckRef.current < 15000) return; // at most every 15s
+      lastRevCheckRef.current = nowTs;
+      try {
+        const current = await readRevValue();
+        if ((revRef.current ?? null) !== (current ?? null)) reloadFromStorage();
+      } catch { /* offline — try again next time the page wakes */ }
+    };
+    document.addEventListener("visibilitychange", maybeRefresh);
+    window.addEventListener("focus", maybeRefresh);
+    return () => {
+      document.removeEventListener("visibilitychange", maybeRefresh);
+      window.removeEventListener("focus", maybeRefresh);
+    };
+  }, [reloadFromStorage]);
+
   const persist = useCallback((next) => {
     // Queue this save behind whatever's already running, rather than
     // starting it immediately — see persistQueueRef above for why.
@@ -1292,6 +1463,7 @@ function ForecastRoomApp() {
           leagueKey={safeLeagueKey}
           data={data}
           persist={persist}
+          mergeProfileSave={mergeProfileSave}
           submitPredictions={submitPredictions}
           viewerId={viewerId}
           adminMode={adminMode}
@@ -1458,7 +1630,7 @@ function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId
             : <LockedAdminNotice />
         )}
         {tab === "leaderboard" && <LeaderboardView league={league} leagueKey={leagueKey} data={data} />}
-        {tab === "profiles" && <ProfilesView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} adminMode={adminMode} persist={persist} />}
+        {tab === "profiles" && <ProfilesView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} adminMode={adminMode} persist={persist} mergeProfileSave={mergeProfileSave} />}
         {tab === "stats" && <StatsView league={league} leagueKey={leagueKey} data={data} />}
       </main>
     </>
@@ -5152,7 +5324,7 @@ function BadgeAvatar({ participant, name, size = 26 }) {
   return <Avatar name={name} size={size} />;
 }
 
-function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist }) {
+function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist, mergeProfileSave }) {
   const fileInputRef = useRef(null);
   // Normally you can only ever edit your own profile. In admin mode there's
   // no "self" to default to, so admin explicitly picks who they're managing
@@ -5219,12 +5391,16 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
     if (!editTargetId) { setError(adminMode ? "Choose a contestant to manage first." : "You're not registered in this league, so there's no profile to save."); return; }
     if (!name.trim() || !supports.trim()) { setError("Name and favourite team are required."); return; }
     setError("");
-    const nextParticipants = league.participants.map((p) =>
-      p.id === editTargetId
-        ? { ...p, name: adminMode ? name.trim() : p.name, supports: supports.trim(), dob, residence: residence.trim(), bio: bio.trim(), badge: adminMode ? photo : p.badge, stadium: stadiumLocked ? p.stadium : stadium.trim() }
-        : p
-    );
-    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, participants: nextParticipants } } });
+    // Saved via read-merge-write (see mergeProfileSave): only THIS
+    // contestant's fields are applied to the freshest stored roster, so
+    // any number of people can save profiles at the same time without
+    // stale-data errors — and without overwriting each other.
+    const fields = { supports: supports.trim(), dob, residence: residence.trim(), bio: bio.trim() };
+    if (adminMode) fields.name = name.trim();
+    if (!stadiumLocked) fields.stadium = stadium.trim();
+    const badgePatch = adminMode ? { badge: photo } : null; // only admin can change the badge
+    const ok = await mergeProfileSave(leagueKey, editTargetId, fields, badgePatch);
+    if (!ok) return; // the banner explains what happened — nothing typed is lost
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
   };
@@ -5494,6 +5670,7 @@ function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, save
               leagueKey={safeAdminLeagueKey}
               data={data}
               persist={persist}
+              mergeProfileSave={mergeProfileSave}
               viewerId=""
               adminMode
               now={Date.now()}
@@ -5535,8 +5712,8 @@ function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, save
         </div>
 
         {mode === "login"
-          ? <LoginForm data={data} persist={persist} onLogin={onLogin} />
-          : <RegisterForm data={data} persist={persist} onLogin={onLogin} />}
+          ? <LoginForm data={data} persist={persist} reloadData={reloadData} onLogin={onLogin} />
+          : <RegisterForm data={data} reloadData={reloadData} registerAccount={registerAccount} onLogin={onLogin} />}
 
         <div className="mt-6 pt-4 border-t border-stone-200 text-center">
           {enteringPin ? (
@@ -5565,7 +5742,7 @@ function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, save
   );
 }
 
-function LoginForm({ data, persist, onLogin }) {
+function LoginForm({ data, persist, reloadData, onLogin }) {
   const [view, setView] = useState("login"); // "login" | "reset"
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -5581,11 +5758,15 @@ function LoginForm({ data, persist, onLogin }) {
     if (!key || !password) { setError("Enter your email and password."); return; }
     setBusy(true);
     try {
-      const account = data.accounts[key];
+      // Pull the latest data first, so logging in always starts from the
+      // freshest state — even if this page has been open (or asleep on a
+      // phone's home screen) for days.
+      const d = reloadData ? ((await reloadData()) ?? data) : data;
+      const account = d.accounts[key];
       if (!account) { setError("No account found for that email."); return; }
       const hash = await hashPassword(password, account.salt);
       if (hash !== account.hash) { setError("Incorrect password."); return; }
-      const league = data.leagues[account.leagueKey];
+      const league = d.leagues[account.leagueKey];
       const participant = league?.participants.find((p) => p.id === account.participantId);
       if (!participant) { setError("Your linked contestant record is missing — ask the organizer to check the roster."); return; }
       onLogin({ email: key, name: participant.name, leagueKey: account.leagueKey, participantId: account.participantId });
@@ -5604,7 +5785,10 @@ function LoginForm({ data, persist, onLogin }) {
     const cleaned = resetCode.replace(/\s+/g, "").toUpperCase();
     if (!key) { setError("Enter your email address."); return; }
     if (!cleaned) { setError("Enter the reset code your organizer gave you."); return; }
-    const account = data.accounts[key];
+    // Fresh data first — the reset code was generated moments ago on the
+    // organizer's device, so this page's copy may not have it yet.
+    const d = reloadData ? ((await reloadData()) ?? data) : data;
+    const account = d.accounts[key];
     if (!account) { setError("No account found for that email."); return; }
     if (!account.resetCode || account.resetCode !== cleaned) { setError("That reset code isn't right, or has already been used — ask your organizer to generate a new one."); return; }
     if (newPassword.length < 6) { setError("New password must be at least 6 characters."); return; }
@@ -5614,9 +5798,9 @@ function LoginForm({ data, persist, onLogin }) {
       const salt = randomSaltHex();
       const hash = await hashPassword(newPassword, salt);
       const { resetCode: _used, ...rest } = account;
-      const ok = await persist({ ...data, accounts: { ...data.accounts, [key]: { ...rest, salt, hash } } });
+      const ok = await persist({ ...d, accounts: { ...d.accounts, [key]: { ...rest, salt, hash } } });
       if (!ok) { setError("Couldn't save your new password — check your connection and try again."); return; }
-      const league = data.leagues[account.leagueKey];
+      const league = d.leagues[account.leagueKey];
       const participant = league?.participants.find((p) => p.id === account.participantId);
       if (!participant) { setError("Password saved, but your contestant record is missing — ask the organizer to check the roster."); return; }
       onLogin({ email: key, name: participant.name, leagueKey: account.leagueKey, participantId: account.participantId });
@@ -5733,7 +5917,7 @@ function resolveInviteCode(data, rawCode, claimedIds) {
   return null;
 }
 
-function RegisterForm({ data, persist, onLogin }) {
+function RegisterForm({ data, reloadData, registerAccount, onLogin }) {
   const [code, setCode] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -5755,11 +5939,25 @@ function RegisterForm({ data, persist, onLogin }) {
 
     setBusy(true);
     try {
+      // Revalidate against the freshest data — someone else may have
+      // registered, or claimed this contestant, moments ago on another
+      // device — then write ONLY the new account (read-merge-write), so
+      // simultaneous registrations all land safely.
+      const d = reloadData ? ((await reloadData()) ?? data) : data;
+      if (d.accounts[key]) { setError("An account with that email already exists — try logging in instead."); return; }
+      const claimedNow = new Set(Object.values(d.accounts).map((a) => a.participantId));
+      const resolvedNow = resolveInviteCode(d, code, claimedNow);
+      if (!resolvedNow) { setError("That invite code isn't available any more — check it with your organizer."); return; }
       const salt = randomSaltHex();
       const hash = await hashPassword(password, salt);
-      const { leagueKey, participant } = resolved;
-      const nextAccounts = { ...data.accounts, [key]: { email: key, salt, hash, leagueKey, participantId: participant.id } };
-      await persist({ ...data, accounts: nextAccounts });
+      const { leagueKey, participant } = resolvedNow;
+      const result = await registerAccount(key, { email: key, salt, hash, leagueKey, participantId: participant.id });
+      if (!result.ok) {
+        setError(result.reason === "exists"
+          ? "An account with that email already exists — try logging in instead."
+          : "Registration couldn't be saved — check your connection and try again.");
+        return;
+      }
       onLogin({ email: key, name: participant.name, leagueKey, participantId: participant.id });
     } finally {
       setBusy(false);
