@@ -2332,6 +2332,50 @@ function HonoursView({ data, adminMode, persist }) {
   );
 }
 
+// Renders the history text with collapsible sections: any line starting
+// with "## " becomes a section heading readers can open and close with a
+// click; anything before the first heading is always shown. Text without
+// any headings renders exactly as one flowing page, same as before — so
+// nothing changes until the admin chooses to add section markers.
+function HistorySections({ text }) {
+  const [open, setOpen] = useState({});
+  const sections = [];
+  let current = { title: null, body: [] };
+  text.split("\n").forEach((line) => {
+    if (line.startsWith("## ")) {
+      sections.push(current);
+      current = { title: line.slice(3).trim() || "Untitled section", body: [] };
+    } else {
+      current.body.push(line);
+    }
+  });
+  sections.push(current);
+  const preamble = sections[0].body.join("\n").trim();
+  const titled = sections.slice(1);
+  if (titled.length === 0) {
+    return <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{text}</p>;
+  }
+  return (
+    <div className="space-y-3">
+      {preamble && <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{preamble}</p>}
+      {titled.map((s, i) => (
+        <div key={i} className="border border-stone-200 rounded-xl overflow-hidden">
+          <button
+            onClick={() => setOpen((o) => ({ ...o, [i]: !o[i] }))}
+            className="w-full flex items-center justify-between gap-2 px-4 py-2.5 bg-stone-50 hover:bg-stone-100 text-left"
+          >
+            <span className="font-display font-semibold text-sm">{s.title}</span>
+            <span className="text-stone-500 text-xs shrink-0">{open[i] ? "Hide \u25B4" : "Read \u25BE"}</span>
+          </button>
+          {open[i] && (
+            <p className="px-4 py-3 text-sm text-stone-800 leading-relaxed whitespace-pre-line border-t border-stone-100">{s.body.join("\n").trim()}</p>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function HistoryView({ data, adminMode, persist }) {
   const [editing, setEditing] = useState(false);
   const [textDraft, setTextDraft] = useState(data.historyPage.text);
@@ -2342,7 +2386,8 @@ function HistoryView({ data, adminMode, persist }) {
   const MAX_HISTORY_IMAGES = 30; // a comfortable safety margin so this page's storage bucket stays a sensible size
 
   const saveText = async () => {
-    await persist({ ...data, historyPage: { ...data.historyPage, text: textDraft } });
+    const ok = await persist({ ...data, historyPage: { ...data.historyPage, text: textDraft } });
+    if (!ok) return; // refused save — the editor stays open with everything typed intact; the banner explains
     setEditing(false);
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
@@ -2394,30 +2439,7 @@ function HistoryView({ data, adminMode, persist }) {
         )}
       </div>
 
-      <div className="border border-stone-200 rounded-2xl bg-white p-5">
-        {editing ? (
-          <div className="space-y-3">
-            <textarea
-              value={textDraft}
-              onChange={(e) => setTextDraft(e.target.value)}
-              rows={14}
-              placeholder="Write the history of the competition here…"
-              className="w-full bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-violet-600/50"
-            />
-            <div className="flex gap-2">
-              <button onClick={saveText} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
-                {saved ? <CheckCircle2 size={16} /> : null} Save
-              </button>
-              <button onClick={() => setEditing(false)} className="text-sm text-stone-500 hover:text-stone-900 px-2">Cancel</button>
-            </div>
-          </div>
-        ) : data.historyPage.text.trim() ? (
-          <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{data.historyPage.text}</p>
-        ) : (
-          <p className="text-sm text-stone-400 italic">Nothing written yet{adminMode ? " — click \"Edit text\" above to get started." : "."}</p>
-        )}
-      </div>
-
+      {/* Photos lead the page — the imagery sets the scene before the story. */}
       <div className="space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <h3 className="font-display font-semibold text-sm text-stone-600">Photos</h3>
@@ -2465,6 +2487,32 @@ function HistoryView({ data, adminMode, persist }) {
           </div>
         )}
       </div>
+
+      <div className="border border-stone-200 rounded-2xl bg-white p-5">
+        {editing ? (
+          <div className="space-y-3">
+            <textarea
+              value={textDraft}
+              onChange={(e) => setTextDraft(e.target.value)}
+              rows={14}
+              placeholder="Write the history of the competition here…"
+              className="w-full bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+            />
+            <p className="text-[11px] text-stone-500">Tip: start a line with <code className="bg-stone-100 border border-stone-200 rounded px-1">## </code> to turn it into a collapsible section heading — e.g. <code className="bg-stone-100 border border-stone-200 rounded px-1">## The early years</code>. Readers open the sections they want; anything before the first heading always shows.</p>
+            <div className="flex gap-2">
+              <button onClick={saveText} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+                {saved ? <CheckCircle2 size={16} /> : null} Save
+              </button>
+              <button onClick={() => setEditing(false)} className="text-sm text-stone-500 hover:text-stone-900 px-2">Cancel</button>
+            </div>
+          </div>
+        ) : data.historyPage.text.trim() ? (
+          <HistorySections text={data.historyPage.text} />
+        ) : (
+          <p className="text-sm text-stone-400 italic">Nothing written yet{adminMode ? " — click \"Edit text\" above to get started." : "."}</p>
+        )}
+      </div>
+
     </div>
   );
 }
@@ -3367,6 +3415,11 @@ function DivisionsCard({ data, persist }) {
   );
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
+  // Sticky "Saved" button — same pattern as the matchday card: purple while
+  // the rows differ from the last-saved state, grey "Saved" once they match.
+  const rowsJson = JSON.stringify(rows);
+  const [savedRowsJson, setSavedRowsJson] = useState(rowsJson);
+  const divisionsDirty = rowsJson !== savedRowsJson;
 
   // Read live from `data` on every render rather than caching it in `rows`
   // state — the roster can change (contestants added or removed) while
@@ -3400,13 +3453,14 @@ function DivisionsCard({ data, persist }) {
       }
     }
     setError("");
+    const snapshotAtSave = rowsJson;
     const nextLeagues = { ...data.leagues };
     rows.forEach((r) => {
       nextLeagues[r.key] = { ...nextLeagues[r.key], enabled: r.alwaysEnabled ? true : r.enabled, name: r.name.trim(), maxParticipants: r.maxParticipants, minParticipants: r.minParticipants };
     });
-    await persist({ ...data, leagues: nextLeagues });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+    const ok = await persist({ ...data, leagues: nextLeagues });
+    if (ok === false) return; // refused save — button stays purple, the banner explains
+    setSavedRowsJson(snapshotAtSave);
   };
 
   return (
@@ -3470,8 +3524,15 @@ function DivisionsCard({ data, persist }) {
         })}
       </div>
 
-      <button onClick={save} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
-        {saved ? <CheckCircle2 size={16} /> : null} Save divisions
+      <button
+        onClick={save}
+        disabled={!divisionsDirty}
+        className={cx(
+          "flex items-center gap-2 font-semibold rounded-lg px-4 py-2 text-sm",
+          divisionsDirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default"
+        )}
+      >
+        {divisionsDirty ? "Save divisions" : <><CheckCircle2 size={16} /> Saved</>}
       </button>
     </section>
   );
@@ -3494,8 +3555,15 @@ function RoomSettingsCard({ currentPin, onUpdatePin }) {
       <label className="text-xs text-stone-500">Admin PIN</label>
       <div className="flex gap-2 mt-1.5 max-w-xs">
         <input value={pin} onChange={(e) => setPin(e.target.value)} className="flex-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
-        <button onClick={save} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm">
-          {saved ? <CheckCircle2 size={16} /> : "Save"}
+        <button
+          onClick={save}
+          disabled={pin.trim() === currentPin}
+          className={cx(
+            "font-semibold rounded-lg px-3 py-2 text-sm flex items-center gap-1.5",
+            pin.trim() === currentPin ? "bg-stone-300 text-stone-600 cursor-default" : "bg-violet-700 hover:bg-violet-600 text-white"
+          )}
+        >
+          {pin.trim() === currentPin ? <><CheckCircle2 size={14} /> Saved</> : "Save"}
         </button>
       </div>
       <p className="text-xs text-stone-500 mt-2">Whoever knows this PIN can enter admin mode — share it only with people who should manage fixtures and outcomes.</p>
@@ -3572,7 +3640,7 @@ function AdjustmentsCard({ league, leagueKey, data, persist }) {
           <label className="text-[10px] text-stone-500">Contestant</label>
           <select value={participantId} onChange={(e) => setParticipantId(e.target.value)} className="block bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50">
             <option value="">— choose —</option>
-            {league.participants.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {[...league.participants].sort((a, b) => a.name.localeCompare(b.name)).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
         </div>
         <div>
@@ -3857,7 +3925,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
   };
 
   const updateLeague = async (patch) => {
-    await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, ...patch } } });
+    return persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, ...patch } } });
   };
 
   const addParticipant = async () => {
@@ -3951,7 +4019,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
   };
 
   const updateMatchday = async (mdId, patch) => {
-    await updateLeague({ matchdays: league.matchdays.map((md) => (md.id === mdId ? { ...md, ...patch } : md)) });
+    return updateLeague({ matchdays: league.matchdays.map((md) => (md.id === mdId ? { ...md, ...patch } : md)) });
   };
 
   const addMatchday = async (md) => {
@@ -4337,7 +4405,8 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
     onUpdate({ bonanzaPicks: next });
   };
 
-  const save = () => {
+  const save = async () => {
+    const snapshotAtSave = formSnapshot;
     const nextMatches = matches.map((m) => ({
       id: m.id,
       home: m.home,
@@ -4364,7 +4433,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
         outcome: o.outcomeHome !== "" && o.outcomeAway !== "" ? { home: Number(o.outcomeHome), away: Number(o.outcomeAway) } : null,
       };
     });
-    onUpdate({
+    const ok = await onUpdate({
       label,
       scheduledDate: scheduledDate || null,
       releaseAt: releaseAt ? new Date(releaseAt).toISOString() : null,
@@ -4378,9 +4447,20 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
       customMatches: nextCustomMatches,
       bonanzaPicks: nextBonanzaPicks,
     });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+    // Only mark the form as saved if the save actually landed — a refused
+    // save (stale tab, connection drop) leaves the button purple and the
+    // banner explains what happened.
+    if (ok === false) return;
+    setSavedSnapshot(snapshotAtSave);
   };
+
+  // Sticky "Saved" button: a snapshot of every editable field, taken at
+  // mount and refreshed on each successful save. While the live form still
+  // matches the last-saved snapshot the button shows a grey "Saved"; the
+  // moment anything is edited it turns purple again.
+  const formSnapshot = JSON.stringify({ label, scheduledDate, releaseAt, predictionsCloseAt, locked, scoring, blog, closingBlog, freeMatchIndex, matches, customOutcomes, bonanzaOutcomes });
+  const [savedSnapshot, setSavedSnapshot] = useState(formSnapshot);
+  const dirty = formSnapshot !== savedSnapshot;
 
   const allScored = matchday.matches.every((m) => m.outcome)
     && Object.values(matchday.customMatches || {}).every((c) => c.outcome)
@@ -4628,8 +4708,15 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
         </div>
       )}
 
-      <button onClick={save} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
-        {saved ? <CheckCircle2 size={16} /> : null} Save changes
+      <button
+        onClick={save}
+        disabled={!dirty}
+        className={cx(
+          "flex items-center gap-2 font-semibold rounded-lg px-4 py-2 text-sm",
+          dirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default"
+        )}
+      >
+        {dirty ? "Save changes" : <><CheckCircle2 size={16} /> Saved</>}
       </button>
 
       {matchday.resultsPublished ? (
@@ -5420,7 +5507,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist, m
             className="bg-transparent text-sm text-stone-900 focus:outline-none"
           >
             <option value="">— choose a contestant —</option>
-            {league.participants.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {[...league.participants].sort((a, b) => a.name.localeCompare(b.name)).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
         </div>
       )}
@@ -5542,7 +5629,8 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist, m
       <section>
         <h2 className="font-display font-semibold text-lg mb-4 flex items-center gap-2"><Users size={18} className="text-amber-400" /> {league.name} squad</h2>
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {league.participants.map((p) => (
+          {/* Alphabetical at display time only — the stored roster order is untouched. */}
+          {[...league.participants].sort((a, b) => a.name.localeCompare(b.name)).map((p) => (
             <div key={p.id} className={cx("border rounded-2xl p-4 bg-white flex gap-3", p.id === editTargetId ? "border-amber-400/40" : "border-stone-200")}>
               <BadgeAvatar participant={p} name={p.name} size={56} />
               <div className="min-w-0">
