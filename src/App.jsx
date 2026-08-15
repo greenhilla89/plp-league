@@ -1910,6 +1910,8 @@ function LegacyHonourForm({ data, onAdd, onCancel }) {
   const [season, setSeason] = useState("");
   const [winnerName, setWinnerName] = useState("");
   const [linkedId, setLinkedId] = useState("");
+  const [error, setError] = useState("");
+  const [justAdded, setJustAdded] = useState(false);
 
   const allParticipants = Object.entries(data.leagues).flatMap(([key, league]) =>
     league.participants.map((p) => ({ id: p.id, name: p.name, leagueName: league.name, leagueKey: key }))
@@ -1921,21 +1923,45 @@ function LegacyHonourForm({ data, onAdd, onCancel }) {
     if (match) setWinnerName(match.name);
   };
 
-  const submit = () => {
-    if (!competition.trim() || !season.trim() || !winnerName.trim()) return;
-    onAdd({
+  const submit = async () => {
+    setJustAdded(false);
+    if (!competition.trim() || !season.trim() || !winnerName.trim()) {
+      setError("Fill in the competition, season, and winner before adding.");
+      return;
+    }
+    setError("");
+    // Only clear the fields once the save has actually landed — if it's
+    // refused (e.g. this page's data went stale while another tab saved),
+    // everything typed stays put and a clear message says what to do.
+    const ok = await onAdd({
       id: `legacy_${Date.now()}`,
       competition: competition.trim(),
       season: season.trim(),
       winnerName: winnerName.trim(),
       linkedParticipantId: linkedId || null,
     });
+    if (!ok) {
+      setError("That didn't save — refresh this page and try again. (This can happen if the site was updated from another tab or device while this page was open.) Your entry is still here.");
+      return;
+    }
     setCompetition(""); setSeason(""); setWinnerName(""); setLinkedId("");
+    setJustAdded(true);
+    setTimeout(() => setJustAdded(false), 2500);
   };
 
   return (
     <div className="border border-amber-400/30 bg-amber-400/5 rounded-2xl p-4 space-y-3">
       <h4 className="font-display font-semibold text-sm">Add a legacy honour</h4>
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+      {justAdded && (
+        <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-300/30 text-emerald-700 text-sm rounded-lg px-3 py-2">
+          <CheckCircle2 size={16} /> Honour added — the form stays open for the next one.
+        </div>
+      )}
       <div className="grid sm:grid-cols-2 gap-3">
         <div>
           <label className="text-xs text-stone-500">Tournament / competition name</label>
@@ -1976,9 +2002,11 @@ function HonoursView({ data, adminMode, persist }) {
     return yb - ya;
   });
 
+  // Returns whether the save actually landed — the form stays open either
+  // way (on failure so nothing typed is lost; on success because honours
+  // tend to be entered several at a time).
   const addLegacyHonour = async (entry) => {
-    await persist({ ...data, legacyHonours: [...(data.legacyHonours || []), entry] });
-    setShowAddForm(false);
+    return persist({ ...data, legacyHonours: [...(data.legacyHonours || []), entry] });
   };
   const removeLegacyHonour = async (id) => {
     await persist({ ...data, legacyHonours: (data.legacyHonours || []).filter((h) => h.id !== id) });
@@ -2080,12 +2108,25 @@ function HonoursView({ data, adminMode, persist }) {
           <div className="border border-stone-200 rounded-2xl bg-white overflow-hidden">
             <table className="min-w-full text-sm">
               <tbody>
-                {legacyHonours.map((entry) => {
+                {(() => {
+                  // Two-tone banding that alternates per SEASON (not per row),
+                  // so each season reads as one visual block at a glance.
+                  const seasonOrder = [];
+                  legacyHonours.forEach((e) => { if (!seasonOrder.includes(e.season)) seasonOrder.push(e.season); });
+                  // The primary tournament's honours are bolded throughout.
+                  const league1Name = data.leagues.league1.name.toLowerCase();
+                  const isPrimary = (comp) => {
+                    const c = comp.toLowerCase();
+                    return c === league1Name || c.includes("premier league");
+                  };
+                  return legacyHonours.map((entry) => {
                   const winner = resolveLegacyWinner(entry, data);
+                  const banded = seasonOrder.indexOf(entry.season) % 2 === 1;
+                  const primary = isPrimary(entry.competition);
                   return (
-                    <tr key={entry.id} className="border-t border-stone-100 first:border-t-0">
-                      <td className="px-4 py-2.5 font-mono-num text-stone-400 w-24">{entry.season}</td>
-                      <td className="px-4 py-2.5 text-stone-700">{entry.competition}</td>
+                    <tr key={entry.id} className={cx("border-t border-stone-100 first:border-t-0", banded ? "bg-stone-100" : "bg-white")}>
+                      <td className={cx("px-4 py-2.5 font-mono-num w-24", primary ? "font-bold text-stone-600" : "text-stone-400")}>{entry.season}</td>
+                      <td className={cx("px-4 py-2.5", primary ? "font-bold text-stone-900" : "text-stone-700")}>{entry.competition}</td>
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
                           {winner.badge ? (
@@ -2093,7 +2134,7 @@ function HonoursView({ data, adminMode, persist }) {
                           ) : (
                             <Crown size={14} className="text-amber-400 shrink-0" />
                           )}
-                          <span className="font-medium">{winner.name}</span>
+                          <span className={cx("font-medium", primary && "font-bold")}>{winner.name}</span>
                         </div>
                       </td>
                       {adminMode && (
@@ -2103,7 +2144,8 @@ function HonoursView({ data, adminMode, persist }) {
                       )}
                     </tr>
                   );
-                })}
+                  });
+                })()}
               </tbody>
             </table>
           </div>
@@ -5133,6 +5175,20 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
   // Admin can always change it, from here or from the roster.
   const stadiumLocked = !adminMode && league.matchdays.length > 0;
 
+  // Whether anything on the form differs from what's stored — drives the
+  // Save button: purple "Save profile" while there are unsaved changes,
+  // grey "Saved" the moment everything matches (after saving, or before
+  // anything's been touched).
+  const dirty = !participant
+    ? true
+    : name !== (participant.name ?? "")
+      || supports !== (participant.supports ?? "")
+      || dob !== (participant.dob ?? "")
+      || residence !== (participant.residence ?? "")
+      || bio !== (participant.bio ?? "")
+      || stadium !== (participant.stadium ?? "")
+      || photo !== (participant.badge ?? null);
+
   useEffect(() => {
     setName(participant?.name ?? "");
     setSupports(participant?.supports ?? "");
@@ -5289,8 +5345,15 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
             </div>
           </div>
 
-          <button onClick={save} className="mt-5 flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-5 py-2.5 text-sm">
-            {saved ? <CheckCircle2 size={16} /> : null} Save profile
+          <button
+            onClick={save}
+            disabled={!dirty}
+            className={cx(
+              "mt-5 flex items-center gap-2 font-semibold rounded-lg px-5 py-2.5 text-sm",
+              dirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default"
+            )}
+          >
+            {dirty ? <>Save profile</> : <><CheckCircle2 size={16} /> Saved</>}
           </button>
         </section>
       )}
