@@ -1354,6 +1354,9 @@ function ForecastRoomApp() {
       <AuthScreen
         data={data}
         persist={persist}
+        mergeProfileSave={mergeProfileSave}
+        registerAccount={registerAccount}
+        reloadData={reloadFromStorage}
         onLogin={(user) => { setCurrentUser(user); setLeagueKey(user.leagueKey); }}
         snapshots={snapshots}
         onRestoreSnapshot={restoreSnapshot}
@@ -1599,7 +1602,7 @@ function TabButton({ icon: Icon, label, active, onClick, accent }) {
 // the PIN-only "admin access" panel on the login screen (no Submit tab,
 // since there's no contestant identity there, but everything else — the
 // Matrix, Standings, Profiles, Stats and Admin panel itself — is the same).
-function AppTabs({ league, leagueKey, data, persist, submitPredictions, viewerId, adminMode, now, snapshots, onRestoreSnapshot, allowSubmit }) {
+function AppTabs({ league, leagueKey, data, persist, mergeProfileSave, submitPredictions, viewerId, adminMode, now, snapshots, onRestoreSnapshot, allowSubmit }) {
   const [tab, setTab] = useState(allowSubmit ? "submit" : "matrix");
   const accent = leagueAccent(leagueKey);
   return (
@@ -5570,7 +5573,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist, m
 // app, so submitting predictions and editing your profile always maps back
 // to the account you logged into rather than a free-form name picker.
 // -----------------------------------------------------------------------------
-function AuthScreen({ data, persist, onLogin, snapshots, onRestoreSnapshot, saveError, setSaveError }) {
+function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadData, onLogin, snapshots, onRestoreSnapshot, saveError, setSaveError }) {
   const [mode, setMode] = useState("login");
   const [adminUnlocked, setAdminUnlocked] = useState(false);
   const [enteringPin, setEnteringPin] = useState(false);
