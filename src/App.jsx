@@ -604,6 +604,12 @@ function migrateData(data) {
     if (!league.fixturePool) league.fixturePool = [];
     if (!Array.isArray(league.h2hSchedule)) league.h2hSchedule = [];
     if (!Array.isArray(league.adjustments)) league.adjustments = []; // manual standings corrections — see AdjustmentsCard
+    // One image per contestant: the badge. Anything uploaded as a profile
+    // "photo" before this rule (including via the Profiles tab) is adopted
+    // as the badge so it shows consistently across the whole site.
+    league.participants.forEach((p) => {
+      if (!p.badge && p.photo) p.badge = p.photo;
+    });
     league.h2hSchedule.forEach((round) => {
       if (typeof round.scheduledDate === "undefined") round.scheduledDate = null;
     });
@@ -1576,6 +1582,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
       : data.predictions;
     const ok = await persist({ ...data, predictions: nextPredictions, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
     if (ok) setEditingCustom((e) => ({ ...e, [md.id]: false }));
+    else setError("That didn't save — refresh this page and try again. (This can happen if the site was updated from another device while this page was open.)");
   };
 
   // Saves (or CHANGES) one Bonanza pick (one slot) — changeable right up
@@ -1605,6 +1612,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
     });
     const ok = await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, matchdays: nextMatchdays } } });
     if (ok) setEditingBonanza((e) => ({ ...e, [key]: false }));
+    else setError("That didn't save — refresh this page and try again. (This can happen if the site was updated from another device while this page was open.)");
   };
 
   return (
@@ -1723,7 +1731,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                         placeholder="Away team"
                         className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
                       />
-                      <button onClick={() => saveBonanzaPick(md, idx)} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
+                      <button onClick={() => saveBonanzaPick(md, idx)} onMouseDown={(e) => e.preventDefault()} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
                         Set match
                       </button>
                       {bonanzaPickSet && (
@@ -1767,7 +1775,10 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                         placeholder="Away team"
                         className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
                       />
-                      <button onClick={() => saveCustomMatch(md)} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
+                      {/* onMouseDown preventDefault keeps the text input focused while
+                          the tap lands — otherwise on phones the keyboard closes first,
+                          the page reflows, and the tap misses the moved button. */}
+                      <button onClick={() => saveCustomMatch(md)} onMouseDown={(e) => e.preventDefault()} className="bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-3 py-2 text-sm shrink-0">
                         Set match
                       </button>
                       {myCustomMatch && (
@@ -1828,7 +1839,7 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                     <span className="sm:order-4"><ScoreInput value={pair.away} onChange={(v) => setField(m.id, "away", v)} /></span>
                   </div>
                   <div className="flex justify-end mt-3">
-                    <button onClick={() => submitMatch(md, m.id)} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">Save</button>
+                    <button onClick={() => submitMatch(md, m.id)} onMouseDown={(e) => e.preventDefault()} className="bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">Save</button>
                   </div>
                 </div>
               );
@@ -1993,7 +2004,9 @@ function HonoursView({ data, adminMode, persist }) {
         <p className="text-stone-500 text-sm">No seasons have been completed on this site yet — this section fills in once a season ends.</p>
       ) : (
         visibleArchives.map((season) => (
-          <div key={season.id} className="space-y-3">
+          // Hidden seasons stay visible to admin (dimmed, with the chip) so
+          // they can be unhidden — contestants don't see them at all.
+          <div key={season.id} className={cx("space-y-3", season.hidden && "opacity-60")}>
             <div className="flex items-center justify-between flex-wrap gap-2">
               <h3 className="font-display font-semibold text-sm text-violet-800">
                 {season.label} <span className="text-stone-400 font-normal normal-case">ended {fmtDateTime(season.endedAt)}</span>
@@ -3676,6 +3689,12 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
   };
 
   const otherLeagueKeys = enabledLeagueKeys(data).filter((k) => k !== leagueKey);
+  // Moves a contestant to another division — including registered ones:
+  // their login account stores which division it belongs to, so the account
+  // moves in the same save, keeping their email + password working and
+  // pointing at the right place. (Do this between seasons: the contestant's
+  // published history stays in the division it was earned in, and both
+  // divisions' season fixture lists need regenerating afterwards.)
   const moveToLeague = async (id, targetKey) => {
     const participant = league.participants.find((p) => p.id === id);
     if (!participant) return;
@@ -3685,11 +3704,16 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       return;
     }
     setMoveError("");
+    const accountEntry = Object.entries(data.accounts).find(([, acc]) => acc.participantId === id);
+    const nextAccounts = accountEntry
+      ? { ...data.accounts, [accountEntry[0]]: { ...accountEntry[1], leagueKey: targetKey } }
+      : data.accounts;
     await persist({
       ...data,
+      accounts: nextAccounts,
       leagues: {
         ...data.leagues,
-        [leagueKey]: { ...league, participants: league.participants.filter((p) => p.id !== id) },
+        [leagueKey]: { ...league, participants: league.participants.filter((p) => p.id !== id), adjustments: (league.adjustments || []).filter((a) => a.participantId !== id) },
         [targetKey]: { ...targetLeague, participants: [...targetLeague.participants, participant] },
       },
     });
@@ -3809,7 +3833,16 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
               resetCode={accountByParticipantId[p.id]?.resetCode ?? null}
               onGenerateResetCode={() => generateResetCode(p.id)}
               onCancelResetCode={() => cancelResetCode(p.id)}
-              moveOptions={claimedIds.has(p.id) ? [] : otherLeagueKeys.map((k) => ({ key: k, name: data.leagues[k].name }))}
+              moveOptions={
+                // Division moves are a start-of-season affair: offered only
+                // until this division's first matchday exists, and only to
+                // divisions that haven't started theirs either. The option
+                // returns automatically when a season is archived (which
+                // clears matchdays) and a new one begins.
+                league.matchdays.length === 0
+                  ? otherLeagueKeys.filter((k) => data.leagues[k].matchdays.length === 0).map((k) => ({ key: k, name: data.leagues[k].name }))
+                  : []
+              }
               onMoveLeague={(targetKey) => moveToLeague(p.id, targetKey)}
             />
           ))}
@@ -5107,7 +5140,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
     setResidence(participant?.residence ?? "");
     setBio(participant?.bio ?? "");
     setStadium(participant?.stadium ?? "");
-    setPhoto(participant?.photo ?? null);
+    setPhoto(participant?.badge ?? null); // "photo" state holds the contestant's badge — the site's one image per contestant
     setError("");
     setSaved(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5117,7 +5150,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const dataUrl = await resizeImageFile(file, 320);
+      const dataUrl = await resizeImageFile(file, 200); // same sizing as the roster badge upload — it IS the badge
       setPhoto(dataUrl);
     } catch {
       setError("Couldn't read that image — try a different file.");
@@ -5130,7 +5163,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
     setError("");
     const nextParticipants = league.participants.map((p) =>
       p.id === editTargetId
-        ? { ...p, name: adminMode ? name.trim() : p.name, supports: supports.trim(), dob, residence: residence.trim(), bio: bio.trim(), photo: adminMode ? photo : p.photo, stadium: stadiumLocked ? p.stadium : stadium.trim() }
+        ? { ...p, name: adminMode ? name.trim() : p.name, supports: supports.trim(), dob, residence: residence.trim(), bio: bio.trim(), badge: adminMode ? photo : p.badge, stadium: stadiumLocked ? p.stadium : stadium.trim() }
         : p
     );
     await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, participants: nextParticipants } } });
@@ -5172,31 +5205,40 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
 
           <div className="flex flex-col sm:flex-row gap-6">
             <div className="flex flex-col items-center gap-2 shrink-0">
-              {/* Profile photos are admin-managed: contestants see their
-                  photo but only admin can upload, change, or remove it. */}
+              {/* The contestant's badge — the site's one image per person,
+                  shown here and in standings, podiums, fixtures and cards.
+                  Admin-managed: uploadable here or from the roster. */}
               {adminMode ? (
                 <>
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
                     className="relative group"
-                    title="Upload a photo"
+                    title="Upload a badge"
                   >
-                    <Avatar name={name} photo={photo} size={88} />
+                    {photo ? (
+                      <img src={photo} alt="" style={{ width: 88, height: 88 }} className="rounded-full border border-stone-200 bg-white object-contain" />
+                    ) : (
+                      <Avatar name={name} size={88} />
+                    )}
                     <span className="absolute -bottom-1 -right-1 bg-amber-400 text-black rounded-full p-1.5 border-2 border-zinc-900 group-hover:bg-amber-300">
                       <Camera size={13} />
                     </span>
                   </button>
                   <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
                   {photo && (
-                    <button onClick={() => setPhoto(null)} className="text-xs text-stone-500 hover:text-rose-600">Remove photo</button>
+                    <button onClick={() => setPhoto(null)} className="text-xs text-stone-500 hover:text-rose-600">Remove badge</button>
                   )}
                   <span className="text-[11px] text-stone-500">Optional</span>
                 </>
               ) : (
                 <>
-                  <Avatar name={name} photo={photo} size={88} />
-                  <span className="text-[11px] text-stone-500 text-center max-w-[100px]">Photo is set by your organizer</span>
+                  {photo ? (
+                    <img src={photo} alt="" style={{ width: 88, height: 88 }} className="rounded-full border border-stone-200 bg-white object-contain" />
+                  ) : (
+                    <Avatar name={name} size={88} />
+                  )}
+                  <span className="text-[11px] text-stone-500 text-center max-w-[100px]">Badge is set by your organizer</span>
                 </>
               )}
             </div>
@@ -5258,7 +5300,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist })
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {league.participants.map((p) => (
             <div key={p.id} className={cx("border rounded-2xl p-4 bg-white flex gap-3", p.id === editTargetId ? "border-amber-400/40" : "border-stone-200")}>
-              <Avatar name={p.name} photo={p.photo} size={56} />
+              <BadgeAvatar participant={p} name={p.name} size={56} />
               <div className="min-w-0">
                 <div className="font-display font-semibold truncate">{p.name}</div>
                 <div className="text-xs text-amber-300 flex items-center gap-1 mt-0.5">
@@ -6062,7 +6104,7 @@ function StatsProfileView({ participant, league, leagueKey, data, onBack }) {
 
       <div className="flex items-center gap-4">
         <div className="relative shrink-0">
-          <Avatar name={participant.name} photo={participant.photo} size={64} />
+          <BadgeAvatar participant={participant} name={participant.name} size={64} />
           {participant.badge && (
             <img src={participant.badge} alt="" className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full border-2 border-black bg-white object-contain" />
           )}
@@ -6164,7 +6206,7 @@ function StatsView({ league, leagueKey, data }) {
                 className="flex items-center gap-3 border border-stone-200 rounded-xl p-3 bg-white hover:border-amber-400/40 text-left transition-colors"
               >
                 <div className="relative shrink-0">
-                  <Avatar name={participant.name} photo={participant.photo} size={40} />
+                  <BadgeAvatar participant={participant} name={participant.name} size={40} />
                   {participant.badge && (
                     <img src={participant.badge} alt="" className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full border-2 border-black bg-white object-contain" />
                   )}
