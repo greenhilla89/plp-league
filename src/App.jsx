@@ -3583,6 +3583,7 @@ function AdjustmentsCard({ league, leagueKey, data, persist }) {
   const [diffDelta, setDiffDelta] = useState("");
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
+  const [appliedFlash, setAppliedFlash] = useState(false);
   const nameById = Object.fromEntries(league.participants.map((p) => [p.id, p.name]));
   const adjustments = league.adjustments || [];
 
@@ -3597,7 +3598,10 @@ function AdjustmentsCard({ league, leagueKey, data, persist }) {
     setError("");
     const entry = { id: `adj_${Date.now()}`, participantId, leaguePoints: lp, scoreDiff: sd, note: note.trim(), createdAt: new Date().toISOString() };
     const ok = await persist({ ...data, leagues: { ...data.leagues, [leagueKey]: { ...league, adjustments: [...adjustments, entry] } } });
-    if (ok) { setParticipantId(""); setPointsDelta(""); setDiffDelta(""); setNote(""); }
+    if (!ok) { setError("That didn't save — refresh this page and try again. Everything you entered is still here."); return; }
+    setParticipantId(""); setPointsDelta(""); setDiffDelta(""); setNote("");
+    setAppliedFlash(true);
+    setTimeout(() => setAppliedFlash(false), 1500);
   };
 
   const remove = async (id) => {
@@ -3655,8 +3659,8 @@ function AdjustmentsCard({ league, leagueKey, data, persist }) {
           <label className="text-[10px] text-stone-500">Why? (required)</label>
           <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. MD4 result entered wrong — corrected" className="block w-full bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
         </div>
-        <button onClick={add} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
-          <Plus size={15} /> Apply correction
+        <button onClick={add} className={cx("flex items-center gap-1.5 font-semibold rounded-lg px-4 py-2 text-sm", appliedFlash ? "bg-stone-300 text-stone-600" : "bg-violet-700 hover:bg-violet-600 text-white")}>
+          {appliedFlash ? <><CheckCircle2 size={15} /> Applied</> : <><Plus size={15} /> Apply correction</>}
         </button>
       </div>
     </section>
@@ -3816,6 +3820,10 @@ function BulkAddParticipants({ disabled, onAdd }) {
     const names = text.split("\n").map((n) => n.trim()).filter(Boolean);
     if (names.length === 0) return;
     const added = await onAdd(names);
+    if (added === null) {
+      setResult("That didn't save — refresh this page and try again. Your names are still here.");
+      return;
+    }
     setResult(`Added ${added} of ${names.length} name${names.length === 1 ? "" : "s"}.`);
     setText("");
   };
@@ -3931,7 +3939,8 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
   const addParticipant = async () => {
     const trimmed = newName.trim();
     if (!trimmed || atCap) return;
-    await updateLeague({ participants: [...league.participants, { id: `p_${Date.now()}`, name: trimmed, code: randomInviteCode() }] });
+    const ok = await updateLeague({ participants: [...league.participants, { id: `p_${Date.now()}`, name: trimmed, code: randomInviteCode() }] });
+    if (ok === false) return; // refused save — the typed name stays put; the banner explains
     setNewName("");
   };
 
@@ -4014,7 +4023,8 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       code: randomInviteCode(),
     }));
     if (toAdd.length === 0) return 0;
-    await updateLeague({ participants: [...league.participants, ...toAdd] });
+    const ok = await updateLeague({ participants: [...league.participants, ...toAdd] });
+    if (ok === false) return null; // refused save — signal failure so the form keeps the names
     return toAdd.length;
   };
 
@@ -4023,8 +4033,10 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
   };
 
   const addMatchday = async (md) => {
-    await updateLeague({ matchdays: [...league.matchdays, md] });
+    const ok = await updateLeague({ matchdays: [...league.matchdays, md] });
+    if (ok === false) return false; // refused save — the form stays open with everything typed intact
     setShowNewMatchday(false);
+    return true;
   };
 
   const addFixtureToPool = async (home, away, kickoff) => {
@@ -4037,7 +4049,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
 
   const generateH2HSchedule = async () => {
     const schedule = generateRoundRobinSchedule(league.participants.map((p) => p.id));
-    await updateLeague({ h2hSchedule: schedule });
+    return updateLeague({ h2hSchedule: schedule });
   };
 
   const setRoundDate = async (index, date) => {
@@ -4309,10 +4321,14 @@ function FixturePoolCard({ pool, onAdd, onRemove, onGenerate }) {
   const [away, setAway] = useState("");
   const [kickoff, setKickoff] = useState("");
 
-  const add = () => {
+  const [addedFlash, setAddedFlash] = useState(false);
+  const add = async () => {
     if (!home.trim() || !away.trim()) return;
-    onAdd(home.trim(), away.trim(), kickoff ? new Date(kickoff).toISOString() : null);
+    const ok = await onAdd(home.trim(), away.trim(), kickoff ? new Date(kickoff).toISOString() : null);
+    if (ok === false) return; // refused save — the fixture stays typed in; the banner explains
     setHome(""); setAway(""); setKickoff("");
+    setAddedFlash(true);
+    setTimeout(() => setAddedFlash(false), 1500);
   };
 
   return (
@@ -4336,7 +4352,7 @@ function FixturePoolCard({ pool, onAdd, onRemove, onGenerate }) {
         <input value={away} onChange={(e) => setAway(e.target.value)} placeholder="Away team" className="flex-1 min-w-[140px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
         <input type="datetime-local" value={kickoff} onChange={(e) => setKickoff(e.target.value)} className="bg-white border border-stone-300 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
         <button onClick={add} className="flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 text-sm font-medium">
-          <Plus size={15} /> Add to pool
+          {addedFlash ? <CheckCircle2 size={15} /> : <Plus size={15} />} {addedFlash ? "Added" : "Add to pool"}
         </button>
       </div>
 
@@ -4778,10 +4794,10 @@ function NewMatchdayForm({ league, onCreate, onCancel }) {
   const setFixtureField = (idx, field, val) =>
     setFixtures((arr) => arr.map((f, i) => (i === idx ? { ...f, [field]: val } : f)));
 
-  const create = () => {
+  const create = async () => {
     if (!label.trim() || fixtures.some((f) => !f.home.trim() || !f.away.trim())) return;
     const roundIndex = league.matchdays.length;
-    onCreate({
+    await onCreate({
       id: `md_${Date.now()}`,
       label: label.trim(),
       releaseAt: releaseAt ? new Date(releaseAt).toISOString() : null,
@@ -5218,15 +5234,15 @@ function LeaderboardView({ league, leagueKey, data }) {
         <table className="min-w-full text-sm">
           <thead>
             <tr style={{ background: "#3D1F5C" }} className="text-left">
-              <th className="px-4 py-3 font-semibold w-16 text-amber-300">Rank</th>
+              <th className="px-2 sm:px-4 py-3 font-semibold w-9 sm:w-16 text-amber-300"><span className="sm:hidden">#</span><span className="hidden sm:inline">Rank</span></th>
               <th className="px-4 py-3 font-semibold text-amber-300">Participant</th>
-              <th className="px-2 py-3 font-semibold text-center w-10 text-amber-300" title="Movement since the most recent matchday">±</th>
+              <th className="px-1 sm:px-2 py-3 font-semibold text-center w-6 sm:w-10 text-amber-300" title="Movement since the most recent matchday">±</th>
               <th className="hidden sm:table-cell px-2 py-3 font-semibold text-center text-amber-300" title="Last four matchdays, oldest first">Form</th>
               <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">W</th>
               <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">D</th>
               <th className="hidden sm:table-cell px-4 py-3 font-semibold text-right text-amber-300">L</th>
-              <th className="px-3 sm:px-4 py-3 font-semibold text-right text-amber-300">Score diff</th>
-              <th className="px-4 py-3 font-display font-bold text-right text-amber-300 bg-white/10">Pts</th>
+              <th className="px-2 sm:px-4 py-3 font-semibold text-right text-amber-300"><span className="sm:hidden">+/−</span><span className="hidden sm:inline">Score diff</span></th>
+              <th className="px-2.5 sm:px-4 py-3 font-display font-bold text-right text-amber-300 bg-white/10">Pts</th>
             </tr>
           </thead>
           <tbody>
@@ -5235,15 +5251,15 @@ function LeaderboardView({ league, leagueKey, data }) {
               return (
               <tr key={row.id} className={cx("border-t border-stone-200", zone ?? (idx % 2 === 1 && "bg-white"))}>
                 <td className="px-4 py-3 font-mono-num text-stone-500">
-                  <span className="inline-flex items-center gap-1">{row.rank === 1 && row.leaguePoints > 0 && <Crown size={14} className="text-amber-400" />}#{row.rank}</span>
+                  <span className="inline-flex items-center gap-1">{row.rank === 1 && row.leaguePoints > 0 && <Crown size={14} className="text-amber-400" />}<span className="hidden sm:inline">#</span>{row.rank}</span>
                 </td>
-                <td className="px-4 py-3 font-medium">
-                  <div className="flex items-center gap-2 min-w-0">
+                <td className="px-2 sm:px-4 py-3 font-medium">
+                  <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
                     <BadgeAvatar participant={league.participants.find((p) => p.id === row.id)} name={row.name} size={26} />
                     <span className="truncate">{row.name}</span>
                   </div>
                 </td>
-                <td className="px-2 py-3 text-center">
+                <td className="px-1 sm:px-2 py-3 text-center">
                   {(() => {
                     const prevRank = prevRankById?.[row.id];
                     const movement = prevRank ? prevRank - row.rank : 0;
@@ -5278,10 +5294,10 @@ function LeaderboardView({ league, leagueKey, data }) {
                 <td className="hidden sm:table-cell px-4 py-3 text-right font-mono-num text-stone-700">{row.losses}</td>
                 {/* Score difference deliberately demoted to muted grey — points
                     are the standings' primary currency and should read first. */}
-                <td className="px-3 sm:px-4 py-3 text-right font-mono-num text-stone-500">
+                <td className="px-2 sm:px-4 py-3 text-right font-mono-num text-stone-500">
                   {row.scoreDifference > 0 ? "+" : ""}{row.scoreDifference}
                 </td>
-                <td className="px-4 py-3 text-right bg-amber-400/5">
+                <td className="px-2.5 sm:px-4 py-3 text-right bg-amber-400/5">
                   <span className="font-display font-bold text-lg text-amber-500">{row.leaguePoints}</span>
                 </td>
               </tr>
