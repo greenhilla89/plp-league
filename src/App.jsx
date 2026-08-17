@@ -5610,7 +5610,12 @@ function resizeImageFile(file, maxDim = 320) {
         canvas.width = width;
         canvas.height = height;
         canvas.getContext("2d").drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL("image/jpeg", 0.85));
+        // Formats that can carry transparency (PNG, WebP, GIF, SVG) are
+        // re-exported as PNG so transparent backgrounds STAY transparent —
+        // JPEG has no transparency, so exporting those as JPEG paints the
+        // background black. Photos (JPEG sources) stay JPEG for small size.
+        const keepAlpha = /png|webp|gif|svg/i.test(file.type || "");
+        resolve(keepAlpha ? canvas.toDataURL("image/png") : canvas.toDataURL("image/jpeg", 0.85));
       };
       img.src = reader.result;
     };
