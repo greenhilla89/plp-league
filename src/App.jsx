@@ -5,7 +5,7 @@ import {
   Eye, EyeOff, ShieldCheck, Loader2, Trash2, Calendar, Sparkles,
   UserCircle2, Camera, MapPin, Cake, Shirt, Mail, KeyRound, LogOut,
   TrendingUp, ArrowLeft, Target, Flame, Award, Archive, History, Landmark,
-  Upload, Share2,
+  Upload, Share2, BookOpen,
 } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
@@ -76,6 +76,7 @@ const ROSTER_KEY = "plp-2026-27-roster-v1"; // participant names/codes/bios/etc 
 const PHOTOS_KEY = "plp-2026-27-photos-v1"; // profile photos only, kept separate since they're the biggest payloads
 const BADGES_KEY = "plp-2026-27-badges-v1"; // admin-assigned team-crest badges — separate from self-uploaded profile photos
 const HISTORY_KEY = "plp-2026-27-history-page-v1"; // the free-text History page + its images, isolated since images can be large
+const CLUB_KEY = "plp-2026-27-club-library-v1"; // club crests + colour identities, isolated since crest images can be large
 const PREDICTIONS_KEY = "plp-2026-27-predictions-v1"; // the highest-frequency write in the app, isolated on its own
 const SEASON_ARCHIVES_KEY = "plp-2026-27-season-archives-v1"; // past seasons — grows slowly but can get large, so it's isolated too
 const DEFAULT_MAX_PARTICIPANTS = 20; // fallback cap when a league doesn't specify its own
@@ -571,6 +572,8 @@ function migrateData(data) {
   if (typeof data.lastManualExportAt === "undefined") data.lastManualExportAt = null;
   if (typeof data.seasonLabel !== "string") data.seasonLabel = "2026-27";
   if (!Array.isArray(data.seasonArchives)) data.seasonArchives = [];
+  if (!data.rulesPage) data.rulesPage = { text: "" }; // the Rules tab — free text with ## collapsible sections, like History
+  if (!data.clubLibrary) data.clubLibrary = { crests: [], colors: [] }; // admin-managed club crests + colour identities — see ClubLibraryCard
   if (!Array.isArray(data.legacyHonours)) data.legacyHonours = [];
   if (!data.historyPage || typeof data.historyPage !== "object") data.historyPage = { text: "", images: [] };
   if (typeof data.historyPage.text !== "string") data.historyPage.text = "";
@@ -671,13 +674,14 @@ function splitData(data) {
     predictionsBlob: { predictions: data.predictions },
     archivesBlob: { seasonArchives: data.seasonArchives, legacyHonours: data.legacyHonours },
     badgesBlob: { badges },
-    historyBlob: { historyPage: data.historyPage },
+    historyBlob: { historyPage: data.historyPage, rulesPage: data.rulesPage },
+    clubBlob: { clubLibrary: data.clubLibrary },
   };
 }
 
 // The inverse of splitData — reconstructs the unified shape the rest of the
 // app expects from the 8 separately-loaded pieces.
-function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob) {
+function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob = { clubLibrary: null }) {
   const leagues = {};
   Object.keys(core.leagueMeta).forEach((key) => {
     const roster = rosterBlob.leagues[key]?.participants ?? [];
@@ -693,6 +697,8 @@ function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsB
     seasonArchives: archivesBlob.seasonArchives ?? [],
     legacyHonours: archivesBlob.legacyHonours ?? [],
     historyPage: historyBlob.historyPage ?? { text: "", images: [] },
+    rulesPage: historyBlob.rulesPage ?? { text: "" },
+    clubLibrary: clubBlob.clubLibrary ?? { crests: [], colors: [] },
     accounts: accountsBlob.accounts ?? {},
     predictions: predictionsBlob.predictions ?? {},
     leagues,
@@ -734,7 +740,7 @@ async function setWithRetry(key, json, attempts = 3, delayMs = 400) {
 }
 
 async function writeSplitData(data) {
-  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob } = splitData(data);
+  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob } = splitData(data);
   // Named entries, written one at a time (not all at once) — sequencing
   // keeps write bursts gentle on the backend and makes failures easier to
   // attribute. Still independent of each other: one failing doesn't stop
@@ -748,6 +754,7 @@ async function writeSplitData(data) {
     ["season archives", SEASON_ARCHIVES_KEY, archivesBlob],
     ["badges", BADGES_KEY, badgesBlob],
     ["history page", HISTORY_KEY, historyBlob],
+    ["club library", CLUB_KEY, clubBlob],
   ];
   const failed = [];
   for (const [label, key, blob] of entries) {
@@ -962,6 +969,7 @@ function ForecastRoomApp() {
         const archivesRes = await window.storage.get(SEASON_ARCHIVES_KEY, true);
         const badgesRes = await window.storage.get(BADGES_KEY, true);
         const historyRes = await window.storage.get(HISTORY_KEY, true);
+        const clubRes = await window.storage.get(CLUB_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         if (cancelled) return;
         // Remember which save-version this data came from — every future
@@ -978,7 +986,8 @@ function ForecastRoomApp() {
             predictionsRes && predictionsRes.value ? JSON.parse(predictionsRes.value) : { predictions: {} },
             archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
             badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
-            historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } }
+            historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
+            clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null }
           );
           setData(migrateData(merged));
           return;
@@ -1185,6 +1194,7 @@ function ForecastRoomApp() {
         const archivesRes = await window.storage.get(SEASON_ARCHIVES_KEY, true);
         const badgesRes = await window.storage.get(BADGES_KEY, true);
         const historyRes = await window.storage.get(HISTORY_KEY, true);
+        const clubRes = await window.storage.get(CLUB_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         const merged = migrateData(mergeSplitData(
           JSON.parse(coreRes.value),
@@ -1194,7 +1204,8 @@ function ForecastRoomApp() {
           predictionsRes && predictionsRes.value ? JSON.parse(predictionsRes.value) : { predictions: {} },
           archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
           badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
-          historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } }
+          historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
+          clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null }
         ));
         revRef.current = revRes && revRes.value ? revRes.value : null;
         setData(merged);
@@ -1425,6 +1436,15 @@ function ForecastRoomApp() {
           >
             <History size={13} /> History
           </button>
+          <button
+            onClick={() => setGlobalView(globalView === "rules" ? null : "rules")}
+            className={cx(
+              "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5 transition-colors",
+              globalView === "rules" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+            )}
+          >
+            <BookOpen size={13} /> Rules
+          </button>
         </div>
 
         {/* The current division's signature colour, as a strip under the banner. */}
@@ -1460,6 +1480,8 @@ function ForecastRoomApp() {
         <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><HonoursView data={data} adminMode={adminMode} persist={persist} /></main>
       ) : globalView === "history" ? (
         <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><HistoryView data={data} adminMode={adminMode} persist={persist} /></main>
+      ) : globalView === "rules" ? (
+        <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><RulesView data={data} adminMode={adminMode} persist={persist} /></main>
       ) : (
         <AppTabs
           league={league}
@@ -2007,10 +2029,10 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                       so long names never truncate. Larger screens: the
                       original single centred line, via sm: order classes. */}
                   <div className="grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2 sm:flex sm:justify-center">
-                    <span className="min-w-0 font-medium sm:order-1 sm:flex-1 sm:text-right">{m.home}</span>
+                    <span className="min-w-0 font-medium sm:order-1 sm:flex-1 sm:text-right"><ClubName name={m.home} clubLibrary={data.clubLibrary} size={16} /></span>
                     <span className="sm:order-2"><ScoreInput value={pair.home} onChange={(v) => setField(m.id, "home", v)} /></span>
                     <span className="hidden sm:inline text-stone-500 font-mono-num sm:order-3">–</span>
-                    <span className="min-w-0 font-medium sm:order-5 sm:flex-1 sm:text-left">{m.away}</span>
+                    <span className="min-w-0 font-medium sm:order-5 sm:flex-1 sm:text-left"><ClubName name={m.away} clubLibrary={data.clubLibrary} size={16} /></span>
                     <span className="sm:order-4"><ScoreInput value={pair.away} onChange={(v) => setField(m.id, "away", v)} /></span>
                   </div>
                   <div className="flex justify-end mt-3">
@@ -2376,6 +2398,59 @@ function HistorySections({ text }) {
   );
 }
 
+// The Rules tab — a free-text page at the same level as Honours and
+// History, written by admin, read by everyone. Uses the same "## heading"
+// convention as History for collapsible sections. A refused save keeps
+// the editor open with everything typed intact.
+function RulesView({ data, adminMode, persist }) {
+  const [editing, setEditing] = useState(false);
+  const [textDraft, setTextDraft] = useState(data.rulesPage?.text ?? "");
+
+  const saveText = async () => {
+    const ok = await persist({ ...data, rulesPage: { text: textDraft } });
+    if (!ok) return;
+    setEditing(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><BookOpen size={18} className="text-amber-400" /> Rules</h2>
+        {adminMode && !editing && (
+          <button onClick={() => { setTextDraft(data.rulesPage?.text ?? ""); setEditing(true); }} className="text-xs text-stone-500 hover:text-stone-900">
+            Edit rules
+          </button>
+        )}
+      </div>
+
+      <div className="border border-stone-200 rounded-2xl bg-white p-5">
+        {editing ? (
+          <div className="space-y-2">
+            <textarea
+              value={textDraft}
+              onChange={(e) => setTextDraft(e.target.value)}
+              rows={16}
+              placeholder="Write the rules and points scoring here…"
+              className="w-full bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+            />
+            <p className="text-[11px] text-stone-500">Tip: start a line with <code className="bg-stone-100 border border-stone-200 rounded px-1">## </code> to turn it into a collapsible section heading — e.g. <code className="bg-stone-100 border border-stone-200 rounded px-1">## Points scoring</code>. Readers open the sections they want; anything before the first heading always shows.</p>
+            <div className="flex gap-2">
+              <button onClick={saveText} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+                Save rules
+              </button>
+              <button onClick={() => setEditing(false)} className="text-sm text-stone-500 hover:text-stone-900 px-2">Cancel</button>
+            </div>
+          </div>
+        ) : data.rulesPage?.text?.trim() ? (
+          <HistorySections text={data.rulesPage.text} />
+        ) : (
+          <p className="text-sm text-stone-500">{adminMode ? "No rules written yet — click Edit rules to add them." : "The rules haven't been written up yet — check back soon."}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function HistoryView({ data, adminMode, persist }) {
   const [editing, setEditing] = useState(false);
   const [textDraft, setTextDraft] = useState(data.historyPage.text);
@@ -2600,7 +2675,7 @@ function FixtureListView({ league, viewerId }) {
 // Once results are published, each prediction also shows the points it
 // earned, and the card footer shows the head-to-head outcome.
 // -----------------------------------------------------------------------------
-function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, now }) {
+function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, now, clubLibrary }) {
   if (!matchday.pairings) return null;
   const released = adminMode || isReleased(matchday, now);
   const canSeeResults = adminMode || matchday.resultsPublished;
@@ -2632,7 +2707,7 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
       <div className="flex-1 min-w-0 text-center">
         {isCustomPick && (
           canSeePick ? (
-            <div className="text-[10px] text-stone-500 leading-tight">{m.home} v {m.away}</div>
+            <div className="text-[10px] text-stone-500 leading-tight"><ClubName name={m.home} clubLibrary={clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={clubLibrary} size={10} /></div>
           ) : (
             <div className="text-[10px] text-stone-400 italic leading-tight flex items-center justify-center gap-1"><EyeOff size={9} /> pick hidden</div>
           )
@@ -2640,7 +2715,7 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
         {isFree && !isCustomPick && (
           // A pick slot where the contestant never chose — they fall back
           // to the admin's default fixture, shown plainly.
-          <div className="text-[10px] text-stone-500 leading-tight">{m.home} v {m.away}</div>
+          <div className="text-[10px] text-stone-500 leading-tight"><ClubName name={m.home} clubLibrary={clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={clubLibrary} size={10} /></div>
         )}
         {pred ? (
           canSeeVal
@@ -2724,8 +2799,8 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
                       <span className="italic flex items-center justify-center gap-1"><Sparkles size={9} /> Bonanza picks</span>
                     ) : matchday.bonanza && idx === 2 ? (
                       <>
-                        <div>{defaultMatch.home}</div>
-                        <div>v {defaultMatch.away}</div>
+                        <div><ClubName name={defaultMatch.home} clubLibrary={clubLibrary} size={12} /></div>
+                        <div>v <ClubName name={defaultMatch.away} clubLibrary={clubLibrary} size={12} /></div>
                         <div className="italic text-stone-400">anchor — home picks own</div>
                         {defaultMatch.outcome && canSeeResults && (
                           <div className="text-amber-500 font-mono-num">FT {defaultMatch.outcome.home}–{defaultMatch.outcome.away}</div>
@@ -2735,8 +2810,8 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
                       <span className="italic flex items-center justify-center gap-1"><Landmark size={9} /> Free match</span>
                     ) : (
                       <>
-                        <div>{defaultMatch.home}</div>
-                        <div>v {defaultMatch.away}</div>
+                        <div><ClubName name={defaultMatch.home} clubLibrary={clubLibrary} size={12} /></div>
+                        <div>v <ClubName name={defaultMatch.away} clubLibrary={clubLibrary} size={12} /></div>
                         {defaultMatch.outcome && canSeeResults && (
                           <div className="text-amber-500 font-mono-num">FT {defaultMatch.outcome.home}–{defaultMatch.outcome.away}</div>
                         )}
@@ -2822,7 +2897,7 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
               </span>
             </div>
             {md.pairings && (
-              <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} />
+              <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} clubLibrary={data.clubLibrary} />
             )}
             {/* Opening blog: from the reveal time until results are published.
                 Closing blog: from publish onward. Admin sees both, always. */}
@@ -2931,13 +3006,13 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                               !isOwnPick ? (
                                 colIdx !== 2 || !md.bonanza ? (
                                   <div className="text-[10px] text-stone-500 leading-tight mb-1">
-                                    {m.home} v {m.away}
+                                    <ClubName name={m.home} clubLibrary={data.clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={data.clubLibrary} size={10} />
                                     {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
                                   </div>
                                 ) : null /* the anchor column header already names the fixture */
                               ) : canSeeCustomPick ? (
                                 <div className="text-[10px] text-stone-500 leading-tight mb-1">
-                                  {m.home} v {m.away}
+                                  <ClubName name={m.home} clubLibrary={data.clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={data.clubLibrary} size={10} />
                                   {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
                                 </div>
                               ) : (
@@ -3571,6 +3646,151 @@ function RoomSettingsCard({ currentPin, onUpdatePin }) {
   );
 }
 
+// The club identity library (see clubIdentityFor above): admin uploads
+// crests for Premier League / Championship clubs and defines colour pills
+// for everyone below, each with an alias list so every spelling contestants
+// use resolves to the same identity. Shared across all divisions.
+function ClubLibraryCard({ data, persist }) {
+  const [crestName, setCrestName] = useState("");
+  const [crestAliases, setCrestAliases] = useState("");
+  const [crestImage, setCrestImage] = useState(null);
+  const [colorName, setColorName] = useState("");
+  const [colorAliases, setColorAliases] = useState("");
+  const [bg, setBg] = useState("#1D4ED8");
+  const [textColor, setTextColor] = useState("#FFFFFF");
+  const [error, setError] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef(null);
+  const library = data.clubLibrary || { crests: [], colors: [] };
+
+  const parseAliases = (s) => s.split(",").map((a) => a.trim()).filter(Boolean);
+  const librarySizeKB = Math.round(JSON.stringify(library).length / 1024);
+
+  const handleCrestFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setUploading(true);
+    try {
+      setCrestImage(await resizeImageFile(file, 80)); // crisp at every size the site shows (max ~16px, retina-safe)
+    } catch {
+      setError("Couldn't read that image — try a different file.");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const saveLibrary = async (nextLibrary) => {
+    const ok = await persist({ ...data, clubLibrary: nextLibrary });
+    if (!ok) { setError("That didn't save — refresh this page and try again. Everything you entered is still here."); return false; }
+    setError("");
+    return true;
+  };
+
+  const addCrest = async () => {
+    if (!crestName.trim()) { setError("Enter the club's name."); return; }
+    if (!crestImage) { setError("Upload the club's crest image."); return; }
+    const entry = { id: `crest_${Date.now()}`, name: crestName.trim(), aliases: parseAliases(crestAliases), image: crestImage };
+    const ok = await saveLibrary({ ...library, crests: [...(library.crests || []), entry] });
+    if (ok) { setCrestName(""); setCrestAliases(""); setCrestImage(null); }
+  };
+
+  const addColor = async () => {
+    if (!colorName.trim()) { setError("Enter the club's name."); return; }
+    const entry = { id: `clr_${Date.now()}`, name: colorName.trim(), aliases: parseAliases(colorAliases), bg, text: textColor };
+    const ok = await saveLibrary({ ...library, colors: [...(library.colors || []), entry] });
+    if (ok) { setColorName(""); setColorAliases(""); }
+  };
+
+  const removeCrest = (id) => saveLibrary({ ...library, crests: (library.crests || []).filter((c) => c.id !== id) });
+  const removeColor = (id) => saveLibrary({ ...library, colors: (library.colors || []).filter((c) => c.id !== id) });
+
+  const updateAliases = (kind, id, value) => {
+    const list = (library[kind] || []).map((c) => (c.id === id ? { ...c, aliases: parseAliases(value) } : c));
+    return saveLibrary({ ...library, [kind]: list });
+  };
+
+  return (
+    <section className="bg-white border border-stone-200 rounded-2xl p-5 space-y-4">
+      <h2 className="font-display font-semibold text-lg flex items-center gap-2"><ShieldCheck size={18} className="text-amber-400" /> Club identity library</h2>
+      <p className="text-xs text-stone-500">
+        Gives real-world clubs a visual identity on the prediction and results score cards, across all divisions. Premier League and Championship clubs get an uploaded <strong>crest</strong>; clubs below the Championship get a <strong>colour pill</strong> in their home colours. Matching is by exact club name or alias (case doesn't matter) — add every spelling contestants use, separated by commas. Unmatched names simply show as plain text. Library size so far: ~{librarySizeKB}KB (keep total under ~2,000KB).
+      </p>
+
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+
+      <div>
+        <h3 className="text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2">Crests — Premier League &amp; Championship</h3>
+        {(library.crests || []).length > 0 && (
+          <div className="space-y-1.5 mb-3">
+            {(library.crests || []).map((c) => (
+              <div key={c.id} className="flex items-center gap-2 border border-stone-200 rounded-xl px-3 py-1.5 bg-stone-50 flex-wrap">
+                <img src={c.image} alt="" className="w-6 h-6 object-contain shrink-0" />
+                <span className="font-medium text-sm">{c.name}</span>
+                <input
+                  defaultValue={(c.aliases || []).join(", ")}
+                  onBlur={(e) => { if (e.target.value !== (c.aliases || []).join(", ")) updateAliases("crests", c.id, e.target.value); }}
+                  placeholder="aliases, comma-separated"
+                  className="flex-1 min-w-[160px] bg-white border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                  title="Other spellings that should match this club — saved when you click away"
+                />
+                <button onClick={() => removeCrest(c.id)} className="text-stone-500 hover:text-rose-600 shrink-0" title="Remove this crest"><X size={14} /></button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <button onClick={() => fileRef.current?.click()} disabled={uploading} className="flex items-center gap-1.5 text-xs bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 font-medium disabled:opacity-50">
+            {crestImage ? <img src={crestImage} alt="" className="w-4 h-4 object-contain" /> : <Upload size={13} />}
+            {uploading ? "Reading…" : crestImage ? "Crest ready" : "Choose crest image"}
+          </button>
+          <input ref={fileRef} type="file" accept="image/*" onChange={handleCrestFile} className="hidden" />
+          <input value={crestName} onChange={(e) => setCrestName(e.target.value)} placeholder="Club name (e.g. Liverpool)" className="flex-1 min-w-[140px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <input value={crestAliases} onChange={(e) => setCrestAliases(e.target.value)} placeholder="Aliases (e.g. Liverpool FC, LFC)" className="flex-1 min-w-[160px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <button onClick={addCrest} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm shrink-0">
+            <Plus size={15} /> Add crest
+          </button>
+        </div>
+      </div>
+
+      <div>
+        <h3 className="text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2">Colour pills — clubs below the Championship</h3>
+        {(library.colors || []).length > 0 && (
+          <div className="space-y-1.5 mb-3">
+            {(library.colors || []).map((c) => (
+              <div key={c.id} className="flex items-center gap-2 border border-stone-200 rounded-xl px-3 py-1.5 bg-stone-50 flex-wrap">
+                <span className="inline-block rounded px-1.5 py-0.5 text-xs font-medium shrink-0" style={{ background: c.bg, color: c.text }}>{c.name}</span>
+                <input
+                  defaultValue={(c.aliases || []).join(", ")}
+                  onBlur={(e) => { if (e.target.value !== (c.aliases || []).join(", ")) updateAliases("colors", c.id, e.target.value); }}
+                  placeholder="aliases, comma-separated"
+                  className="flex-1 min-w-[160px] bg-white border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                  title="Other spellings that should match this club — saved when you click away"
+                />
+                <button onClick={() => removeColor(c.id)} className="text-stone-500 hover:text-rose-600 shrink-0" title="Remove this colour pill"><X size={14} /></button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <input value={colorName} onChange={(e) => setColorName(e.target.value)} placeholder="Club name (e.g. Bristol Rovers)" className="flex-1 min-w-[150px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <input value={colorAliases} onChange={(e) => setColorAliases(e.target.value)} placeholder="Aliases" className="flex-1 min-w-[120px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <label className="flex items-center gap-1.5 text-xs text-stone-500">Shirt <input type="color" value={bg} onChange={(e) => setBg(e.target.value)} className="w-8 h-8 border border-stone-300 rounded cursor-pointer" title="Background colour (home shirt)" /></label>
+          <label className="flex items-center gap-1.5 text-xs text-stone-500">Text <input type="color" value={textColor} onChange={(e) => setTextColor(e.target.value)} className="w-8 h-8 border border-stone-300 rounded cursor-pointer" title="Text colour" /></label>
+          <span className="inline-block rounded px-1.5 py-0.5 text-xs font-medium" style={{ background: bg, color: textColor }}>{colorName.trim() || "Preview"}</span>
+          <button onClick={addColor} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm shrink-0">
+            <Plus size={15} /> Add colours
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 // Manual standings corrections — for when a mistake slips through during
 // the season. Deliberately built as a layer of adjustments applied ON TOP
 // of the computed standings (see computeLeaderboardWithPredictions), never
@@ -4103,6 +4323,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       <DivisionsCard data={data} persist={persist} />
       <RoomSettingsCard currentPin={data.adminPin} onUpdatePin={updatePin} />
       <AdjustmentsCard league={league} leagueKey={leagueKey} data={data} persist={persist} />
+      <ClubLibraryCard data={data} persist={persist} />
 
       {/* Participants */}
       <section className="bg-white border border-stone-200 rounded-2xl p-5">
@@ -5412,6 +5633,51 @@ function Avatar({ name, photo, size = 56 }) {
   );
 }
 
+// -----------------------------------------------------------------------------
+// CLUB IDENTITIES — an admin-managed library (see ClubLibraryCard) giving
+// every real-world club a visual identity on the score cards:
+//   - Premier League / Championship clubs: an uploaded crest, shown beside
+//     the club name
+//   - clubs below the Championship: a colour pill (admin-chosen background
+//     and text colours matching the club's home kit)
+// Matching is by exact name or alias, case-insensitive — admin maintains
+// the alias lists so "Man Utd", "Man United" and "Manchester United" all
+// resolve to the same crest. Unmatched names render as plain text, so
+// nothing changes anywhere until the library is populated.
+// -----------------------------------------------------------------------------
+function clubIdentityFor(teamName, clubLibrary) {
+  if (!teamName || !clubLibrary) return null;
+  const norm = teamName.trim().toLowerCase();
+  const matches = (c) => c.name.trim().toLowerCase() === norm || (c.aliases || []).some((a) => a.trim().toLowerCase() === norm);
+  const crest = (clubLibrary.crests || []).find(matches);
+  if (crest) return { type: "crest", image: crest.image };
+  const color = (clubLibrary.colors || []).find(matches);
+  if (color) return { type: "colors", bg: color.bg, text: color.text };
+  return null;
+}
+
+// A club name with its visual identity applied: crest beside the name, a
+// colour pill around it, or plain text when the library has no entry.
+function ClubName({ name, clubLibrary, size = 14 }) {
+  const identity = clubIdentityFor(name, clubLibrary);
+  if (identity?.type === "crest") {
+    return (
+      <span className="inline-flex items-center gap-1 min-w-0 align-middle">
+        <img src={identity.image} alt="" style={{ width: size, height: size }} className="object-contain shrink-0" />
+        <span className="min-w-0">{name}</span>
+      </span>
+    );
+  }
+  if (identity?.type === "colors") {
+    return (
+      <span className="inline-block rounded px-1 py-px leading-tight align-middle" style={{ background: identity.bg, color: identity.text }}>
+        {name}
+      </span>
+    );
+  }
+  return <span>{name}</span>;
+}
+
 // Roster identity chip used in standings, podiums and pairing cards: the
 // contestant's admin-uploaded team badge when one exists, otherwise a plain
 // initial disc. Deliberately badge-first — badges are the site's visual
@@ -5745,6 +6011,15 @@ function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadDa
                   >
                     <History size={13} /> History
                   </button>
+                  <button
+                    onClick={() => setAdminGlobalView(adminGlobalView === "rules" ? null : "rules")}
+                    className={cx(
+                      "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5",
+                      adminGlobalView === "rules" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+                    )}
+                  >
+                    <BookOpen size={13} /> Rules
+                  </button>
                 </div>
                 <button
                   onClick={() => setAdminUnlocked(false)}
@@ -5771,6 +6046,8 @@ function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadDa
             <HonoursView data={data} adminMode persist={persist} />
           ) : adminGlobalView === "history" ? (
             <HistoryView data={data} adminMode persist={persist} />
+          ) : adminGlobalView === "rules" ? (
+            <RulesView data={data} adminMode persist={persist} />
           ) : (
             <AppTabs
               league={league}
