@@ -77,6 +77,13 @@ const PHOTOS_KEY = "plp-2026-27-photos-v1"; // profile photos only, kept separat
 const BADGES_KEY = "plp-2026-27-badges-v1"; // admin-assigned team-crest badges — separate from self-uploaded profile photos
 const HISTORY_KEY = "plp-2026-27-history-page-v1"; // the free-text History page + its images, isolated since images can be large
 const CLUB_KEY = "plp-2026-27-club-library-v1"; // club crests + colour identities, isolated since crest images can be large
+const RULES_KEY = "plp-2026-27-rules-page-v1"; // the Rules tab text — its OWN key (see schema note below)
+// SCHEMA RULE (learned the hard way): every NEW top-level field must live in
+// its own NEW storage key. Older cached builds of the site rewrite the keys
+// they know about on every full save — a new field piggybacking on an old
+// key gets silently dropped by any device still running yesterday's code.
+// A brand-new key is invisible to old builds, so they can never erase it.
+const APP_SCHEMA_VERSION = 2; // bump whenever the storage shape changes
 const PREDICTIONS_KEY = "plp-2026-27-predictions-v1"; // the highest-frequency write in the app, isolated on its own
 const SEASON_ARCHIVES_KEY = "plp-2026-27-season-archives-v1"; // past seasons — grows slowly but can get large, so it's isolated too
 const DEFAULT_MAX_PARTICIPANTS = 20; // fallback cap when a league doesn't specify its own
@@ -667,21 +674,22 @@ function splitData(data) {
     });
   });
   return {
-    core: { adminPin: data.adminPin, lastManualExportAt: data.lastManualExportAt, seasonLabel: data.seasonLabel, leagueMeta },
+    core: { adminPin: data.adminPin, lastManualExportAt: data.lastManualExportAt, seasonLabel: data.seasonLabel, leagueMeta, schemaVersion: APP_SCHEMA_VERSION },
     accountsBlob: { accounts: data.accounts },
     rosterBlob: { leagues: rosterLeagues },
     photosBlob: { photos },
     predictionsBlob: { predictions: data.predictions },
     archivesBlob: { seasonArchives: data.seasonArchives, legacyHonours: data.legacyHonours },
     badgesBlob: { badges },
-    historyBlob: { historyPage: data.historyPage, rulesPage: data.rulesPage },
+    historyBlob: { historyPage: data.historyPage },
     clubBlob: { clubLibrary: data.clubLibrary },
+    rulesBlob: { rulesPage: data.rulesPage },
   };
 }
 
 // The inverse of splitData — reconstructs the unified shape the rest of the
 // app expects from the 8 separately-loaded pieces.
-function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob = { clubLibrary: null }) {
+function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob = { clubLibrary: null }, rulesBlob = { rulesPage: null }) {
   const leagues = {};
   Object.keys(core.leagueMeta).forEach((key) => {
     const roster = rosterBlob.leagues[key]?.participants ?? [];
@@ -697,7 +705,9 @@ function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsB
     seasonArchives: archivesBlob.seasonArchives ?? [],
     legacyHonours: archivesBlob.legacyHonours ?? [],
     historyPage: historyBlob.historyPage ?? { text: "", images: [] },
-    rulesPage: historyBlob.rulesPage ?? { text: "" },
+    // Prefer the dedicated key; fall back to the brief early spot inside the
+    // history blob (v24) in case rules were written there and not yet wiped.
+    rulesPage: rulesBlob.rulesPage ?? historyBlob.rulesPage ?? { text: "" },
     clubLibrary: clubBlob.clubLibrary ?? { crests: [], colors: [] },
     accounts: accountsBlob.accounts ?? {},
     predictions: predictionsBlob.predictions ?? {},
@@ -740,7 +750,7 @@ async function setWithRetry(key, json, attempts = 3, delayMs = 400) {
 }
 
 async function writeSplitData(data) {
-  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob } = splitData(data);
+  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob, rulesBlob } = splitData(data);
   // Named entries, written one at a time (not all at once) — sequencing
   // keeps write bursts gentle on the backend and makes failures easier to
   // attribute. Still independent of each other: one failing doesn't stop
@@ -755,6 +765,7 @@ async function writeSplitData(data) {
     ["badges", BADGES_KEY, badgesBlob],
     ["history page", HISTORY_KEY, historyBlob],
     ["club library", CLUB_KEY, clubBlob],
+    ["rules page", RULES_KEY, rulesBlob],
   ];
   const failed = [];
   for (const [label, key, blob] of entries) {
@@ -970,6 +981,7 @@ function ForecastRoomApp() {
         const badgesRes = await window.storage.get(BADGES_KEY, true);
         const historyRes = await window.storage.get(HISTORY_KEY, true);
         const clubRes = await window.storage.get(CLUB_KEY, true);
+        const rulesRes = await window.storage.get(RULES_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         if (cancelled) return;
         // Remember which save-version this data came from — every future
@@ -978,8 +990,10 @@ function ForecastRoomApp() {
 
         if (coreRes && coreRes.value) {
           // Already on the split-storage format.
+          const parsedCore = JSON.parse(coreRes.value);
+          markIfOutdated(parsedCore);
           const merged = mergeSplitData(
-            JSON.parse(coreRes.value),
+            parsedCore,
             accountsRes && accountsRes.value ? JSON.parse(accountsRes.value) : { accounts: {} },
             rosterRes && rosterRes.value ? JSON.parse(rosterRes.value) : { leagues: {} },
             photosRes && photosRes.value ? JSON.parse(photosRes.value) : { photos: {} },
@@ -987,7 +1001,8 @@ function ForecastRoomApp() {
             archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
             badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
             historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
-            clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null }
+            clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null },
+            rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null }
           );
           setData(migrateData(merged));
           return;
@@ -1078,6 +1093,7 @@ function ForecastRoomApp() {
   // to it. Any number of contestants can save their profiles at the same
   // time — every change lands, nobody sees a stale-data error.
   const mergeProfileSave = useCallback((targetLeagueKey, participantId, fields, badgePatch) => {
+    if (outdatedBuildRef.current) return Promise.resolve(false); // outdated build — writes disabled
     const run = persistQueueRef.current.then(async () => {
       try {
         const currentRev = await readRevValue();
@@ -1147,6 +1163,7 @@ function ForecastRoomApp() {
   // save can never leave someone apparently "logged in" to an account that
   // was never actually stored.
   const registerAccount = useCallback((emailKey, record) => {
+    if (outdatedBuildRef.current) return Promise.resolve({ ok: false, reason: "network" }); // outdated build — writes disabled
     const run = persistQueueRef.current.then(async () => {
       try {
         const currentRev = await readRevValue();
@@ -1180,6 +1197,28 @@ function ForecastRoomApp() {
   // in-memory data stays exactly as it is.
   const reloadInFlightRef = useRef(false);
   const lastRevCheckRef = useRef(0);
+  // OUTDATED-BUILD GUARD: if the stored data was written by a NEWER build
+  // of the site than this one (its schemaVersion is higher), this device
+  // is running old cached code. Old code rewriting storage is how new
+  // fields get silently erased, so: block every write from this device,
+  // explain, and attempt one automatic page reload to pick up the new
+  // build. Old builds already in the wild cannot gain this guard, but
+  // every build from now on protects every future schema change.
+  const outdatedBuildRef = useRef(false);
+  const markIfOutdated = useCallback((parsedCore) => {
+    const remote = (parsedCore && parsedCore.schemaVersion) || 1;
+    if (remote > APP_SCHEMA_VERSION && !outdatedBuildRef.current) {
+      outdatedBuildRef.current = true;
+      setSaveError("This device is showing an older version of the site, so saving is disabled here to protect newer data. Refresh the page (or close and reopen the app) to update.");
+      try {
+        if (!sessionStorage.getItem("plp-auto-reloaded")) {
+          sessionStorage.setItem("plp-auto-reloaded", "1");
+          window.location.reload();
+        }
+      } catch (e) { /* if reload is blocked, the banner and write-block still protect */ }
+    }
+    return outdatedBuildRef.current;
+  }, []);
   const reloadFromStorage = useCallback(() => {
     if (reloadInFlightRef.current) return persistQueueRef.current.then(() => dataRef.current);
     reloadInFlightRef.current = true;
@@ -1195,9 +1234,12 @@ function ForecastRoomApp() {
         const badgesRes = await window.storage.get(BADGES_KEY, true);
         const historyRes = await window.storage.get(HISTORY_KEY, true);
         const clubRes = await window.storage.get(CLUB_KEY, true);
+        const rulesRes = await window.storage.get(RULES_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
+        const parsedCore = JSON.parse(coreRes.value);
+        markIfOutdated(parsedCore);
         const merged = migrateData(mergeSplitData(
-          JSON.parse(coreRes.value),
+          parsedCore,
           accountsRes && accountsRes.value ? JSON.parse(accountsRes.value) : { accounts: {} },
           rosterRes && rosterRes.value ? JSON.parse(rosterRes.value) : { leagues: {} },
           photosRes && photosRes.value ? JSON.parse(photosRes.value) : { photos: {} },
@@ -1205,7 +1247,8 @@ function ForecastRoomApp() {
           archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
           badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
           historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
-          clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null }
+          clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null },
+          rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null }
         ));
         revRef.current = revRes && revRes.value ? revRes.value : null;
         setData(merged);
@@ -1244,6 +1287,7 @@ function ForecastRoomApp() {
   }, [reloadFromStorage]);
 
   const persist = useCallback((next) => {
+    if (outdatedBuildRef.current) return Promise.resolve(false); // outdated build — writes disabled (see guard above)
     // Queue this save behind whatever's already running, rather than
     // starting it immediately — see persistQueueRef above for why.
     const run = persistQueueRef.current.then(async () => {
