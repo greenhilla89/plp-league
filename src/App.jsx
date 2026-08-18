@@ -451,28 +451,57 @@ function computeMatchdayPoints(matchday, predictions, participants) {
 function generateRoundRobinSchedule(participantIds) {
   let ids = [...participantIds];
   if (ids.length < 2) return [];
-  const hasBye = ids.length % 2 !== 0;
-  if (hasBye) ids.push(null);
+  if (ids.length % 2 !== 0) ids.push(null);
   const n = ids.length;
   const half = n / 2;
   let arr = [...ids];
-  const firstLeg = [];
+
+  // Pass 1: the classic circle method decides WHO meets WHOM each round.
+  const roundPairs = [];
   for (let r = 0; r < n - 1; r++) {
-    const pairings = [];
+    const pairs = [];
     let bye = null;
     for (let i = 0; i < half; i++) {
       const a = arr[i];
       const b = arr[n - 1 - i];
       if (a === null) bye = b;
       else if (b === null) bye = a;
-      else pairings.push({ home: a, away: b });
+      else pairs.push([a, b]);
     }
-    firstLeg.push({ pairings, bye });
+    roundPairs.push({ pairs, bye });
     const fixed = arr[0];
     const rest = arr.slice(1);
     rest.unshift(rest.pop());
     arr = [fixed, ...rest];
   }
+
+  // Pass 2 decides the VENUES: round by round, each pairing is oriented so
+  // the contestant under the most venue pressure (the longest current run
+  // of playing the same way) gets the opposite venue next, with overall
+  // home counts as the tie-breaker. Empirically this keeps everyone on a
+  // home-away-home-away rhythm, with only the very occasional (and short)
+  // exception, while home/away totals stay perfectly equal. The second leg
+  // mirrors the first with venues flipped, which preserves the rhythm
+  // through the season's midpoint and guarantees every pair meets exactly
+  // once at each contestant's ground.
+  const state = {};
+  ids.forEach((id) => { if (id !== null) state[id] = { last: null, streak: 0, homes: 0 }; });
+  const firstLeg = roundPairs.map(({ pairs, bye }) => {
+    const pairings = pairs.map(([a, b]) => {
+      const sa = state[a], sb = state[b];
+      const pen = (s, v) => (s.last === v ? s.streak : 0);
+      const aHomePenalty = pen(sa, "H") + pen(sb, "A") + (sa.homes - sb.homes) * 0.1;
+      const bHomePenalty = pen(sb, "H") + pen(sa, "A") + (sb.homes - sa.homes) * 0.1;
+      const aHome = aHomePenalty <= bHomePenalty;
+      const [h, w] = aHome ? [a, b] : [b, a];
+      const sh = state[h], sw = state[w];
+      sh.streak = sh.last === "H" ? sh.streak + 1 : 1; sh.last = "H"; sh.homes++;
+      sw.streak = sw.last === "A" ? sw.streak + 1 : 1; sw.last = "A";
+      return { home: h, away: w };
+    });
+    return { pairings, bye };
+  });
+
   const secondLeg = firstLeg.map(({ pairings, bye }) => ({
     pairings: pairings.map((p) => ({ home: p.away, away: p.home })),
     bye,
@@ -4316,19 +4345,14 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
     return updateLeague({ h2hSchedule: schedule });
   };
 
-  const setRoundDate = async (index, date) => {
-    const nextSchedule = league.h2hSchedule.map((r, i) => (i === index ? { ...r, scheduledDate: date || null } : r));
-    await updateLeague({ h2hSchedule: nextSchedule });
-  };
-
-  const bulkSetDates = async (startDateStr, intervalDays) => {
-    if (!startDateStr) return;
-    const start = new Date(`${startDateStr}T00:00:00`);
-    const nextSchedule = league.h2hSchedule.map((r, i) => {
-      const d = new Date(start.getTime() + i * intervalDays * 24 * 60 * 60 * 1000);
-      return { ...r, scheduledDate: d.toISOString().slice(0, 10) };
-    });
-    await updateLeague({ h2hSchedule: nextSchedule });
+  // All round dates are saved in ONE write, built from the schedule as it
+  // is at the moment Save is clicked. (Saving each date the instant it was
+  // typed meant several in-flight saves each built from an older snapshot —
+  // they overwrote each other, which is why dates crawled, vanished, or
+  // reverted to values never chosen.)
+  const saveRoundDates = async (dates) => {
+    const nextSchedule = league.h2hSchedule.map((r, i) => ({ ...r, scheduledDate: dates[i] || null }));
+    return updateLeague({ h2hSchedule: nextSchedule });
   };
 
   const generateRandomMatchday = async () => {
@@ -4428,7 +4452,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       </section>
 
       {/* Season-long head-to-head schedule */}
-      <H2HScheduleCard league={league} onGenerate={generateH2HSchedule} onSetRoundDate={setRoundDate} onBulkSetDates={bulkSetDates} />
+      <H2HScheduleCard league={league} onGenerate={generateH2HSchedule} onSaveDates={saveRoundDates} />
 
       {/* Fixture pool + random matchday generator */}
       <FixturePoolCard
@@ -4468,11 +4492,30 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
 // pre-set rotation — exactly like a normal football season's fixture list.
 // Each matchday, when created, pulls its pairings from the next unused
 // round of this schedule (see generateRandomMatchday / NewMatchdayForm).
-function H2HScheduleCard({ league, onGenerate, onSetRoundDate, onBulkSetDates }) {
+function H2HScheduleCard({ league, onGenerate, onSaveDates }) {
   const [confirmingRegenerate, setConfirmingRegenerate] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [bulkStart, setBulkStart] = useState("");
   const [bulkInterval, setBulkInterval] = useState(7);
+
+  // Round dates are edited as local DRAFTS (instant, no saving mid-typing)
+  // and committed in one go by the Save dates button. If the stored
+  // schedule changes externally (a regenerate, or the save landing), the
+  // drafts resync to it.
+  const storedDates = league.h2hSchedule.map((r) => (r.scheduledDate ? r.scheduledDate.slice(0, 10) : ""));
+  const storedJson = JSON.stringify(storedDates);
+  const [dateDrafts, setDateDrafts] = useState(storedDates);
+  const [loadedJson, setLoadedJson] = useState(storedJson);
+  if (storedJson !== loadedJson) {
+    setLoadedJson(storedJson);
+    setDateDrafts(storedDates);
+  }
+  const datesDirty = JSON.stringify(dateDrafts) !== storedJson;
+
+  const saveDates = async () => {
+    const ok = await onSaveDates(dateDrafts);
+    if (ok === false) return; // refused save — drafts stay put; the banner explains
+  };
 
   const n = league.participants.length;
   const minRequired = league.minParticipants ?? DEFAULT_MIN_PARTICIPANTS;
@@ -4486,9 +4529,12 @@ function H2HScheduleCard({ league, onGenerate, onSetRoundDate, onBulkSetDates })
     setConfirmingRegenerate(false);
   };
 
+  // Fills the DRAFTS only — nothing is stored until Save dates is clicked.
   const applyBulkDates = () => {
     if (!bulkStart) return;
-    onBulkSetDates(bulkStart, Number(bulkInterval) || 7);
+    const start = new Date(`${bulkStart}T00:00:00`);
+    const interval = Number(bulkInterval) || 7;
+    setDateDrafts(league.h2hSchedule.map((_, i) => new Date(start.getTime() + i * interval * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)));
   };
 
   return (
@@ -4534,7 +4580,7 @@ function H2HScheduleCard({ league, onGenerate, onSetRoundDate, onBulkSetDates })
       {hasSchedule && (
         <div className="border-t border-stone-200 pt-3">
           <label className="text-xs text-stone-400">Matchday dates for the season</label>
-          <p className="text-[11px] text-stone-500 mb-2">Set every round's date at once, then fine-tune individual ones below — visible to contestants in the Fixture List from day one, even before you've created that round's matches yet.</p>
+          <p className="text-[11px] text-stone-500 mb-2">Set every round's date at once, fine-tune individual ones below, then click <strong>Save dates</strong> — visible to contestants in the Fixture List from day one, even before you've created that round's matches yet.</p>
           <div className="flex flex-wrap items-end gap-2 mb-3">
             <div>
               <label className="text-[10px] text-stone-500">First matchday</label>
@@ -4546,6 +4592,16 @@ function H2HScheduleCard({ league, onGenerate, onSetRoundDate, onBulkSetDates })
             </div>
             <button onClick={applyBulkDates} disabled={!bulkStart} className="bg-stone-200 hover:bg-stone-300 disabled:opacity-50 rounded-lg px-3 py-2 text-sm font-medium">
               Fill all {league.h2hSchedule.length} dates
+            </button>
+            <button
+              onClick={saveDates}
+              disabled={!datesDirty}
+              className={cx(
+                "flex items-center gap-1.5 font-semibold rounded-lg px-4 py-2 text-sm",
+                datesDirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default"
+              )}
+            >
+              {datesDirty ? "Save dates" : <><CheckCircle2 size={14} /> Saved</>}
             </button>
           </div>
 
@@ -4560,8 +4616,8 @@ function H2HScheduleCard({ league, onGenerate, onSetRoundDate, onBulkSetDates })
                     <div className="text-stone-500 font-medium">Round {i + 1}</div>
                     <input
                       type="date"
-                      value={round.scheduledDate ? round.scheduledDate.slice(0, 10) : ""}
-                      onChange={(e) => onSetRoundDate(i, e.target.value)}
+                      value={dateDrafts[i] ?? ""}
+                      onChange={(e) => setDateDrafts((d) => d.map((v, j) => (j === i ? e.target.value : v)))}
                       className="mt-1 bg-white border border-stone-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50"
                     />
                   </div>
