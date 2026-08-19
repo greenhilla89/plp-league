@@ -1568,7 +1568,7 @@ function ForecastRoomApp() {
           now={now}
           snapshots={snapshots}
           onRestoreSnapshot={restoreSnapshot}
-          allowSubmit
+          allowSubmit={safeLeagueKey === currentUser.leagueKey}
         />
       )}
 
@@ -1699,6 +1699,16 @@ function TabButton({ icon: Icon, label, active, onClick, accent }) {
 // Matrix, Standings, Profiles, Stats and Admin panel itself — is the same).
 function AppTabs({ league, leagueKey, data, persist, mergeProfileSave, submitPredictions, viewerId, adminMode, now, snapshots, onRestoreSnapshot, allowSubmit }) {
   const [tab, setTab] = useState(allowSubmit ? "submit" : "matrix");
+
+  // The Submit tab only exists in the division a contestant actually
+  // predicts in. Other divisions are view-only (scores, standings,
+  // fixtures, profiles) with no Submit tab at all — so no one can even
+  // appear to enter predictions for a league they're not part of. If
+  // someone switches divisions while sitting on Submit, they land on
+  // Scores instead of a blank page.
+  useEffect(() => {
+    if (!allowSubmit && tab === "submit") setTab("matrix");
+  }, [allowSubmit, tab]);
   const accent = leagueAccent(leagueKey);
   return (
     <>
