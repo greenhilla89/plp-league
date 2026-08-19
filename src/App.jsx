@@ -2776,28 +2776,34 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
     const m = effectiveMatchesFor(matchday, pid)[matchIdx];
     const pred = predictions[`${m.id}__${pid}`];
     const isSelf = pid === viewerId;
-    // A slot where this contestant's fixture can differ from the default:
-    // the normal free slot, or their own Bonanza pick slots.
-    const isFree = matchday.bonanza
+    // A slot where this contestant has the RIGHT to choose their own
+    // fixture: their Bonanza pick slots, or — on a normal matchday — the
+    // free slot if they're the HOME side of their pairing. Whether they've
+    // actually exercised that right is deliberately NOT part of this test:
+    // before the reveal, a pick-capable slot always shows "hidden", so
+    // rivals can't tell whether the default fixture has been swapped out.
+    const pairingFor = matchday.pairings ? matchday.pairings.pairings.find((x) => x.home === pid || x.away === pid) : null;
+    const isHomeSide = pairingFor ? pairingFor.home === pid : false;
+    const couldPick = matchday.bonanza
       ? (bonanzaSlotsFor(matchday, pid)?.includes(matchIdx) ?? false)
-      : matchday.freeMatchIndex === matchIdx;
-    const isCustomPick = isFree && (m.id.startsWith("custom__") || m.id.startsWith("bonanza__"));
+      : (matchday.freeMatchIndex === matchIdx && isHomeSide);
+    // The away side of a normal free slot: their fixture there is the
+    // admin default, fixed — nothing secret about it.
+    const fixedAtPickSlot = !matchday.bonanza && matchday.freeMatchIndex === matchIdx && !couldPick;
     // Picks follow the same reveal as scorelines: hidden before the reveal
     // time, fully visible (match and prediction) from then on.
     const canSeePick = adminMode || released || isSelf;
     const canSeeVal = released || isSelf;
     return (
       <div className="flex-1 min-w-0 text-center">
-        {isCustomPick && (
+        {couldPick && (
           canSeePick ? (
             <div className="text-[10px] text-stone-500 leading-tight"><ClubName name={m.home} clubLibrary={clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={clubLibrary} size={10} /></div>
           ) : (
             <div className="text-[10px] text-stone-400 italic leading-tight flex items-center justify-center gap-1"><EyeOff size={9} /> pick hidden</div>
           )
         )}
-        {isFree && !isCustomPick && (
-          // A pick slot where the contestant never chose — they fall back
-          // to the admin's default fixture, shown plainly.
+        {fixedAtPickSlot && (
           <div className="text-[10px] text-stone-500 leading-tight"><ClubName name={m.home} clubLibrary={clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={clubLibrary} size={10} /></div>
         )}
         {pred ? (
@@ -2812,7 +2818,7 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
             its own. This covers chosen picks AND the default mandatory match
             an away contestant predicts at the free slot, which previously
             had no FT score anywhere on the card. */}
-        {isFree && canSeeResults && m.outcome && (!isCustomPick || canSeePick) && (
+        {(couldPick || fixedAtPickSlot) && canSeeResults && m.outcome && (!couldPick || canSeePick) && (
           <div className="text-[10px] text-amber-500 font-mono-num">FT {m.outcome.home}–{m.outcome.away}</div>
         )}
         {/* Once results are published: the points this prediction earned on
@@ -3069,6 +3075,17 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                         // fixture, unless this row's contestant has swapped
                         // it for their own (free match or Bonanza pick).
                         const m = isPickCol ? effectiveMatchesFor(md, p.id)[colIdx] : defaultMatch;
+                        // Whether this ROW's contestant has the right to
+                        // choose their own fixture at this column — home
+                        // side at the free slot, or their Bonanza slots.
+                        // Pick-capable slots show "hidden" before the
+                        // reveal WHETHER OR NOT a pick has been made, so
+                        // the matrix never betrays who has swapped the
+                        // default fixture out.
+                        const rowPairing = md.pairings ? md.pairings.pairings.find((x) => x.home === p.id || x.away === p.id) : null;
+                        const couldPick = md.bonanza
+                          ? (bonanzaSlotsFor(md, p.id)?.includes(colIdx) ?? false)
+                          : (isFreeCol && rowPairing?.home === p.id);
                         // A contestant's OWN chosen fixture (never the admin
                         // default) — these get the stricter hiding below.
                         const isOwnPick = m.id.startsWith("custom__") || m.id.startsWith("bonanza__");
@@ -3086,22 +3103,26 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                         return (
                           <td key={defaultMatch.id} className="px-3 py-3 text-center">
                             {isPickCol && (
-                              !isOwnPick ? (
+                              couldPick ? (
+                                canSeeCustomPick ? (
+                                  <div className="text-[10px] text-stone-500 leading-tight mb-1">
+                                    <ClubName name={m.home} clubLibrary={data.clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={data.clubLibrary} size={10} />
+                                    {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
+                                  </div>
+                                ) : (
+                                  <div className="text-[10px] text-stone-400 italic leading-tight mb-1 flex items-center justify-center gap-1">
+                                    <EyeOff size={9} /> pick hidden until predictions are revealed
+                                  </div>
+                                )
+                              ) : (
                                 colIdx !== 2 || !md.bonanza ? (
+                                  // This row's fixture at the slot is fixed (away side of
+                                  // the free slot) — nothing secret to protect.
                                   <div className="text-[10px] text-stone-500 leading-tight mb-1">
                                     <ClubName name={m.home} clubLibrary={data.clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={data.clubLibrary} size={10} />
                                     {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
                                   </div>
                                 ) : null /* the anchor column header already names the fixture */
-                              ) : canSeeCustomPick ? (
-                                <div className="text-[10px] text-stone-500 leading-tight mb-1">
-                                  <ClubName name={m.home} clubLibrary={data.clubLibrary} size={10} /> v <ClubName name={m.away} clubLibrary={data.clubLibrary} size={10} />
-                                  {m.outcome && (adminMode || md.resultsPublished) && <span className="text-amber-300"> ({m.outcome.home}–{m.outcome.away})</span>}
-                                </div>
-                              ) : (
-                                <div className="text-[10px] text-stone-400 italic leading-tight mb-1 flex items-center justify-center gap-1">
-                                  <EyeOff size={9} /> pick hidden until predictions are revealed
-                                </div>
                               )
                             )}
                             <span className={cx("inline-flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-medium", STATUS_STYLES[status])}>
