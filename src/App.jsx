@@ -5,7 +5,7 @@ import {
   Eye, EyeOff, ShieldCheck, Loader2, Trash2, Calendar, Sparkles,
   UserCircle2, Camera, MapPin, Cake, Shirt, Mail, KeyRound, LogOut,
   TrendingUp, ArrowLeft, Target, Flame, Award, Archive, History, Landmark,
-  Upload, Share2, BookOpen,
+  Upload, Share2, BookOpen, Newspaper, Mic, Square,
 } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
@@ -78,12 +78,13 @@ const BADGES_KEY = "plp-2026-27-badges-v1"; // admin-assigned team-crest badges 
 const HISTORY_KEY = "plp-2026-27-history-page-v1"; // the free-text History page + its images, isolated since images can be large
 const CLUB_KEY = "plp-2026-27-club-library-v1"; // club crests + colour identities, isolated since crest images can be large
 const RULES_KEY = "plp-2026-27-rules-page-v1"; // the Rules tab text — its OWN key (see schema note below)
+const BLOG_KEY = "plp-2026-27-blog-page-v1"; // Blog tab articles — its OWN key (see schema note below)
 // SCHEMA RULE (learned the hard way): every NEW top-level field must live in
 // its own NEW storage key. Older cached builds of the site rewrite the keys
 // they know about on every full save — a new field piggybacking on an old
 // key gets silently dropped by any device still running yesterday's code.
 // A brand-new key is invisible to old builds, so they can never erase it.
-const APP_SCHEMA_VERSION = 2; // bump whenever the storage shape changes
+const APP_SCHEMA_VERSION = 3; // bump whenever the storage shape changes
 const PREDICTIONS_KEY = "plp-2026-27-predictions-v1"; // the highest-frequency write in the app, isolated on its own
 const SEASON_ARCHIVES_KEY = "plp-2026-27-season-archives-v1"; // past seasons — grows slowly but can get large, so it's isolated too
 const DEFAULT_MAX_PARTICIPANTS = 20; // fallback cap when a league doesn't specify its own
@@ -610,6 +611,21 @@ function migrateData(data) {
   if (!Array.isArray(data.seasonArchives)) data.seasonArchives = [];
   if (!data.rulesPage) data.rulesPage = { text: "" }; // the Rules tab — free text with ## collapsible sections, like History
   if (!data.clubLibrary) data.clubLibrary = { crests: [], colors: [] }; // admin-managed club crests + colour identities — see ClubLibraryCard
+  if (!data.blogPage) data.blogPage = { articles: [] }; // the Blog tab — see BlogView
+  if (!data.voiceNotes) data.voiceNotes = {}; // matchday voice-note index — see VOICE NOTES
+  // One-time adoption: matchday write-ups from before the Blog tab existed
+  // become Blog articles (deterministic ids make this safe to re-run). The
+  // original text on the matchday is left untouched.
+  Object.entries(data.leagues).forEach(([lk, lg]) => {
+    (lg.matchdays || []).forEach((md) => {
+      [["open", md.blog, "The Preview"], ["close", md.closingBlog, "The Roundup"]].forEach(([kind, text, word]) => {
+        if (!text || !text.trim()) return;
+        const id = `art_mig_${lk}_${md.id}_${kind}`;
+        if (data.blogPage.articles.some((a) => a.id === id)) return;
+        data.blogPage.articles.push({ id, date: new Date().toISOString(), title: `${lg.name} — ${md.label}: ${word}`, body: text.trim(), image: null });
+      });
+    });
+  });
   if (!Array.isArray(data.legacyHonours)) data.legacyHonours = [];
   if (!data.historyPage || typeof data.historyPage !== "object") data.historyPage = { text: "", images: [] };
   if (typeof data.historyPage.text !== "string") data.historyPage.text = "";
@@ -713,12 +729,14 @@ function splitData(data) {
     historyBlob: { historyPage: data.historyPage },
     clubBlob: { clubLibrary: data.clubLibrary },
     rulesBlob: { rulesPage: data.rulesPage },
+    voiceBlob: { voiceNotes: data.voiceNotes },
+    blogBlob: { blogPage: data.blogPage },
   };
 }
 
 // The inverse of splitData — reconstructs the unified shape the rest of the
 // app expects from the 8 separately-loaded pieces.
-function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob = { clubLibrary: null }, rulesBlob = { rulesPage: null }) {
+function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob = { clubLibrary: null }, rulesBlob = { rulesPage: null }, blogBlob = { blogPage: null }, voiceBlob = { voiceNotes: null }) {
   const leagues = {};
   Object.keys(core.leagueMeta).forEach((key) => {
     const roster = rosterBlob.leagues[key]?.participants ?? [];
@@ -737,6 +755,8 @@ function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsB
     // Prefer the dedicated key; fall back to the brief early spot inside the
     // history blob (v24) in case rules were written there and not yet wiped.
     rulesPage: rulesBlob.rulesPage ?? historyBlob.rulesPage ?? { text: "" },
+    voiceNotes: voiceBlob.voiceNotes ?? {},
+    blogPage: blogBlob.blogPage ?? { articles: [] },
     clubLibrary: clubBlob.clubLibrary ?? { crests: [], colors: [] },
     accounts: accountsBlob.accounts ?? {},
     predictions: predictionsBlob.predictions ?? {},
@@ -779,7 +799,7 @@ async function setWithRetry(key, json, attempts = 3, delayMs = 400) {
 }
 
 async function writeSplitData(data) {
-  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob, rulesBlob } = splitData(data);
+  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob, rulesBlob, blogBlob, voiceBlob } = splitData(data);
   // Named entries, written one at a time (not all at once) — sequencing
   // keeps write bursts gentle on the backend and makes failures easier to
   // attribute. Still independent of each other: one failing doesn't stop
@@ -795,6 +815,8 @@ async function writeSplitData(data) {
     ["history page", HISTORY_KEY, historyBlob],
     ["club library", CLUB_KEY, clubBlob],
     ["rules page", RULES_KEY, rulesBlob],
+    ["blog page", BLOG_KEY, blogBlob],
+    ["voice index", VOICE_INDEX_KEY, voiceBlob],
   ];
   const failed = [];
   for (const [label, key, blob] of entries) {
@@ -1011,6 +1033,8 @@ function ForecastRoomApp() {
         const historyRes = await window.storage.get(HISTORY_KEY, true);
         const clubRes = await window.storage.get(CLUB_KEY, true);
         const rulesRes = await window.storage.get(RULES_KEY, true);
+        const blogRes = await window.storage.get(BLOG_KEY, true);
+        const voiceRes = await window.storage.get(VOICE_INDEX_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         if (cancelled) return;
         // Remember which save-version this data came from — every future
@@ -1031,7 +1055,9 @@ function ForecastRoomApp() {
             badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
             historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
             clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null },
-            rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null }
+            rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null },
+            blogRes && blogRes.value ? JSON.parse(blogRes.value) : { blogPage: null },
+            voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null }
           );
           setData(migrateData(merged));
           return;
@@ -1264,6 +1290,8 @@ function ForecastRoomApp() {
         const historyRes = await window.storage.get(HISTORY_KEY, true);
         const clubRes = await window.storage.get(CLUB_KEY, true);
         const rulesRes = await window.storage.get(RULES_KEY, true);
+        const blogRes = await window.storage.get(BLOG_KEY, true);
+        const voiceRes = await window.storage.get(VOICE_INDEX_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         const parsedCore = JSON.parse(coreRes.value);
         markIfOutdated(parsedCore);
@@ -1277,7 +1305,9 @@ function ForecastRoomApp() {
           badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
           historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
           clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null },
-          rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null }
+          rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null },
+          blogRes && blogRes.value ? JSON.parse(blogRes.value) : { blogPage: null },
+          voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null }
         ));
         revRef.current = revRes && revRes.value ? revRes.value : null;
         setData(merged);
@@ -1518,11 +1548,23 @@ function ForecastRoomApp() {
           >
             <BookOpen size={13} /> Rules
           </button>
+          <button
+            onClick={() => setGlobalView(globalView === "blog" ? null : "blog")}
+            className={cx(
+              "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5 transition-colors",
+              globalView === "blog" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+            )}
+          >
+            <Newspaper size={13} /> Blog
+          </button>
         </div>
 
         {/* The current division's signature colour, as a strip under the banner. */}
         <div style={{ height: 4, background: leagueAccent(safeLeagueKey) }} />
       </div>
+
+      {/* Voice-note stop ribbon: pinned bottom on every page while a note plays. */}
+      <VoiceRibbon />
 
       {saveError && (
         <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-4">
@@ -1555,6 +1597,8 @@ function ForecastRoomApp() {
         <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><HistoryView data={data} adminMode={adminMode} persist={persist} /></main>
       ) : globalView === "rules" ? (
         <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><RulesView data={data} adminMode={adminMode} persist={persist} /></main>
+      ) : globalView === "blog" ? (
+        <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><BlogView data={data} adminMode={adminMode} persist={persist} /></main>
       ) : (
         <AppTabs
           league={league}
@@ -2038,8 +2082,8 @@ function SubmitView({ league, leagueKey, data, viewerId, submitPredictions, pers
                     <div className="text-xs font-semibold text-amber-300 uppercase tracking-wide flex items-center gap-1.5"><Landmark size={12} /> Your home match — pick your own</div>
                     <p className="text-[11px] text-stone-500">
                       {leagueKey === "league1"
-                        ? "You can only change this match to another Premier League match."
-                        : "You can change this match to any match from the Premier League down to the National League."}
+                        ? "You can only change this match to another Premier League match. Friday night matches can't be chosen as your free selection game."
+                        : "You can change this match to any match from the Premier League down to the National League. Friday night matches can't be chosen as your free selection game."}
                     </p>
                     <div className="flex flex-wrap items-center gap-2">
                       <input
@@ -2477,6 +2521,227 @@ function HistorySections({ text }) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// VOICE NOTES — a short admin-recorded audio roundup per matchday, played
+// from the Predictions Matrix. Each note lives in its OWN storage key,
+// fetched only when someone presses play (so notes add nothing to normal
+// page loads), with a small index at VOICE_INDEX_KEY. Notes expire after
+// 7 days: expired notes disappear for contestants immediately, and their
+// storage is reclaimed (value overwritten empty) next time admin visits.
+// The player itself is a tiny module-level singleton so audio keeps
+// playing while the person scrolls and moves between tabs, with a stop
+// ribbon pinned to the bottom of the screen wherever they are.
+// -----------------------------------------------------------------------------
+const VOICE_INDEX_KEY = "plp-2026-27-voice-index-v1";
+const voiceNoteKey = (mdId) => `plp-2026-27-voice-note-${mdId}`;
+const VOICE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const voiceNoteFresh = (entry) => entry && entry.addedAt && (Date.now() - new Date(entry.addedAt).getTime()) < VOICE_MAX_AGE_MS;
+
+const voicePlayer = {
+  audio: null,
+  current: null, // { mdId, label }
+  loading: null, // mdId being fetched
+  listeners: new Set(),
+  notify() { this.listeners.forEach((fn) => fn()); },
+  subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
+  async play(mdId, label) {
+    this.stop();
+    this.loading = mdId;
+    this.notify();
+    try {
+      const res = await window.storage.get(voiceNoteKey(mdId), true);
+      const dataUrl = res && res.value ? res.value : null;
+      if (!dataUrl) { this.loading = null; this.notify(); return; }
+      const audio = new Audio(dataUrl);
+      audio.onended = () => { this.current = null; this.audio = null; this.notify(); };
+      await audio.play();
+      this.audio = audio;
+      this.current = { mdId, label };
+    } catch { /* autoplay refused or fetch failed — nothing plays */ }
+    this.loading = null;
+    this.notify();
+  },
+  stop() {
+    if (this.audio) { try { this.audio.pause(); } catch (e) { /* already stopped */ } }
+    this.audio = null;
+    this.current = null;
+    this.notify();
+  },
+};
+
+function useVoicePlayer() {
+  const [, force] = useState(0);
+  useEffect(() => voicePlayer.subscribe(() => force((x) => x + 1)), []);
+  return voicePlayer;
+}
+
+// The stop ribbon: pinned to the bottom of the screen while a note plays,
+// on every page and tab, so stopping is always one tap away.
+function VoiceRibbon() {
+  const player = useVoicePlayer();
+  if (!player.current) return null;
+  return (
+    <div className="fixed bottom-0 inset-x-0 z-50 flex justify-center pointer-events-none">
+      <div className="pointer-events-auto flex items-center gap-3 bg-stone-900 text-white rounded-t-xl px-4 py-2.5 shadow-lg">
+        <Mic size={14} className="text-amber-400 shrink-0" />
+        <span className="text-xs font-medium truncate max-w-[220px]">{player.current.label} — voice note</span>
+        <button onClick={() => player.stop()} className="bg-white/15 hover:bg-white/25 rounded-lg p-1.5" title="Stop">
+          <Square size={12} fill="currentColor" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// The play/stop control at the top of a published matchday in the
+// Predictions Matrix. One tap plays (audio keeps going while they browse
+// and switch tabs); the icon flips to a square stop button while playing.
+function VoiceNoteButton({ mdId, label }) {
+  const player = useVoicePlayer();
+  const playingThis = player.current && player.current.mdId === mdId;
+  const loadingThis = player.loading === mdId;
+  return (
+    <button
+      onClick={() => (playingThis ? player.stop() : player.play(mdId, label))}
+      disabled={loadingThis}
+      className={cx(
+        "flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold border mb-3",
+        playingThis ? "bg-stone-900 text-white border-stone-900" : "bg-amber-400/15 hover:bg-amber-400/25 border-amber-400/40 text-amber-600"
+      )}
+      title={playingThis ? "Stop the voice note" : "Hear the weekend's voice note"}
+    >
+      {playingThis ? <Square size={12} fill="currentColor" /> : <Mic size={13} />}
+      {loadingThis ? "Loading…" : playingThis ? "Stop voice note" : "Play voice note"}
+    </button>
+  );
+}
+
+// The Blog tab — matchday previews and reviews as a list of ARTICLES
+// (newest first), each with a title, date, optional small image, and body.
+// Articles rather than one big text box: each stays readable and each
+// addition is a small save, however long the season runs.
+function BlogView({ data, adminMode, persist }) {
+  const articles = data.blogPage?.articles ?? [];
+  const [openId, setOpenId] = useState(null);
+  const [editingId, setEditingId] = useState(null); // null = adding new
+  const [showForm, setShowForm] = useState(false);
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [image, setImage] = useState(null);
+  const [error, setError] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const fileRef = useRef(null);
+  const blogSizeKB = Math.round(JSON.stringify(data.blogPage ?? {}).length / 1024);
+
+  const startAdd = () => { setEditingId(null); setTitle(""); setBody(""); setImage(null); setError(""); setShowForm(true); };
+  const startEdit = (a) => { setEditingId(a.id); setTitle(a.title); setBody(a.body); setImage(a.image ?? null); setError(""); setShowForm(true); };
+
+  const handleImage = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      setImage(await resizeImageFile(file, 480)); // small on purpose — a few tens of KB
+    } catch { setError("Couldn't read that image — try a different file."); }
+  };
+
+  const save = async () => {
+    if (!title.trim() || !body.trim()) { setError("Give the article a title and some text."); return; }
+    setError("");
+    const next = editingId
+      ? articles.map((a) => (a.id === editingId ? { ...a, title: title.trim(), body: body.trim(), image } : a))
+      : [{ id: `art_${Date.now()}`, date: new Date().toISOString(), title: title.trim(), body: body.trim(), image }, ...articles];
+    const ok = await persist({ ...data, blogPage: { articles: next } });
+    if (!ok) { setError("That didn't save — refresh this page and try again. Everything you wrote is still here."); return; }
+    setShowForm(false); setEditingId(null); setTitle(""); setBody(""); setImage(null);
+  };
+
+  const remove = async (id) => {
+    const ok = await persist({ ...data, blogPage: { articles: articles.filter((a) => a.id !== id) } });
+    if (ok) setConfirmDeleteId(null);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Newspaper size={18} className="text-amber-400" /> Blog</h2>
+        {adminMode && !showForm && (
+          <button onClick={startAdd} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+            <Plus size={15} /> New article
+          </button>
+        )}
+      </div>
+
+      {adminMode && showForm && (
+        <div className="border border-stone-200 rounded-2xl bg-white p-5 space-y-3">
+          <h3 className="font-display font-semibold text-sm">{editingId ? "Edit article" : "New article"}</h3>
+          {error && (
+            <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+              <AlertCircle size={16} /> {error}
+            </div>
+          )}
+          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title — e.g. Matchday 2: The Preview" className="w-full bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={10} placeholder="The article itself…" className="w-full bg-stone-50 border border-stone-300 rounded-lg px-3 py-2 text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+          <div className="flex flex-wrap items-center gap-2">
+            <button onClick={() => fileRef.current?.click()} className="flex items-center gap-1.5 text-xs bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 font-medium">
+              {image ? <img src={image} alt="" className="w-5 h-5 object-cover rounded" /> : <Upload size={13} />}
+              {image ? "Image attached" : "Add an image (optional)"}
+            </button>
+            <input ref={fileRef} type="file" accept="image/*" onChange={handleImage} className="hidden" />
+            {image && <button onClick={() => setImage(null)} className="text-xs text-stone-500 hover:text-rose-600">Remove image</button>}
+            <span className="text-[11px] text-stone-400 ml-auto">Blog size so far: ~{blogSizeKB}KB</span>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={save} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm">
+              {editingId ? "Update article" : "Publish article"}
+            </button>
+            <button onClick={() => { setShowForm(false); setEditingId(null); }} className="text-sm text-stone-500 hover:text-stone-900 px-2">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {articles.length === 0 && !showForm ? (
+        <div className="border border-stone-200 rounded-2xl bg-white p-5">
+          <p className="text-sm text-stone-500">{adminMode ? "No articles yet — click New article to write the first roundup." : "No articles yet — check back around the next matchday."}</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {articles.map((a) => {
+            const open = openId === a.id;
+            return (
+              <article key={a.id} className="border border-stone-200 rounded-2xl bg-white overflow-hidden">
+                <button onClick={() => setOpenId(open ? null : a.id)} className="w-full flex items-center justify-between gap-3 px-5 py-3.5 text-left hover:bg-stone-50">
+                  <span className="min-w-0">
+                    <span className="block font-display font-bold text-stone-900 leading-tight">{a.title}</span>
+                    <span className="block text-[11px] text-stone-400 mt-0.5">{fmtDateOnly(a.date)} · By Admin</span>
+                  </span>
+                  <span className="text-stone-500 text-xs shrink-0">{open ? "Hide \u25B4" : "Read \u25BE"}</span>
+                </button>
+                {open && (
+                  <div className="px-5 pb-5 border-t border-stone-100 pt-4 space-y-3">
+                    {a.image && <img src={a.image} alt="" className="rounded-xl border border-stone-200 max-h-64 object-cover" />}
+                    <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{a.body}</p>
+                    {adminMode && (
+                      <div className="flex gap-3 pt-1">
+                        <button onClick={() => startEdit(a)} className="text-xs text-stone-500 hover:text-stone-900">Edit</button>
+                        {confirmDeleteId === a.id ? (
+                          <button onClick={() => remove(a.id)} className="text-xs text-rose-600 font-semibold">Confirm delete?</button>
+                        ) : (
+                          <button onClick={() => setConfirmDeleteId(a.id)} className="text-xs text-stone-500 hover:text-rose-600">Delete</button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -2985,31 +3250,14 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                 {released ? "revealed to everyone" : `hides other picks until ${fmtDateTime(md.releaseAt)}`}
               </span>
             </div>
+            {md.resultsPublished && voiceNoteFresh(data.voiceNotes?.[md.id]) && (
+              <VoiceNoteButton mdId={md.id} label={md.label} />
+            )}
             {md.pairings && (
               <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} clubLibrary={data.clubLibrary} />
             )}
-            {/* Opening blog: from the reveal time until results are published.
-                Closing blog: from publish onward. Admin sees both, always. */}
-            {(adminMode || (released && !md.resultsPublished)) && md.blog && md.blog.trim() && (
-              <article className="border border-amber-400/20 bg-amber-400/5 rounded-2xl p-5">
-                <div className="text-[10px] font-semibold text-amber-500 uppercase tracking-[0.2em] mb-1">Matchday programme</div>
-                <h4 className="font-display font-bold text-lg text-stone-900 leading-tight">
-                  {md.label}{md.scheduledDate ? ` · ${fmtDateOnly(md.scheduledDate)}` : ""}
-                </h4>
-                <div className="text-[11px] text-stone-400 mb-3 pb-2 border-b border-amber-400/20">By Admin</div>
-                <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.blog}</p>
-              </article>
-            )}
-            {(adminMode || md.resultsPublished) && md.closingBlog && md.closingBlog.trim() && (
-              <article className="border border-violet-700/20 bg-violet-700/5 rounded-2xl p-5">
-                <div className="text-[10px] font-semibold text-violet-700 uppercase tracking-[0.2em] mb-1">The full-time review</div>
-                <h4 className="font-display font-bold text-lg text-stone-900 leading-tight">
-                  {md.label}{md.scheduledDate ? ` · ${fmtDateOnly(md.scheduledDate)}` : ""}
-                </h4>
-                <div className="text-[11px] text-stone-400 mb-3 pb-2 border-b border-violet-700/20">By Admin</div>
-                <p className="text-sm text-stone-800 leading-relaxed whitespace-pre-line">{md.closingBlog}</p>
-              </article>
-            )}
+            {/* Matchday write-ups moved to the Blog tab (v30) — stored blog
+                text on old matchdays is untouched, just no longer shown here. */}
             {md.pairings && (
               <button
                 onClick={() => setOpenTables((t) => ({ ...t, [md.id]: !t[md.id] }))}
@@ -4356,6 +4604,41 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
     return updateLeague({ matchdays: league.matchdays.map((md) => (md.id === mdId ? { ...md, ...patch } : md)) });
   };
 
+  // VOICE NOTES: the audio itself is written straight to its own storage
+  // key (fetched lazily at play time); only the tiny index rides in the
+  // normal data. dataUrl === null removes a note and reclaims its space.
+  const setVoiceNote = async (mdId, dataUrl) => {
+    try {
+      await window.storage.set(voiceNoteKey(mdId), dataUrl || "", true);
+    } catch {
+      return false; // audio write failed — don't advertise a note that isn't there
+    }
+    const nextNotes = { ...data.voiceNotes };
+    if (dataUrl) nextNotes[mdId] = { addedAt: new Date().toISOString() };
+    else delete nextNotes[mdId];
+    if (!dataUrl && voicePlayer.current && voicePlayer.current.mdId === mdId) voicePlayer.stop();
+    return persist({ ...data, voiceNotes: nextNotes });
+  };
+
+  // Housekeeping: notes older than 7 days vanish for contestants on their
+  // own (voiceNoteFresh gates every play button); their storage is
+  // reclaimed here whenever admin visits. One pass per session.
+  const voiceCleanupRan = useRef(false);
+  useEffect(() => {
+    if (voiceCleanupRan.current) return;
+    const expired = Object.entries(data.voiceNotes || {}).filter(([, entry]) => !voiceNoteFresh(entry)).map(([id]) => id);
+    if (expired.length === 0) return;
+    voiceCleanupRan.current = true;
+    (async () => {
+      for (const id of expired) {
+        try { await window.storage.set(voiceNoteKey(id), "", true); } catch { /* retry next visit */ }
+      }
+      const nextNotes = { ...data.voiceNotes };
+      expired.forEach((id) => delete nextNotes[id]);
+      persist({ ...data, voiceNotes: nextNotes });
+    })();
+  }, []);
+
   const addMatchday = async (md) => {
     const ok = await updateLeague({ matchdays: [...league.matchdays, md] });
     if (ok === false) return false; // refused save — the form stays open with everything typed intact
@@ -4497,6 +4780,14 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       <section className="space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Settings2 size={18} className="text-amber-400" /> Matchdays</h2>
+          {league.matchdays.length > 1 && (
+            <button
+              onClick={() => document.getElementById(`md-admin-${league.matchdays[league.matchdays.length - 1].id}`)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+              className="flex items-center gap-1.5 bg-amber-400/15 hover:bg-amber-400/25 border border-amber-400/40 text-amber-600 rounded-lg px-3 py-1.5 text-sm font-medium"
+            >
+              Jump to latest matchday ↓
+            </button>
+          )}
           <button onClick={() => setShowNewMatchday((s) => !s)} className="flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">
             <Plus size={15} /> New matchday manually
           </button>
@@ -4505,13 +4796,16 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
         {showNewMatchday && <NewMatchdayForm league={league} onCreate={addMatchday} onCancel={() => setShowNewMatchday(false)} />}
 
         {league.matchdays.map((md) => (
-          <MatchdayAdminCard
-            key={md.id}
-            matchday={md}
-            participants={league.participants}
-            predictions={data.predictions}
-            onUpdate={(patch) => updateMatchday(md.id, patch)}
-          />
+          <div key={md.id} id={`md-admin-${md.id}`}>
+            <MatchdayAdminCard
+              matchday={md}
+              participants={league.participants}
+              predictions={data.predictions}
+              onUpdate={(patch) => updateMatchday(md.id, patch)}
+              voiceNote={data.voiceNotes?.[md.id] ?? null}
+              onSetVoiceNote={(dataUrl) => setVoiceNote(md.id, dataUrl)}
+            />
+          </div>
         ))}
       </section>
     </div>
@@ -4720,15 +5014,36 @@ function FixturePoolCard({ pool, onAdd, onRemove, onGenerate }) {
   );
 }
 
-function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
+function MatchdayAdminCard({ matchday, participants, predictions, onUpdate, voiceNote, onSetVoiceNote }) {
   const [label, setLabel] = useState(matchday.label);
   const [scheduledDate, setScheduledDate] = useState(matchday.scheduledDate ? matchday.scheduledDate.slice(0, 10) : "");
   const [releaseAt, setReleaseAt] = useState(toLocalInputValue(matchday.releaseAt));
   const [predictionsCloseAt, setPredictionsCloseAt] = useState(toLocalInputValue(matchday.predictionsCloseAt));
   const [locked, setLocked] = useState(matchday.locked);
   const [scoring, setScoring] = useState(matchday.scoring);
-  const [blog, setBlog] = useState(matchday.blog || "");
-  const [closingBlog, setClosingBlog] = useState(matchday.closingBlog || "");
+  const voiceFileRef = useRef(null);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceError, setVoiceError] = useState("");
+  const handleVoiceFile = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setVoiceError("");
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const dataUrl = reader.result;
+      if (typeof dataUrl !== "string" || dataUrl.length > 1_650_000) {
+        setVoiceError("That file is too large — export at a lower bitrate (a 60–90s MP3 at 64–96kbps fits easily).");
+        return;
+      }
+      setVoiceBusy(true);
+      const ok = await onSetVoiceNote(dataUrl);
+      if (ok === false) setVoiceError("Couldn't save the voice note — check your connection and try again.");
+      setVoiceBusy(false);
+    };
+    reader.onerror = () => setVoiceError("Couldn't read that file — try a different one.");
+    reader.readAsDataURL(file);
+  };
   const [matches, setMatches] = useState(matchday.matches.map((m) => ({ ...m, outcomeHome: m.outcome?.home ?? "", outcomeAway: m.outcome?.away ?? "" })));
   const [freeMatchIndex, setFreeMatchIndex] = useState(matchday.freeMatchIndex ?? null);
   const [customOutcomes, setCustomOutcomes] = useState(() => {
@@ -4808,8 +5123,6 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
       predictionsCloseAt: predictionsCloseAt ? new Date(predictionsCloseAt).toISOString() : null,
       locked,
       scoring,
-      blog,
-      closingBlog,
       matches: nextMatches,
       freeMatchIndex: matchday.bonanza ? null : freeMatchIndex,
       customMatches: nextCustomMatches,
@@ -4826,7 +5139,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
   // mount and refreshed on each successful save. While the live form still
   // matches the last-saved snapshot the button shows a grey "Saved"; the
   // moment anything is edited it turns purple again.
-  const formSnapshot = JSON.stringify({ label, scheduledDate, releaseAt, predictionsCloseAt, locked, scoring, blog, closingBlog, freeMatchIndex, matches, customOutcomes, bonanzaOutcomes });
+  const formSnapshot = JSON.stringify({ label, scheduledDate, releaseAt, predictionsCloseAt, locked, scoring, freeMatchIndex, matches, customOutcomes, bonanzaOutcomes });
   const [savedSnapshot, setSavedSnapshot] = useState(formSnapshot);
   const dirty = formSnapshot !== savedSnapshot;
 
@@ -4918,26 +5231,28 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate }) {
         </div>
       </div>
 
-      <div>
-        <label className="text-xs text-stone-500">Opening blog (private until picks are revealed above; shows until results are published)</label>
-        <textarea
-          value={blog}
-          onChange={(e) => setBlog(e.target.value)}
-          rows={3}
-          placeholder="Your preview for this matchday — only you can see this until the reveal time above, then it appears alongside the Predictions Matrix until the results go out."
-          className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
-        />
-      </div>
-
-      <div>
-        <label className="text-xs text-stone-500">Closing blog (private until results are published — then it replaces the opening blog)</label>
-        <textarea
-          value={closingBlog}
-          onChange={(e) => setClosingBlog(e.target.value)}
-          rows={3}
-          placeholder="Your review of how the matchday went — write it as you enter the results; it appears alongside the Predictions Matrix the moment you publish."
-          className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50"
-        />
+      {/* Matchday previews and reviews now live in the Blog tab (articles).
+          In their place: the weekend voice note. */}
+      <div className="border border-stone-200 rounded-xl p-3 space-y-2 bg-stone-50">
+        <label className="text-xs font-semibold text-stone-600 flex items-center gap-1.5"><Mic size={13} className="text-amber-500" /> Voice note (plays from the Predictions Matrix once results are published)</label>
+        {voiceNote && voiceNoteFresh(voiceNote) ? (
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="text-emerald-700 text-xs font-medium inline-flex items-center gap-1"><CheckCircle2 size={12} /> Voice note attached · added {fmtDateOnly(voiceNote.addedAt)}</span>
+            <button onClick={() => (voicePlayer.current && voicePlayer.current.mdId === matchday.id ? voicePlayer.stop() : voicePlayer.play(matchday.id, matchday.label))} className="text-xs bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-2.5 py-1.5 font-medium">Listen</button>
+            <button onClick={async () => { setVoiceBusy(true); await onSetVoiceNote(null); setVoiceBusy(false); }} disabled={voiceBusy} className="text-xs text-stone-500 hover:text-rose-600 disabled:opacity-50">Remove</button>
+          </div>
+        ) : (
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <button onClick={() => voiceFileRef.current?.click()} disabled={voiceBusy} className="flex items-center gap-1.5 text-xs bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 font-medium disabled:opacity-50">
+                <Upload size={13} /> {voiceBusy ? "Uploading…" : "Upload voice note (60–90s)"}
+              </button>
+              <input ref={voiceFileRef} type="file" accept="audio/*" onChange={handleVoiceFile} className="hidden" />
+              {voiceError && <span className="text-xs text-rose-600">{voiceError}</span>}
+            </div>
+            <p className="text-[11px] text-stone-400">MP3 at a modest bitrate keeps it small — up to ~1.2MB. Notes expire after 7 days to keep the site lean.</p>
+          </div>
+        )}
       </div>
 
       <div>
@@ -5412,6 +5727,30 @@ async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZon
   ctx.font = "500 13px Inter, ui-sans-serif, sans-serif";
   ctx.fillText(`Season ${seasonLabel} · Standings`, 110, 84);
 
+  // Column headers, spread across the card.
+  ctx.fillStyle = "rgba(251,191,36,0.9)";
+  ctx.font = "600 11px Inter, ui-sans-serif, sans-serif";
+  ctx.fillText("#", 30, headerH - 10);
+  ctx.fillText("CONTESTANT", 88, headerH - 10);
+  ctx.textAlign = "right";
+  ctx.fillText("W", 482, headerH - 10);
+  ctx.fillText("D", 538, headerH - 10);
+  ctx.fillText("L", 594, headerH - 10);
+  ctx.fillText("+/−", 662, headerH - 10);
+  ctx.fillText("PTS", width - 34, headerH - 10);
+  ctx.textAlign = "left";
+
+  // Contestant badges, pre-loaded (best-effort — a row without a badge
+  // gets an initial in a circle instead).
+  const badgeById = {};
+  await Promise.all(league.participants.map((p) => new Promise((done) => {
+    if (!p.badge) { done(); return; }
+    const img = new Image();
+    img.onload = () => { badgeById[p.id] = img; done(); };
+    img.onerror = () => done();
+    img.src = p.badge;
+  })));
+
   const ZONE_FILLS = {
     "bg-amber-400/5": "rgba(251,191,36,0.14)",
     "bg-yellow-200/20": "rgba(253,224,71,0.14)",
@@ -5429,15 +5768,42 @@ async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZon
     ctx.font = "600 14px 'JetBrains Mono', ui-monospace, monospace";
     ctx.fillText(`#${row.rank}`, 30, y + 27);
 
+    // Badge (or an initial in a circle when the contestant has none)
+    const cx0 = 66, cy0 = y + rowH / 2, r = 13;
+    const badgeImg = badgeById[row.id];
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx0, cy0, r, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.fill();
+    if (badgeImg) {
+      ctx.clip();
+      const s = Math.min((r * 2) / badgeImg.width, (r * 2) / badgeImg.height);
+      const dw = badgeImg.width * s, dh = badgeImg.height * s;
+      ctx.drawImage(badgeImg, cx0 - dw / 2, cy0 - dh / 2, dw, dh);
+    }
+    ctx.restore();
+    if (!badgeImg) {
+      ctx.fillStyle = "#3D1F5C";
+      ctx.font = "700 13px Inter, ui-sans-serif, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText((row.name || "?")[0].toUpperCase(), cx0, cy0 + 5);
+      ctx.textAlign = "left";
+    }
+
     ctx.fillStyle = "#FFFFFF";
     ctx.font = "600 16px Inter, ui-sans-serif, sans-serif";
-    ctx.fillText(row.name, 78, y + 27);
+    ctx.fillText(row.name, 88, y + 27);
 
+    // W / D / L spread as their own columns, then score difference and points
     ctx.textAlign = "right";
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
     ctx.font = "500 14px 'JetBrains Mono', ui-monospace, monospace";
-    ctx.fillText(`${row.wins}-${row.draws}-${row.losses}`, width - 190, y + 27);
-    ctx.fillText(`${row.scoreDifference > 0 ? "+" : ""}${row.scoreDifference}`, width - 110, y + 27);
+    ctx.fillText(String(row.wins), 482, y + 27);
+    ctx.fillText(String(row.draws), 538, y + 27);
+    ctx.fillText(String(row.losses), 594, y + 27);
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillText(`${row.scoreDifference > 0 ? "+" : ""}${row.scoreDifference}`, 662, y + 27);
     ctx.fillStyle = accent;
     ctx.font = "700 20px Oswald, ui-sans-serif, sans-serif";
     ctx.fillText(String(row.leaguePoints), width - 34, y + 29);
@@ -6156,6 +6522,15 @@ function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadDa
                   >
                     <BookOpen size={13} /> Rules
                   </button>
+                  <button
+                    onClick={() => setAdminGlobalView(adminGlobalView === "blog" ? null : "blog")}
+                    className={cx(
+                      "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5",
+                      adminGlobalView === "blog" ? "bg-amber-400 text-black border-amber-400" : "border-amber-400/40 text-amber-300 hover:border-amber-400"
+                    )}
+                  >
+                    <Newspaper size={13} /> Blog
+                  </button>
                 </div>
                 <button
                   onClick={() => setAdminUnlocked(false)}
@@ -6171,6 +6546,7 @@ function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadDa
           </div>
         </div>
         <div className="max-w-5xl mx-auto px-4 py-6 space-y-6">
+          <VoiceRibbon />
           {saveError && (
             <div className="flex items-center gap-2 bg-rose-50 border border-rose-300 text-rose-700 text-sm rounded-lg px-4 py-2.5">
               <AlertCircle size={16} className="shrink-0" />
@@ -6184,6 +6560,8 @@ function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadDa
             <HistoryView data={data} adminMode persist={persist} />
           ) : adminGlobalView === "rules" ? (
             <RulesView data={data} adminMode persist={persist} />
+          ) : adminGlobalView === "blog" ? (
+            <BlogView data={data} adminMode persist={persist} />
           ) : (
             <AppTabs
               league={league}
