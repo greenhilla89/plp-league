@@ -5693,7 +5693,7 @@ function suggestNextSeasonLabel(label) {
 // person always chooses the destination.
 async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZoneClass) {
   const width = 760;
-  const headerH = 128;
+  const headerH = 152; // tall enough that the logo and column headers never touch
   const rowH = 42;
   const footerH = 44;
   const height = headerH + board.length * rowH + footerH;
@@ -5714,7 +5714,7 @@ async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZon
       i.onerror = reject;
       i.src = "/plp-logo.png";
     });
-    const lh = 96;
+    const lh = 84;
     ctx.drawImage(img, 24, 16, img.width * (lh / img.height), lh);
   } catch { /* no logo, no problem */ }
 
@@ -5730,14 +5730,14 @@ async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZon
   // Column headers, spread across the card.
   ctx.fillStyle = "rgba(251,191,36,0.9)";
   ctx.font = "600 11px Inter, ui-sans-serif, sans-serif";
-  ctx.fillText("#", 30, headerH - 10);
-  ctx.fillText("CONTESTANT", 88, headerH - 10);
+  ctx.fillText("#", 30, headerH - 14);
+  ctx.fillText("CONTESTANT", 106, headerH - 14);
   ctx.textAlign = "right";
-  ctx.fillText("W", 482, headerH - 10);
-  ctx.fillText("D", 538, headerH - 10);
-  ctx.fillText("L", 594, headerH - 10);
-  ctx.fillText("+/−", 662, headerH - 10);
-  ctx.fillText("PTS", width - 34, headerH - 10);
+  ctx.fillText("W", 482, headerH - 14);
+  ctx.fillText("D", 538, headerH - 14);
+  ctx.fillText("L", 594, headerH - 14);
+  ctx.fillText("+/−", 662, headerH - 14);
+  ctx.fillText("PTS", width - 34, headerH - 14);
   ctx.textAlign = "left";
 
   // Contestant badges, pre-loaded (best-effort — a row without a badge
@@ -5769,7 +5769,7 @@ async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZon
     ctx.fillText(`#${row.rank}`, 30, y + 27);
 
     // Badge (or an initial in a circle when the contestant has none)
-    const cx0 = 66, cy0 = y + rowH / 2, r = 13;
+    const cx0 = 84, cy0 = y + rowH / 2, r = 13; // right of the widest rank ("#20"), never touching it
     const badgeImg = badgeById[row.id];
     ctx.save();
     ctx.beginPath();
@@ -5793,7 +5793,7 @@ async function buildStandingsImage(league, leagueKey, seasonLabel, board, rowZon
 
     ctx.fillStyle = "#FFFFFF";
     ctx.font = "600 16px Inter, ui-sans-serif, sans-serif";
-    ctx.fillText(row.name, 88, y + 27);
+    ctx.fillText(row.name, 106, y + 27);
 
     // W / D / L spread as their own columns, then score difference and points
     ctx.textAlign = "right";
