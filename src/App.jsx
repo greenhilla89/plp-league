@@ -547,6 +547,14 @@ function computeH2HResultsForMatchday(matchday, predictions, participants) {
 }
 
 
+// 1 -> "1st", 2 -> "2nd", 11 -> "11th" — for the little rank captions.
+function ordinalRank(n) {
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
+  const mod10 = n % 10;
+  return `${n}${mod10 === 1 ? "st" : mod10 === 2 ? "nd" : mod10 === 3 ? "rd" : "th"}`;
+}
+
 function isReleased(matchday, now) {
   if (!matchday.releaseAt) return false;
   return new Date(matchday.releaseAt).getTime() <= now;
@@ -1244,6 +1252,50 @@ function ForecastRoomApp() {
     return run;
   }, []);
 
+  // MATCHDAY SAVES (admin) — read-merge-write on the core key alone. While
+  // a round is live, every contestant submission bumps the save-version, so
+  // a full save from the admin's outcome-entry tab kept being refused as
+  // "stale" even though nothing actually conflicted (the button stayed
+  // purple mid-round). This path reads the freshest core, swaps in just
+  // the one matchday, and writes it back — outcome entry can never be
+  // blocked by contestants predicting at the same time.
+  const mergeMatchdayPatch = useCallback((targetLeagueKey, mdId, patch) => {
+    if (outdatedBuildRef.current) return Promise.resolve(false);
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const currentRev = await readRevValue();
+        const wasFresh = (revRef.current ?? null) === (currentRev ?? null);
+        const coreRes = await window.storage.get(CORE_KEY, true);
+        if (!coreRes || !coreRes.value) return false;
+        const core = JSON.parse(coreRes.value);
+        const meta = core.leagueMeta ? core.leagueMeta[targetLeagueKey] : null;
+        if (!meta || !Array.isArray(meta.matchdays) || !meta.matchdays.some((md) => md.id === mdId)) {
+          setSaveError("That matchday couldn't be found in the latest data — refresh the page and try again.");
+          return false;
+        }
+        meta.matchdays = meta.matchdays.map((md) => (md.id === mdId ? { ...md, ...patch } : md));
+        await window.storage.set(CORE_KEY, JSON.stringify(core), true);
+        try {
+          const newRev = nextRevValue(currentRev);
+          const claimed = await claimRev(currentRev, newRev);
+          if (claimed && wasFresh) revRef.current = newRev;
+        } catch { /* best-effort */ }
+        const prev = dataRef.current;
+        if (prev && prev.leagues[targetLeagueKey]) {
+          const nextLeague = { ...prev.leagues[targetLeagueKey], matchdays: prev.leagues[targetLeagueKey].matchdays.map((md) => (md.id === mdId ? { ...md, ...patch } : md)) };
+          setData({ ...prev, leagues: { ...prev.leagues, [targetLeagueKey]: nextLeague } });
+        }
+        setSaveError(null);
+        return true;
+      } catch {
+        setSaveError("That didn't save — check your connection and try again.");
+        return false;
+      }
+    });
+    persistQueueRef.current = run.then(() => undefined).catch(() => {});
+    return run;
+  }, []);
+
   // AUTO-REFRESH — re-reads everything from storage and adopts it. Used at
   // login (so signing in always starts from the latest data) and whenever
   // the page comes back into view (so a phone reopening the site from its
@@ -1339,9 +1391,16 @@ function ForecastRoomApp() {
     };
     document.addEventListener("visibilitychange", maybeRefresh);
     window.addEventListener("focus", maybeRefresh);
+    // A tab that stays open AND focused (admin entering results, say) never
+    // fires those events — so it silently aged while contestants were
+    // active earlier, and its full saves then got refused. This periodic
+    // check keeps even a never-blurred tab fresh; the tiny rev read makes
+    // it near-free, and the 15s throttle above still applies.
+    const interval = setInterval(maybeRefresh, 60000);
     return () => {
       document.removeEventListener("visibilitychange", maybeRefresh);
       window.removeEventListener("focus", maybeRefresh);
+      clearInterval(interval);
     };
   }, [reloadFromStorage]);
 
@@ -1469,6 +1528,7 @@ function ForecastRoomApp() {
         data={data}
         persist={persist}
         mergeProfileSave={mergeProfileSave}
+        mergeMatchdayPatch={mergeMatchdayPatch}
         registerAccount={registerAccount}
         reloadData={reloadFromStorage}
         onLogin={(user) => { setCurrentUser(user); setLeagueKey(user.leagueKey); }}
@@ -1606,6 +1666,7 @@ function ForecastRoomApp() {
           data={data}
           persist={persist}
           mergeProfileSave={mergeProfileSave}
+          mergeMatchdayPatch={mergeMatchdayPatch}
           submitPredictions={submitPredictions}
           viewerId={viewerId}
           adminMode={adminMode}
@@ -1741,8 +1802,14 @@ function TabButton({ icon: Icon, label, active, onClick, accent }) {
 // the PIN-only "admin access" panel on the login screen (no Submit tab,
 // since there's no contestant identity there, but everything else — the
 // Matrix, Standings, Profiles, Stats and Admin panel itself — is the same).
-function AppTabs({ league, leagueKey, data, persist, mergeProfileSave, submitPredictions, viewerId, adminMode, now, snapshots, onRestoreSnapshot, allowSubmit }) {
-  const [tab, setTab] = useState(allowSubmit ? "submit" : "matrix");
+function AppTabs({ league, leagueKey, data, persist, mergeProfileSave, mergeMatchdayPatch, submitPredictions, viewerId, adminMode, now, snapshots, onRestoreSnapshot, allowSubmit }) {
+  // Where the site opens: the Submit tab while there's a prediction window
+  // open (a nudge to get predictions in), otherwise the Predictions Matrix
+  // (the latest score cards). Evaluated when the person lands after login.
+  const hasOpenSubmission = allowSubmit && league.matchdays.some((md) =>
+    !md.draft && isReleased(md, now) && !md.locked && !md.resultsPublished && !isPredictionsClosed(md, now)
+  );
+  const [tab, setTab] = useState(allowSubmit && hasOpenSubmission ? "submit" : "matrix");
 
   // The Submit tab only exists in the division a contestant actually
   // predicts in. Other divisions are view-only (scores, standings,
@@ -1778,7 +1845,7 @@ function AppTabs({ league, leagueKey, data, persist, mergeProfileSave, submitPre
         {tab === "fixtures" && <FixtureListView league={league} viewerId={viewerId} />}
         {tab === "admin" && (
           adminMode
-            ? <AdminView league={league} leagueKey={leagueKey} data={data} persist={persist} snapshots={snapshots} onRestoreSnapshot={onRestoreSnapshot} now={now} />
+            ? <AdminView league={league} leagueKey={leagueKey} data={data} persist={persist} mergeMatchdayPatch={mergeMatchdayPatch} snapshots={snapshots} onRestoreSnapshot={onRestoreSnapshot} now={now} />
             : <LockedAdminNotice />
         )}
         {tab === "leaderboard" && <LeaderboardView league={league} leagueKey={leagueKey} data={data} />}
@@ -2941,6 +3008,10 @@ function HistoryView({ data, adminMode, persist }) {
 }
 
 function FixtureListView({ league, viewerId }) {
+  // Completed matchdays (results published) fold into one-line rows so the
+  // live or next matchday always sits at the top of the list — tap any
+  // folded row to expand it in place, and collapse it again from its header.
+  const [openCompleted, setOpenCompleted] = useState({});
   const nameById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.name])), [league.participants]);
   const stadiumById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.stadium])), [league.participants]);
   const byId = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p])), [league.participants]);
@@ -2967,12 +3038,34 @@ function FixtureListView({ league, viewerId }) {
           const label = md?.label ?? `Matchday ${i + 1}`;
           const statusText = md ? matchdayDisplayStatus(md) : "not yet scheduled";
           const statusStyle = md ? MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(md)] : "bg-white/5 text-stone-500 border-stone-300 border-dashed";
+          const completed = !!md?.resultsPublished;
+          if (completed && !openCompleted[i]) {
+            return (
+              <button
+                key={i}
+                onClick={() => setOpenCompleted((o) => ({ ...o, [i]: true }))}
+                className="w-full flex items-center justify-between gap-2 border border-stone-200 rounded-xl px-3 py-2 bg-stone-50 hover:bg-stone-100 text-left"
+              >
+                <span className="font-display font-semibold text-xs">{label}</span>
+                <span className="text-[10px] text-stone-500 flex items-center gap-2 shrink-0">
+                  {fmtDateOnly(round.scheduledDate)}
+                  <span className="text-emerald-600 inline-flex items-center gap-1"><CheckCircle2 size={11} /> completed</span>
+                  <span className="text-stone-400">expand ▾</span>
+                </span>
+              </button>
+            );
+          }
           return (
             <div key={i} className="border border-stone-200 rounded-xl p-3 bg-white">
               <div className="flex items-center justify-between mb-1">
                 <span className="font-display font-semibold text-sm">{label}</span>
-                <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", statusStyle)}>
-                  {statusText}
+                <span className="flex items-center gap-2">
+                  {completed && (
+                    <button onClick={() => setOpenCompleted((o) => ({ ...o, [i]: false }))} className="text-[10px] text-stone-400 hover:text-stone-600">collapse ▴</button>
+                  )}
+                  <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", statusStyle)}>
+                    {statusText}
+                  </span>
                 </span>
               </div>
               <div className="text-[11px] text-violet-700 flex items-center gap-1 mb-2">
@@ -3023,7 +3116,7 @@ function FixtureListView({ league, viewerId }) {
 // Once results are published, each prediction also shows the points it
 // earned, and the card footer shows the head-to-head outcome.
 // -----------------------------------------------------------------------------
-function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, now, clubLibrary }) {
+function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, now, clubLibrary, standingsById }) {
   if (!matchday.pairings) return null;
   const released = adminMode || isReleased(matchday, now);
   const canSeeResults = adminMode || matchday.resultsPublished;
@@ -3127,11 +3220,21 @@ function H2HPairingsPanel({ matchday, league, predictions, viewerId, adminMode, 
               <div className="flex items-center gap-2">
                 <div className="flex items-center gap-2 flex-1 min-w-0">
                   <BadgeAvatar participant={home} name={home?.name ?? "?"} size={26} />
-                  <span className={cx("font-medium text-sm truncate", pair.home === viewerId && "text-amber-600")}>{nameOf(pair.home)}</span>
+                  <div className="flex flex-col min-w-0">
+                    <span className={cx("font-medium text-sm truncate", pair.home === viewerId && "text-amber-600")}>{nameOf(pair.home)}</span>
+                    {standingsById?.[pair.home] && (
+                      <span className="text-[10px] text-stone-400 font-mono-num leading-tight">{ordinalRank(standingsById[pair.home].rank)} · {standingsById[pair.home].scoreDifference > 0 ? "+" : ""}{standingsById[pair.home].scoreDifference}</span>
+                    )}
+                  </div>
                 </div>
                 <span className="text-[10px] text-stone-400 font-display shrink-0">V</span>
                 <div className="flex items-center gap-2 flex-1 min-w-0 justify-end">
-                  <span className={cx("font-medium text-sm truncate text-right", pair.away === viewerId && "text-amber-600")}>{nameOf(pair.away)}</span>
+                  <div className="flex flex-col min-w-0 items-end">
+                    <span className={cx("font-medium text-sm truncate text-right", pair.away === viewerId && "text-amber-600")}>{nameOf(pair.away)}</span>
+                    {standingsById?.[pair.away] && (
+                      <span className="text-[10px] text-stone-400 font-mono-num leading-tight">{ordinalRank(standingsById[pair.away].rank)} · {standingsById[pair.away].scoreDifference > 0 ? "+" : ""}{standingsById[pair.away].scoreDifference}</span>
+                    )}
+                  </div>
                   <BadgeAvatar participant={away} name={away?.name ?? "?"} size={26} />
                 </div>
               </div>
@@ -3250,11 +3353,18 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                 {released ? "revealed to everyone" : `hides other picks until ${fmtDateTime(md.releaseAt)}`}
               </span>
             </div>
-            {md.resultsPublished && voiceNoteFresh(data.voiceNotes?.[md.id]) && (
-              <VoiceNoteButton mdId={md.id} label={md.label} />
+            {voiceNoteFresh(data.voiceNotes?.[md.id]) && (
+              md.resultsPublished ? (
+                <VoiceNoteButton mdId={md.id} label={md.label} />
+              ) : adminMode ? (
+                // Only admin sees this — contestants get the button when results publish.
+                <div className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium border border-stone-300 bg-stone-100 text-stone-500 mb-3">
+                  <Mic size={13} /> Voice note attached — the play button appears for everyone when results are published
+                </div>
+              ) : null
             )}
             {md.pairings && (
-              <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} clubLibrary={data.clubLibrary} />
+              <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} clubLibrary={data.clubLibrary} standingsById={boardById} />
             )}
             {/* Matchday write-ups moved to the Blog tab (v30) — stored blog
                 text on old matchdays is untouched, just no longer shown here. */}
@@ -4427,7 +4537,7 @@ function BulkAddParticipants({ disabled, onAdd }) {
   );
 }
 
-function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnapshot, now }) {
+function AdminView({ league, leagueKey, data, persist, mergeMatchdayPatch, snapshots, onRestoreSnapshot, now }) {
   const [showNewMatchday, setShowNewMatchday] = useState(false);
   const [newName, setNewName] = useState("");
   const [copiedId, setCopiedId] = useState(null);
@@ -4601,6 +4711,9 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
   };
 
   const updateMatchday = async (mdId, patch) => {
+    // Merge path when available (see mergeMatchdayPatch) — immune to the
+    // save-version moving while contestants submit predictions mid-round.
+    if (mergeMatchdayPatch) return mergeMatchdayPatch(leagueKey, mdId, patch);
     return updateLeague({ matchdays: league.matchdays.map((md) => (md.id === mdId ? { ...md, ...patch } : md)) });
   };
 
@@ -4699,6 +4812,14 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
 
   return (
     <div className="space-y-8">
+      {league.matchdays.length > 1 && (
+        <button
+          onClick={() => document.getElementById(`md-admin-${league.matchdays[league.matchdays.length - 1].id}`)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+          className="w-full flex items-center justify-center gap-1.5 bg-amber-400/15 hover:bg-amber-400/25 border border-amber-400/40 text-amber-600 rounded-xl px-3 py-2.5 text-sm font-semibold"
+        >
+          Jump to latest matchday ↓
+        </button>
+      )}
       <StorageUsageCard data={data} />
       <BackupsCard data={data} snapshots={snapshots} onRestoreSnapshot={onRestoreSnapshot} onDownload={downloadBackup} onImportBackup={importBackupFile} now={now} />
       <SeasonCard data={data} persist={persist} />
@@ -4780,14 +4901,7 @@ function AdminView({ league, leagueKey, data, persist, snapshots, onRestoreSnaps
       <section className="space-y-3">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Settings2 size={18} className="text-amber-400" /> Matchdays</h2>
-          {league.matchdays.length > 1 && (
-            <button
-              onClick={() => document.getElementById(`md-admin-${league.matchdays[league.matchdays.length - 1].id}`)?.scrollIntoView({ behavior: "smooth", block: "start" })}
-              className="flex items-center gap-1.5 bg-amber-400/15 hover:bg-amber-400/25 border border-amber-400/40 text-amber-600 rounded-lg px-3 py-1.5 text-sm font-medium"
-            >
-              Jump to latest matchday ↓
-            </button>
-          )}
+
           <button onClick={() => setShowNewMatchday((s) => !s)} className="flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-1.5 text-sm font-medium">
             <Plus size={15} /> New matchday manually
           </button>
@@ -5065,6 +5179,7 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate, voic
     return out;
   });
   const [saved, setSaved] = useState(false);
+  const [saveNote, setSaveNote] = useState(""); // inline save-failure message — the top banner alone was too easy to miss mid-scroll
 
   const setMatchField = (idx, field, val) =>
     setMatches((arr) => arr.map((m, i) => (i === idx ? { ...m, [field]: val } : m)));
@@ -5089,6 +5204,8 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate, voic
   };
 
   const save = async () => {
+    setSaveNote("");
+    try {
     const snapshotAtSave = formSnapshot;
     const nextMatches = matches.map((m) => ({
       id: m.id,
@@ -5131,8 +5248,14 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate, voic
     // Only mark the form as saved if the save actually landed — a refused
     // save (stale tab, connection drop) leaves the button purple and the
     // banner explains what happened.
-    if (ok === false) return;
+    if (ok === false) {
+      setSaveNote("That didn't save — refresh this page and try again. Everything you've entered is still here.");
+      return;
+    }
     setSavedSnapshot(snapshotAtSave);
+    } catch {
+      setSaveNote("Something went wrong while saving — check the date/time fields look complete, then try again.");
+    }
   };
 
   // Sticky "Saved" button: a snapshot of every editable field, taken at
@@ -5248,8 +5371,12 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate, voic
                 <Upload size={13} /> {voiceBusy ? "Uploading…" : "Upload voice note (60–90s)"}
               </button>
               <input ref={voiceFileRef} type="file" accept="audio/*" onChange={handleVoiceFile} className="hidden" />
-              {voiceError && <span className="text-xs text-rose-600">{voiceError}</span>}
             </div>
+            {voiceError && (
+              <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-xs rounded-lg px-3 py-2">
+                <AlertCircle size={14} className="shrink-0" /> {voiceError}
+              </div>
+            )}
             <p className="text-[11px] text-stone-400">MP3 at a modest bitrate keeps it small — up to ~1.2MB. Notes expire after 7 days to keep the site lean.</p>
           </div>
         )}
@@ -5391,6 +5518,11 @@ function MatchdayAdminCard({ matchday, participants, predictions, onUpdate, voic
         </div>
       )}
 
+      {saveNote && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} className="shrink-0" /> {saveNote}
+        </div>
+      )}
       <button
         onClick={save}
         disabled={!dirty}
@@ -6445,7 +6577,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist, m
 // app, so submitting predictions and editing your profile always maps back
 // to the account you logged into rather than a free-form name picker.
 // -----------------------------------------------------------------------------
-function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadData, onLogin, snapshots, onRestoreSnapshot, saveError, setSaveError }) {
+function AuthScreen({ data, persist, mergeProfileSave, mergeMatchdayPatch, registerAccount, reloadData, onLogin, snapshots, onRestoreSnapshot, saveError, setSaveError }) {
   const [mode, setMode] = useState("login");
   const [adminUnlocked, setAdminUnlocked] = useState(false);
   const [enteringPin, setEnteringPin] = useState(false);
@@ -6569,6 +6701,7 @@ function AuthScreen({ data, persist, mergeProfileSave, registerAccount, reloadDa
               data={data}
               persist={persist}
               mergeProfileSave={mergeProfileSave}
+              mergeMatchdayPatch={mergeMatchdayPatch}
               viewerId=""
               adminMode
               now={Date.now()}
