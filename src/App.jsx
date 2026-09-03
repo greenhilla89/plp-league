@@ -85,6 +85,42 @@ const BLOG_KEY = "plp-2026-27-blog-page-v1"; // Blog tab articles — its OWN ke
 // key gets silently dropped by any device still running yesterday's code.
 // A brand-new key is invisible to old builds, so they can never erase it.
 const APP_SCHEMA_VERSION = 3; // bump whenever the storage shape changes
+
+// -----------------------------------------------------------------------------
+// EGRESS CONTROL — the image-heavy keys (badges, photos, crests, history,
+// blog, season archives) rarely change but were re-downloaded on every
+// load, which is what blew through the hosting free tier's monthly egress.
+// Each heavy key now has a tiny "-stamp" sidecar updated on every write;
+// devices cache the heavy content locally (localStorage) and only
+// re-download a blob when its stamp changes. A missing stamp (data from
+// before this build) or an unavailable cache simply falls back to a
+// normal fetch — nothing depends on the cache existing.
+// -----------------------------------------------------------------------------
+// Evaluated lazily (a function, not a Set built at module load) because
+// some of these key constants are declared further down the file.
+const isHeavyCacheKey = (key) => [PHOTOS_KEY, BADGES_KEY, CLUB_KEY, HISTORY_KEY, BLOG_KEY, SEASON_ARCHIVES_KEY].includes(key);
+
+function heavyCacheWrite(key, stamp, value) {
+  try { localStorage.setItem(`plp-cache-${key}`, JSON.stringify({ s: stamp, v: value })); } catch { /* cache full or unavailable — fine */ }
+}
+
+async function readWithCache(key) {
+  let stamp = null;
+  try {
+    const sRes = await window.storage.get(`${key}-stamp`, true);
+    stamp = sRes && sRes.value ? sRes.value : null;
+  } catch { /* stamp unreadable — fall through to a plain fetch */ }
+  if (stamp) {
+    try {
+      const cached = JSON.parse(localStorage.getItem(`plp-cache-${key}`) || "null");
+      if (cached && cached.s === stamp) return cached.v; // cache hit — the blob itself never leaves the server
+    } catch { /* corrupt cache entry — refetch */ }
+  }
+  const res = await window.storage.get(key, true);
+  const value = res && res.value ? res.value : null;
+  if (stamp && value) heavyCacheWrite(key, stamp, value);
+  return value;
+}
 const PREDICTIONS_KEY = "plp-2026-27-predictions-v1"; // the highest-frequency write in the app, isolated on its own
 const SEASON_ARCHIVES_KEY = "plp-2026-27-season-archives-v1"; // past seasons — grows slowly but can get large, so it's isolated too
 const DEFAULT_MAX_PARTICIPANTS = 20; // fallback cap when a league doesn't specify its own
@@ -831,6 +867,13 @@ async function writeSplitData(data) {
     try {
       const json = JSON.stringify(blob);
       await setWithRetry(key, json);
+      if (isHeavyCacheKey(key)) {
+        // New stamp so other devices know to refetch this blob — and prime
+        // this device's own cache so it never refetches what it just wrote.
+        const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        await setWithRetry(`${key}-stamp`, stamp);
+        heavyCacheWrite(key, stamp, json);
+      }
     } catch {
       failed.push(label);
     }
@@ -1034,14 +1077,14 @@ function ForecastRoomApp() {
         const coreRes = await getWithRetry(CORE_KEY);
         const accountsRes = await window.storage.get(ACCOUNTS_KEY, true);
         const rosterRes = await window.storage.get(ROSTER_KEY, true);
-        const photosRes = await window.storage.get(PHOTOS_KEY, true);
+        const photosVal = await readWithCache(PHOTOS_KEY);
         const predictionsRes = await window.storage.get(PREDICTIONS_KEY, true);
-        const archivesRes = await window.storage.get(SEASON_ARCHIVES_KEY, true);
-        const badgesRes = await window.storage.get(BADGES_KEY, true);
-        const historyRes = await window.storage.get(HISTORY_KEY, true);
-        const clubRes = await window.storage.get(CLUB_KEY, true);
+        const archivesVal = await readWithCache(SEASON_ARCHIVES_KEY);
+        const badgesVal = await readWithCache(BADGES_KEY);
+        const historyVal = await readWithCache(HISTORY_KEY);
+        const clubVal = await readWithCache(CLUB_KEY);
         const rulesRes = await window.storage.get(RULES_KEY, true);
-        const blogRes = await window.storage.get(BLOG_KEY, true);
+        const blogVal = await readWithCache(BLOG_KEY);
         const voiceRes = await window.storage.get(VOICE_INDEX_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         if (cancelled) return;
@@ -1057,14 +1100,14 @@ function ForecastRoomApp() {
             parsedCore,
             accountsRes && accountsRes.value ? JSON.parse(accountsRes.value) : { accounts: {} },
             rosterRes && rosterRes.value ? JSON.parse(rosterRes.value) : { leagues: {} },
-            photosRes && photosRes.value ? JSON.parse(photosRes.value) : { photos: {} },
+            photosVal ? JSON.parse(photosVal) : { photos: {} },
             predictionsRes && predictionsRes.value ? JSON.parse(predictionsRes.value) : { predictions: {} },
-            archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
-            badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
-            historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
-            clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null },
+            archivesVal ? JSON.parse(archivesVal) : { seasonArchives: [] },
+            badgesVal ? JSON.parse(badgesVal) : { badges: {} },
+            historyVal ? JSON.parse(historyVal) : { historyPage: { text: "", images: [] } },
+            clubVal ? JSON.parse(clubVal) : { clubLibrary: null },
             rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null },
-            blogRes && blogRes.value ? JSON.parse(blogRes.value) : { blogPage: null },
+            blogVal ? JSON.parse(blogVal) : { blogPage: null },
             voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null }
           );
           setData(migrateData(merged));
@@ -1178,7 +1221,13 @@ function ForecastRoomApp() {
           const badgesBlob = badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} };
           if (badgePatch.badge) badgesBlob.badges[participantId] = badgePatch.badge;
           else delete badgesBlob.badges[participantId];
-          await window.storage.set(BADGES_KEY, JSON.stringify(badgesBlob), true);
+          const badgesJson = JSON.stringify(badgesBlob);
+          await window.storage.set(BADGES_KEY, badgesJson, true);
+          try {
+            const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            await window.storage.set(`${BADGES_KEY}-stamp`, stamp, true);
+            heavyCacheWrite(BADGES_KEY, stamp, badgesJson);
+          } catch { /* stamp is an optimisation — the badge itself is saved */ }
           freshBadges = badgesBlob.badges;
         }
 
@@ -1335,14 +1384,14 @@ function ForecastRoomApp() {
         if (!coreRes || !coreRes.value) return dataRef.current;
         const accountsRes = await window.storage.get(ACCOUNTS_KEY, true);
         const rosterRes = await window.storage.get(ROSTER_KEY, true);
-        const photosRes = await window.storage.get(PHOTOS_KEY, true);
+        const photosVal = await readWithCache(PHOTOS_KEY);
         const predictionsRes = await window.storage.get(PREDICTIONS_KEY, true);
-        const archivesRes = await window.storage.get(SEASON_ARCHIVES_KEY, true);
-        const badgesRes = await window.storage.get(BADGES_KEY, true);
-        const historyRes = await window.storage.get(HISTORY_KEY, true);
-        const clubRes = await window.storage.get(CLUB_KEY, true);
+        const archivesVal = await readWithCache(SEASON_ARCHIVES_KEY);
+        const badgesVal = await readWithCache(BADGES_KEY);
+        const historyVal = await readWithCache(HISTORY_KEY);
+        const clubVal = await readWithCache(CLUB_KEY);
         const rulesRes = await window.storage.get(RULES_KEY, true);
-        const blogRes = await window.storage.get(BLOG_KEY, true);
+        const blogVal = await readWithCache(BLOG_KEY);
         const voiceRes = await window.storage.get(VOICE_INDEX_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         const parsedCore = JSON.parse(coreRes.value);
@@ -1351,14 +1400,14 @@ function ForecastRoomApp() {
           parsedCore,
           accountsRes && accountsRes.value ? JSON.parse(accountsRes.value) : { accounts: {} },
           rosterRes && rosterRes.value ? JSON.parse(rosterRes.value) : { leagues: {} },
-          photosRes && photosRes.value ? JSON.parse(photosRes.value) : { photos: {} },
+          photosVal ? JSON.parse(photosVal) : { photos: {} },
           predictionsRes && predictionsRes.value ? JSON.parse(predictionsRes.value) : { predictions: {} },
-          archivesRes && archivesRes.value ? JSON.parse(archivesRes.value) : { seasonArchives: [] },
-          badgesRes && badgesRes.value ? JSON.parse(badgesRes.value) : { badges: {} },
-          historyRes && historyRes.value ? JSON.parse(historyRes.value) : { historyPage: { text: "", images: [] } },
-          clubRes && clubRes.value ? JSON.parse(clubRes.value) : { clubLibrary: null },
+          archivesVal ? JSON.parse(archivesVal) : { seasonArchives: [] },
+          badgesVal ? JSON.parse(badgesVal) : { badges: {} },
+          historyVal ? JSON.parse(historyVal) : { historyPage: { text: "", images: [] } },
+          clubVal ? JSON.parse(clubVal) : { clubLibrary: null },
           rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null },
-          blogRes && blogRes.value ? JSON.parse(blogRes.value) : { blogPage: null },
+          blogVal ? JSON.parse(blogVal) : { blogPage: null },
           voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null }
         ));
         revRef.current = revRes && revRes.value ? revRes.value : null;
