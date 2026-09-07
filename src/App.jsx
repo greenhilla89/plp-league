@@ -3079,8 +3079,8 @@ function FixtureListView({ league, viewerId }) {
       <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Calendar size={18} className="text-amber-400" /> {league.name} fixture list</h2>
       <p className="text-xs text-stone-500">The whole season's head-to-head match-ups, matchday by matchday. Your own is highlighted. Matchdays not yet set up by the admin still show who you're due to face.</p>
 
-      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        {league.h2hSchedule.map((round, i) => {
+      {(() => {
+        const items = league.h2hSchedule.map((round, i) => {
           // Matchdays are always created in round order and never reordered
           // or deleted, so round i lines up directly with matchdays[i].
           const md = league.matchdays[i] && !league.matchdays[i].draft ? league.matchdays[i] : null;
@@ -3089,11 +3089,13 @@ function FixtureListView({ league, viewerId }) {
           const statusStyle = md ? MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(md)] : "bg-white/5 text-stone-500 border-stone-300 border-dashed";
           const completed = !!md?.resultsPublished;
           if (completed && !openCompleted[i]) {
-            return (
+            // Compact auto-width chip — on a laptop a whole season of
+            // completed rounds packs into a couple of tidy lines.
+            return { chip: true, node: (
               <button
                 key={i}
                 onClick={() => setOpenCompleted((o) => ({ ...o, [i]: true }))}
-                className="w-full flex items-center justify-between gap-2 border border-stone-200 rounded-xl px-3 py-2 bg-stone-50 hover:bg-stone-100 text-left"
+                className="flex items-center gap-2 border border-stone-200 rounded-xl px-3 py-2 bg-stone-50 hover:bg-stone-100 text-left shrink-0"
               >
                 <span className="font-display font-semibold text-xs">{label}</span>
                 <span className="text-[10px] text-stone-500 flex items-center gap-2 shrink-0">
@@ -3102,10 +3104,10 @@ function FixtureListView({ league, viewerId }) {
                   <span className="text-stone-400">expand ▾</span>
                 </span>
               </button>
-            );
+            ) };
           }
-          return (
-            <div key={i} className="border border-stone-200 rounded-xl p-3 bg-white">
+          return { chip: false, node: (
+            <div key={i} className={cx("border border-stone-200 rounded-xl p-3 bg-white", completed && "sm:col-span-2 lg:col-span-3")}>
               <div className="flex items-center justify-between mb-1">
                 <span className="font-display font-semibold text-sm">{label}</span>
                 <span className="flex items-center gap-2">
@@ -3146,9 +3148,17 @@ function FixtureListView({ league, viewerId }) {
                 )}
               </div>
             </div>
-          );
-        })}
-      </div>
+          ) };
+        });
+        const chips = items.filter((x) => x.chip).map((x) => x.node);
+        const cards = items.filter((x) => !x.chip).map((x) => x.node);
+        return (
+          <>
+            {chips.length > 0 && <div className="flex flex-wrap gap-2">{chips}</div>}
+            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">{cards}</div>
+          </>
+        );
+      })()}
     </div>
   );
 }
@@ -3351,9 +3361,31 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
   // with head-to-head pairings, the cards are the default view and the grid
   // is opt-in; matchdays without pairings show the grid as before.
   const [openTables, setOpenTables] = useState({});
+  // Historic matchdays (results published, with a newer round existing)
+  // fold to one-line ribbons below the current round — each carrying the
+  // viewer's own result for that round, so past scores are one glance away.
+  const [openHistoric, setOpenHistoric] = useState({});
 
   const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
   const boardById = useMemo(() => Object.fromEntries(board.map((r) => [r.id, r])), [board]);
+
+  // The "calibre" caption on each matchday's cards (rank · score diff) is
+  // FROZEN to the standings as they stood ENTERING that matchday — i.e.
+  // computed from only the published matchdays that precede it in season
+  // order. MD5's cards permanently show end-of-MD4 positions, no matter
+  // how many later rounds publish. A matchday with nothing published
+  // before it (MD1) gets no caption. Adjustments apply throughout, since
+  // they're season-level corrections.
+  const priorBoardsById = useMemo(() => {
+    const map = {};
+    league.matchdays.forEach((md, idx) => {
+      const prior = league.matchdays.slice(0, idx).filter((m) => m.resultsPublished);
+      if (prior.length === 0) { map[md.id] = null; return; }
+      const rows = computeLeaderboardWithPredictions(league.participants, prior, data.predictions, league.adjustments);
+      map[md.id] = Object.fromEntries(rows.map((r) => [r.id, r]));
+    });
+    return map;
+  }, [league, data.predictions]);
   const nameById = useMemo(() => Object.fromEntries(league.participants.map((p) => [p.id, p.name])), [league.participants]);
 
   // Rows: participants ordered by accumulated points so far (highest first),
@@ -3387,6 +3419,45 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
 
       {matchdays.map((md) => {
         const released = adminMode || isReleased(md, now);
+        const newestId = league.matchdays.length > 0 ? league.matchdays[league.matchdays.length - 1].id : null;
+        const historic = md.resultsPublished && md.id !== newestId;
+        if (historic && !openHistoric[md.id]) {
+          let summary = null;
+          if (viewerId && md.pairings) {
+            const pairing = md.pairings.pairings.find((x) => x.home === viewerId || x.away === viewerId);
+            if (!pairing) {
+              summary = md.pairings.bye === viewerId ? "Bye" : null;
+            } else {
+              const oppId = pairing.home === viewerId ? pairing.away : pairing.home;
+              const ptsRows = computeMatchdayPoints(md, data.predictions, league.participants);
+              const mine = ptsRows.find((r) => r.id === viewerId)?.points ?? 0;
+              const theirs = ptsRows.find((r) => r.id === oppId)?.points ?? 0;
+              const verb = mine > theirs ? "Won" : mine < theirs ? "Lost" : "Drew";
+              summary = `${verb} ${mine}–${theirs} v ${nameById[oppId] ?? "?"}`;
+            }
+          }
+          return (
+            <button
+              key={md.id}
+              onClick={() => setOpenHistoric((o) => ({ ...o, [md.id]: true }))}
+              className="w-full flex items-center justify-between gap-2 border border-stone-200 rounded-xl px-3 py-2.5 bg-stone-50 hover:bg-stone-100 text-left"
+            >
+              <span className="flex items-center gap-2 min-w-0">
+                <span className="font-display font-semibold text-xs shrink-0">{md.label}</span>
+                {md.scheduledDate && <span className="text-[10px] text-stone-400 shrink-0">{fmtDateOnly(md.scheduledDate)}</span>}
+                {summary && (
+                  <span className={cx(
+                    "text-[11px] font-medium truncate",
+                    summary.startsWith("Won") ? "text-emerald-600" : summary.startsWith("Lost") ? "text-rose-600" : "text-stone-500"
+                  )}>
+                    {summary}
+                  </span>
+                )}
+              </span>
+              <span className="text-[10px] text-stone-400 shrink-0">expand ▾</span>
+            </button>
+          );
+        }
         return (
           <div key={md.id} className="space-y-2">
             <div className="flex items-center justify-between flex-wrap gap-2">
@@ -3396,6 +3467,9 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
                 <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", MATCHDAY_STATUS_STYLES[matchdayDisplayStatus(md, adminMode, now)])}>
                   {matchdayDisplayStatus(md, adminMode, now)}
                 </span>
+                {historic && (
+                  <button onClick={() => setOpenHistoric((o) => ({ ...o, [md.id]: false }))} className="text-[10px] text-stone-400 hover:text-stone-600">collapse ▴</button>
+                )}
               </div>
               <span className={cx("text-xs flex items-center gap-1", released ? "text-emerald-600" : "text-stone-500")}>
                 {released ? <Eye size={13} /> : <EyeOff size={13} />}
@@ -3413,7 +3487,7 @@ function MatrixView({ league, data, viewerId, adminMode, now }) {
               ) : null
             )}
             {md.pairings && (
-              <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} clubLibrary={data.clubLibrary} standingsById={boardById} />
+              <H2HPairingsPanel matchday={md} league={league} predictions={data.predictions} viewerId={viewerId} adminMode={adminMode} now={now} clubLibrary={data.clubLibrary} standingsById={priorBoardsById[md.id]} />
             )}
             {/* Matchday write-ups moved to the Blog tab (v30) — stored blog
                 text on old matchdays is untouched, just no longer shown here. */}
@@ -7226,7 +7300,7 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
   }
 
   return (
-    <div className="border border-stone-200 rounded-2xl p-4 bg-white" style={{ height: 360 }}>
+    <div className="border border-stone-200 rounded-2xl p-4 bg-white h-[300px] sm:h-[400px]">
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={rows} margin={{ top: 10, right: 20, left: 0, bottom: 24 }}>
           <CartesianGrid stroke="#27272a" strokeDasharray="3 3" />
@@ -7265,7 +7339,7 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
                 isAnimationActive={false}
                 dot={(dotProps) => {
                   if (dotProps.index !== rows.length - 1) return <React.Fragment key={`${p.id}-${dotProps.index}`} />;
-                  const r = 12;
+                  const r = 8; // small enough that twenty end-badges don't collide on a phone
                   return (
                     <g key={`${p.id}-badge`}>
                       <circle cx={dotProps.cx} cy={dotProps.cy} r={r} fill={p.badge ? "#fff" : color} stroke="#000" strokeWidth={1.5} />
@@ -7285,7 +7359,7 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
                           />
                         </>
                       ) : (
-                        <text x={dotProps.cx} y={dotProps.cy + 4} textAnchor="middle" fontSize={10} fontWeight="700" fill="#000">
+                        <text x={dotProps.cx} y={dotProps.cy + 3} textAnchor="middle" fontSize={8} fontWeight="700" fill="#000">
                           {p.name.slice(0, 1).toUpperCase()}
                         </text>
                       )}
