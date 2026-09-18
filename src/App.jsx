@@ -1899,7 +1899,7 @@ function AppTabs({ league, leagueKey, data, persist, mergeProfileSave, mergeMatc
         )}
         {tab === "leaderboard" && <LeaderboardView league={league} leagueKey={leagueKey} data={data} />}
         {tab === "profiles" && <ProfilesView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} adminMode={adminMode} persist={persist} mergeProfileSave={mergeProfileSave} />}
-        {tab === "stats" && <StatsView league={league} leagueKey={leagueKey} data={data} />}
+        {tab === "stats" && <StatsView league={league} leagueKey={leagueKey} data={data} viewerId={viewerId} />}
       </main>
     </>
   );
@@ -7244,6 +7244,40 @@ function computeContestantStats(participant, league, predictions) {
 
   const h2h = computeLeaderboardWithPredictions(league.participants, pubs, predictions, league.adjustments).find((r) => r.id === participant.id);
 
+  // Head-to-head form. Every published meeting this contestant played, in
+  // season order, with the score difference (their raw score minus their
+  // opponent's) that decided it. From these: the current run of matchdays
+  // without a defeat, the season's best result, and its worst.
+  const meetings = [];
+  pubs.forEach((md) => {
+    const res = computeH2HResultsForMatchday(md, predictions, league.participants)[participant.id];
+    if (!res || !res.opponentId) return; // byes and unpaired rounds don't count either way
+    meetings.push({
+      label: md.label,
+      outcome: res.outcome,
+      ownRaw: res.ownRaw ?? 0,
+      opponentRaw: res.opponentRaw ?? 0,
+      opponentName: league.participants.find((p) => p.id === res.opponentId)?.name ?? "?",
+      margin: (res.ownRaw ?? 0) - (res.opponentRaw ?? 0),
+    });
+  });
+
+  // Matchdays unbeaten: consecutive matchdays without a loss (wins and
+  // draws both keep it alive), counting back from the most recent one.
+  let matchdaysUnbeaten = 0;
+  for (let i = meetings.length - 1; i >= 0; i--) {
+    if (meetings[i].outcome === "loss") break;
+    matchdaysUnbeaten += 1;
+  }
+
+  // Best result = biggest score difference (a win if they have one, else
+  // their best draw or narrowest defeat). Worst = the opposite end.
+  let bestWin = null, worstLoss = null;
+  meetings.forEach((m) => {
+    if (!bestWin || m.margin > bestWin.margin) bestWin = m;
+    if (!worstLoss || m.margin < worstLoss.margin) worstLoss = m;
+  });
+
   return {
     totalPoints: round1(totalPoints),
     matchdaysPlayed: matchdayPoints.length,
@@ -7261,6 +7295,9 @@ function computeContestantStats(participant, league, predictions) {
     worst,
     currentStreak,
     longestStreak,
+    matchdaysUnbeaten,
+    bestWin,
+    worstLoss,
     matchdayPoints,
     // Head-to-head record — the table points, not the raw prediction score above.
     leaguePoints: h2h?.leaguePoints ?? 0,
@@ -7286,10 +7323,29 @@ function computeRankHistory(league, predictions) {
   });
 }
 
-function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
+// The season position graph. With twenty-plus contestants, plotting
+// everyone at once is unreadable — so it starts with a SINGLE line (the
+// viewer's own, or the current leader's when admin is looking) and lets
+// anyone add rivals one at a time for comparison. Selections live in the
+// browser for the session only; nothing is stored.
+function RankHistoryChart({ league, leagueKey, predictions, defaultIds = [] }) {
   const rows = useMemo(() => computeRankHistory(league, predictions), [league, predictions]);
   const maxX = league.h2hSchedule.length || Math.max(league.matchdays.length, 1);
   const maxY = league.maxParticipants || DEFAULT_MAX_PARTICIPANTS;
+
+  const initial = defaultIds.filter((id) => league.participants.some((p) => p.id === id));
+  const [selectedIds, setSelectedIds] = useState(initial);
+  const [addId, setAddId] = useState("");
+  // If the default arrives late (the leader isn't known until results
+  // publish), adopt it — but never overrule a selection already made.
+  const [seededFrom, setSeededFrom] = useState(initial.join(","));
+  if (initial.length > 0 && selectedIds.length === 0 && seededFrom !== initial.join(",")) {
+    setSeededFrom(initial.join(","));
+    setSelectedIds(initial);
+  }
+
+  const addable = league.participants.filter((p) => !selectedIds.includes(p.id));
+  const lineColor = (id, i) => (i === 0 ? "#fbbf24" : colorForIndex(i * 3 + 2, Math.max(selectedIds.length * 3, 6)));
 
   if (rows.length === 0) {
     return (
@@ -7300,7 +7356,50 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
   }
 
   return (
-    <div className="border border-stone-200 rounded-2xl p-4 bg-white h-[300px] sm:h-[400px]">
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        {selectedIds.map((id, i) => {
+          const p = league.participants.find((x) => x.id === id);
+          if (!p) return null;
+          return (
+            <span key={id} className="inline-flex items-center gap-1.5 border border-stone-300 rounded-full pl-2 pr-1 py-1 text-xs bg-white">
+              <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: lineColor(id, i) }} />
+              <span className="font-medium">{p.name}</span>
+              <button
+                onClick={() => setSelectedIds((ids) => ids.filter((x) => x !== id))}
+                className="text-stone-400 hover:text-rose-600 px-0.5"
+                title={`Remove ${p.name} from the graph`}
+              >
+                <X size={12} />
+              </button>
+            </span>
+          );
+        })}
+        {addable.length > 0 && (
+          <select
+            value={addId}
+            onChange={(e) => {
+              const id = e.target.value;
+              if (!id) return;
+              setSelectedIds((ids) => (ids.includes(id) ? ids : [...ids, id]));
+              setAddId("");
+            }}
+            className="bg-white border border-stone-300 rounded-lg px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+          >
+            <option value="">+ Add contestant…</option>
+            {[...addable].sort((a, b) => a.name.localeCompare(b.name)).map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {selectedIds.length === 0 ? (
+        <div className="border border-stone-200 rounded-2xl p-8 text-center text-sm text-stone-500">
+          Add a contestant above to plot their position through the season.
+        </div>
+      ) : (
+      <div className="border border-stone-200 rounded-2xl p-4 bg-white h-[300px] sm:h-[400px]">
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={rows} margin={{ top: 10, right: 20, left: 0, bottom: 24 }}>
           <CartesianGrid stroke="#27272a" strokeDasharray="3 3" />
@@ -7325,24 +7424,28 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
             contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8, fontSize: 12 }}
             labelFormatter={(v) => `Matchday ${v}`}
           />
-          {!highlightId && <Legend wrapperStyle={{ fontSize: 11 }} />}
-          {league.participants.map((p, i) => {
-            const isHighlighted = highlightId === p.id;
-            const color = highlightId ? (isHighlighted ? "#fbbf24" : "#52525b") : colorForIndex(i, league.participants.length);
+          {selectedIds.length > 1 && <Legend wrapperStyle={{ fontSize: 11 }} />}
+          {selectedIds.map((id, i) => {
+            const p = league.participants.find((x) => x.id === id);
+            if (!p) return null;
+            const color = lineColor(id, i);
             return (
               <Line
                 key={p.id}
                 dataKey={p.id}
                 name={p.name}
                 stroke={color}
-                strokeWidth={highlightId ? (isHighlighted ? 3 : 1) : 2}
+                strokeWidth={i === 0 ? 3 : 2}
                 isAnimationActive={false}
+                connectNulls
                 dot={(dotProps) => {
+                  // A badge marks only the latest point on each line, so the
+                  // plot stays legible however many lines are added.
                   if (dotProps.index !== rows.length - 1) return <React.Fragment key={`${p.id}-${dotProps.index}`} />;
-                  const r = 8; // small enough that twenty end-badges don't collide on a phone
+                  const r = 9;
                   return (
                     <g key={`${p.id}-badge`}>
-                      <circle cx={dotProps.cx} cy={dotProps.cy} r={r} fill={p.badge ? "#fff" : color} stroke="#000" strokeWidth={1.5} />
+                      <circle cx={dotProps.cx} cy={dotProps.cy} r={r} fill={p.badge ? "#fff" : color} stroke={color} strokeWidth={2} />
                       {p.badge ? (
                         <>
                           <clipPath id={`badge-clip-${p.id}`}>
@@ -7359,7 +7462,7 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
                           />
                         </>
                       ) : (
-                        <text x={dotProps.cx} y={dotProps.cy + 3} textAnchor="middle" fontSize={8} fontWeight="700" fill="#000">
+                        <text x={dotProps.cx} y={dotProps.cy + 3} textAnchor="middle" fontSize={9} fontWeight="700" fill="#000">
                           {p.name.slice(0, 1).toUpperCase()}
                         </text>
                       )}
@@ -7371,6 +7474,8 @@ function RankHistoryChart({ league, leagueKey, predictions, highlightId }) {
           })}
         </LineChart>
       </ResponsiveContainer>
+      </div>
+      )}
     </div>
   );
 }
@@ -7440,22 +7545,37 @@ function H2HRecordsSection({ participant, league, predictions }) {
                 <tr className="bg-stone-50 text-left text-[11px] uppercase tracking-wide text-stone-500">
                   <th className="px-4 py-2 font-semibold">Opponent</th>
                   <th className="px-3 py-2 font-semibold text-center">P</th>
-                  <th className="px-3 py-2 font-semibold text-center">W-D-L</th>
+                  <th className="px-3 py-2 font-semibold text-center">Result</th>
                   <th className="hidden sm:table-cell px-3 py-2 font-semibold text-right">Pts for–against</th>
                 </tr>
               </thead>
               <tbody>
                 {faced.map((o) => {
                   const rec = records[o.id];
+                  // One letter per meeting, in order. The row tints by the
+                  // overall record against this opponent: ahead = green,
+                  // behind = red, level = neutral.
+                  const ahead = rec.wins - rec.losses;
                   return (
-                    <tr key={o.id} className="border-t border-stone-100">
+                    <tr key={o.id} className={cx("border-t border-stone-100", ahead > 0 ? "bg-emerald-50" : ahead < 0 ? "bg-rose-50" : "")}>
                       <td className="px-4 py-2.5">
                         <button onClick={() => setOpponentId(o.id)} className="font-medium hover:text-violet-700 hover:underline text-left">
                           {o.name}
                         </button>
                       </td>
                       <td className="px-3 py-2.5 text-center font-mono-num text-stone-500">{rec.meetings.length}</td>
-                      <td className="px-3 py-2.5 text-center font-mono-num">{rec.wins}-{rec.draws}-{rec.losses}</td>
+                      <td className="px-3 py-2.5 text-center">
+                        <span className="inline-flex items-center justify-center gap-1">
+                          {rec.meetings.map((m, mi) => (
+                            <span key={mi} className={cx(
+                              "font-bold text-xs",
+                              m.outcome === "win" ? "text-emerald-700" : m.outcome === "loss" ? "text-rose-700" : "text-stone-500"
+                            )}>
+                              {m.outcome === "win" ? "W" : m.outcome === "loss" ? "L" : "D"}
+                            </span>
+                          ))}
+                        </span>
+                      </td>
                       <td className="hidden sm:table-cell px-3 py-2.5 text-right font-mono-num text-stone-500">{rec.pointsFor}–{rec.pointsAgainst}</td>
                     </tr>
                   );
@@ -7559,25 +7679,45 @@ function StatsProfileView({ participant, league, leagueKey, data, onBack }) {
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <StatTile icon={Trophy} label="Predicted points" value={stats.totalPoints} sub={`raw score over ${stats.matchdaysPlayed} matchday${stats.matchdaysPlayed === 1 ? "" : "s"}`} />
-            <StatTile icon={BarChart3} label="Avg pts / matchday" value={stats.avgPointsPerMatchday} />
-            <StatTile icon={Target} label="Avg pts / match" value={stats.avgPointsPerMatch} />
+            <StatTile icon={BarChart3} label="Avg score / matchday" value={stats.avgPointsPerMatchday} />
+            <StatTile icon={Target} label="Avg score / match" value={stats.avgPointsPerMatch} />
             <StatTile icon={CheckCircle2} label="Result accuracy" value={stats.accuracy !== null ? `${stats.accuracy}%` : "—"} sub={`${stats.correctResults}/${stats.matchesEvaluated} correct`} />
             <StatTile icon={Award} label="Exact scorelines" value={stats.exactScorelines} />
             <StatTile icon={Send} label="Predictions made" value={stats.matchesPredicted} sub={`of ${stats.matchesEvaluated} matches`} />
-            <StatTile icon={Flame} label="Current streak" value={`${stats.currentStreak} correct`} sub={`best run: ${stats.longestStreak}`} />
+            <StatTile icon={Flame} label="Matchdays unbeaten" value={stats.matchdaysUnbeaten} sub={stats.matchdaysUnbeaten === 0 ? "lost the most recent matchday" : "in a row, to the latest result"} />
             <StatTile icon={BarChart3} label="Avg goals predicted" value={stats.avgGoalsTotal ?? "—"} sub={stats.avgGoalsHome !== null ? `${stats.avgGoalsHome} home · ${stats.avgGoalsAway} away` : undefined} />
           </div>
 
-          <div className="grid sm:grid-cols-2 gap-3">
+          {/* Two head-to-head results (best and worst by score difference)
+              and two raw-score matchdays (highest and lowest total). */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="border border-emerald-300/20 bg-emerald-50 rounded-xl p-3">
-              <div className="text-[11px] text-emerald-700 uppercase tracking-wide mb-1">Best matchday</div>
+              <div className="text-[11px] text-emerald-700 uppercase tracking-wide mb-1">Best result</div>
+              <div className="font-medium">{stats.bestWin?.label ?? "—"}</div>
+              <div className="font-mono-num text-emerald-700 text-sm">
+                {stats.bestWin
+                  ? `${stats.bestWin.outcome === "win" ? "Won" : stats.bestWin.outcome === "loss" ? "Lost" : "Drew"} ${stats.bestWin.ownRaw}–${stats.bestWin.opponentRaw} v ${stats.bestWin.opponentName}`
+                  : "no meetings yet"}
+              </div>
+            </div>
+            <div className="border border-emerald-300/20 bg-emerald-50 rounded-xl p-3">
+              <div className="text-[11px] text-emerald-700 uppercase tracking-wide mb-1">Highest score</div>
               <div className="font-medium">{stats.best?.label ?? "—"}</div>
-              <div className="font-mono-num text-emerald-700 text-sm">{stats.best?.points ?? 0} pts</div>
+              <div className="font-mono-num text-emerald-700 text-sm">{stats.best ? `${stats.best.points} pts` : "—"}</div>
             </div>
             <div className="border border-rose-300/20 bg-rose-50 rounded-xl p-3">
-              <div className="text-[11px] text-rose-700 uppercase tracking-wide mb-1">Toughest matchday</div>
+              <div className="text-[11px] text-rose-700 uppercase tracking-wide mb-1">Worst result</div>
+              <div className="font-medium">{stats.worstLoss?.label ?? "—"}</div>
+              <div className="font-mono-num text-rose-700 text-sm">
+                {stats.worstLoss
+                  ? `${stats.worstLoss.outcome === "win" ? "Won" : stats.worstLoss.outcome === "loss" ? "Lost" : "Drew"} ${stats.worstLoss.ownRaw}–${stats.worstLoss.opponentRaw} v ${stats.worstLoss.opponentName}`
+                  : "no meetings yet"}
+              </div>
+            </div>
+            <div className="border border-rose-300/20 bg-rose-50 rounded-xl p-3">
+              <div className="text-[11px] text-rose-700 uppercase tracking-wide mb-1">Lowest score</div>
               <div className="font-medium">{stats.worst?.label ?? "—"}</div>
-              <div className="font-mono-num text-rose-700 text-sm">{stats.worst?.points ?? 0} pts</div>
+              <div className="font-mono-num text-rose-700 text-sm">{stats.worst ? `${stats.worst.points} pts` : "—"}</div>
             </div>
           </div>
 
@@ -7587,15 +7727,22 @@ function StatsProfileView({ participant, league, leagueKey, data, onBack }) {
 
       <div>
         <h3 className="font-display font-semibold text-sm mb-2">Position through the season</h3>
-        <RankHistoryChart league={league} leagueKey={leagueKey} predictions={data.predictions} highlightId={participant.id} />
+        <RankHistoryChart league={league} leagueKey={leagueKey} predictions={data.predictions} defaultIds={[participant.id]} />
       </div>
     </div>
   );
 }
 
-function StatsView({ league, leagueKey, data }) {
+function StatsView({ league, leagueKey, data, viewerId }) {
   const [selectedId, setSelectedId] = useState(null);
   const board = useMemo(() => computeLeaderboardWithPredictions(league.participants, publishedMatchdays(league), data.predictions, league.adjustments), [league, data.predictions]);
+  // The graph opens on the viewer's own line; for admin (no contestant of
+  // their own) it opens on whoever currently leads the division.
+  const defaultChartIds = useMemo(() => {
+    if (viewerId && league.participants.some((p) => p.id === viewerId)) return [viewerId];
+    const leader = board[0];
+    return leader ? [leader.id] : [];
+  }, [viewerId, league.participants, board]);
   const selected = selectedId ? league.participants.find((p) => p.id === selectedId) : null;
 
   if (selected) {
@@ -7608,7 +7755,7 @@ function StatsView({ league, leagueKey, data }) {
 
       <div>
         <h3 className="font-display font-semibold text-sm mb-2">Position through the season</h3>
-        <RankHistoryChart league={league} leagueKey={leagueKey} predictions={data.predictions} />
+        <RankHistoryChart league={league} leagueKey={leagueKey} predictions={data.predictions} defaultIds={defaultChartIds} />
       </div>
 
       <div>
