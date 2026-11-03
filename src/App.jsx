@@ -84,7 +84,8 @@ const BLOG_KEY = "plp-2026-27-blog-page-v1"; // Blog tab articles — its OWN ke
 // they know about on every full save — a new field piggybacking on an old
 // key gets silently dropped by any device still running yesterday's code.
 // A brand-new key is invisible to old builds, so they can never erase it.
-const APP_SCHEMA_VERSION = 3; // bump whenever the storage shape changes
+const CUP_KEY = "plp-2026-27-cup-v1"; // the FA Cup competition — its OWN key (see schema note above)
+const APP_SCHEMA_VERSION = 6; // bump whenever the storage shape changes
 
 // -----------------------------------------------------------------------------
 // EGRESS CONTROL — the image-heavy keys (badges, photos, crests, history,
@@ -657,6 +658,12 @@ function migrateData(data) {
   if (!data.clubLibrary) data.clubLibrary = { crests: [], colors: [] }; // admin-managed club crests + colour identities — see ClubLibraryCard
   if (!data.blogPage) data.blogPage = { articles: [] }; // the Blog tab — see BlogView
   if (!data.voiceNotes) data.voiceNotes = {}; // matchday voice-note index — see VOICE NOTES
+  // The FA Cup: a competition that spans every division, kept entirely
+  // outside the league objects so it can never reach league standings,
+  // fixture lists, pairings or stats. See CupView.
+  if (!data.cup) data.cup = { enabled: false, name: "FA Cup", entrants: [], groupRounds: [], knockout: null, playoff: null };
+  if (!Array.isArray(data.cup.entrants)) data.cup.entrants = [];
+  if (!Array.isArray(data.cup.groupRounds)) data.cup.groupRounds = [];
   // One-time adoption: matchday write-ups from before the Blog tab existed
   // become Blog articles (deterministic ids make this safe to re-run). The
   // original text on the matchday is left untouched.
@@ -774,13 +781,14 @@ function splitData(data) {
     clubBlob: { clubLibrary: data.clubLibrary },
     rulesBlob: { rulesPage: data.rulesPage },
     voiceBlob: { voiceNotes: data.voiceNotes },
+    cupBlob: { cup: data.cup },
     blogBlob: { blogPage: data.blogPage },
   };
 }
 
 // The inverse of splitData — reconstructs the unified shape the rest of the
 // app expects from the 8 separately-loaded pieces.
-function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob = { clubLibrary: null }, rulesBlob = { rulesPage: null }, blogBlob = { blogPage: null }, voiceBlob = { voiceNotes: null }) {
+function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob = { clubLibrary: null }, rulesBlob = { rulesPage: null }, blogBlob = { blogPage: null }, voiceBlob = { voiceNotes: null }, cupBlob = { cup: null }) {
   const leagues = {};
   Object.keys(core.leagueMeta).forEach((key) => {
     const roster = rosterBlob.leagues[key]?.participants ?? [];
@@ -800,6 +808,7 @@ function mergeSplitData(core, accountsBlob, rosterBlob, photosBlob, predictionsB
     // history blob (v24) in case rules were written there and not yet wiped.
     rulesPage: rulesBlob.rulesPage ?? historyBlob.rulesPage ?? { text: "" },
     voiceNotes: voiceBlob.voiceNotes ?? {},
+    cup: cupBlob.cup ?? null,
     blogPage: blogBlob.blogPage ?? { articles: [] },
     clubLibrary: clubBlob.clubLibrary ?? { crests: [], colors: [] },
     accounts: accountsBlob.accounts ?? {},
@@ -843,7 +852,7 @@ async function setWithRetry(key, json, attempts = 3, delayMs = 400) {
 }
 
 async function writeSplitData(data) {
-  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob, rulesBlob, blogBlob, voiceBlob } = splitData(data);
+  const { core, accountsBlob, rosterBlob, photosBlob, predictionsBlob, archivesBlob, badgesBlob, historyBlob, clubBlob, rulesBlob, blogBlob, voiceBlob, cupBlob } = splitData(data);
   // Named entries, written one at a time (not all at once) — sequencing
   // keeps write bursts gentle on the backend and makes failures easier to
   // attribute. Still independent of each other: one failing doesn't stop
@@ -861,6 +870,7 @@ async function writeSplitData(data) {
     ["rules page", RULES_KEY, rulesBlob],
     ["blog page", BLOG_KEY, blogBlob],
     ["voice index", VOICE_INDEX_KEY, voiceBlob],
+    ["cup", CUP_KEY, cupBlob],
   ];
   const failed = [];
   for (const [label, key, blob] of entries) {
@@ -1086,6 +1096,7 @@ function ForecastRoomApp() {
         const rulesRes = await window.storage.get(RULES_KEY, true);
         const blogVal = await readWithCache(BLOG_KEY);
         const voiceRes = await window.storage.get(VOICE_INDEX_KEY, true);
+        const cupRes = await window.storage.get(CUP_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         if (cancelled) return;
         // Remember which save-version this data came from — every future
@@ -1108,7 +1119,8 @@ function ForecastRoomApp() {
             clubVal ? JSON.parse(clubVal) : { clubLibrary: null },
             rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null },
             blogVal ? JSON.parse(blogVal) : { blogPage: null },
-            voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null }
+            voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null },
+            cupRes && cupRes.value ? JSON.parse(cupRes.value) : { cup: null }
           );
           setData(migrateData(merged));
           return;
@@ -1345,6 +1357,45 @@ function ForecastRoomApp() {
     return run;
   }, []);
 
+  // CUP SAVES (admin) — read-merge-write on the cup key alone, the same
+  // approach as mergeMatchdayPatch. A full save is refused as "stale"
+  // whenever anyone has submitted a prediction since this tab loaded, which
+  // during a live cup round would keep blocking the admin's score entry.
+  // This path reads the freshest cup (and predictions, for the safety
+  // checks), applies the change to THAT, and writes only the cup key back.
+  // `updater(freshCup, freshPredictions)` returns the next cup, or
+  // { error } to refuse the change with a message.
+  const mergeCupUpdate = useCallback((updater) => {
+    if (outdatedBuildRef.current) return Promise.resolve({ ok: false, error: "This device is on an older version of the site — refresh to update." });
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const currentRev = await readRevValue();
+        const wasFresh = (revRef.current ?? null) === (currentRev ?? null);
+        const cupRes = await window.storage.get(CUP_KEY, true);
+        const storedCup = cupRes && cupRes.value ? JSON.parse(cupRes.value).cup : null;
+        const freshCup = storedCup ?? dataRef.current?.cup ?? emptyCup();
+        const predRes = await window.storage.get(PREDICTIONS_KEY, true);
+        const freshPredictions = predRes && predRes.value ? (JSON.parse(predRes.value).predictions ?? {}) : {};
+        const next = updater(freshCup, freshPredictions);
+        if (!next || next.error) return { ok: false, error: next?.error ?? "That change couldn't be applied." };
+        await window.storage.set(CUP_KEY, JSON.stringify({ cup: next }), true);
+        try {
+          const newRev = nextRevValue(currentRev);
+          const claimed = await claimRev(currentRev, newRev);
+          if (claimed && wasFresh) revRef.current = newRev;
+        } catch { /* best-effort — the cup itself is already saved */ }
+        const prev = dataRef.current;
+        if (prev) setData({ ...prev, cup: next, predictions: freshPredictions });
+        setSaveError(null);
+        return { ok: true };
+      } catch {
+        return { ok: false, error: "That didn't save — check your connection and try again. Nothing you entered has been lost." };
+      }
+    });
+    persistQueueRef.current = run.then(() => undefined).catch(() => {});
+    return run;
+  }, []);
+
   // AUTO-REFRESH — re-reads everything from storage and adopts it. Used at
   // login (so signing in always starts from the latest data) and whenever
   // the page comes back into view (so a phone reopening the site from its
@@ -1393,6 +1444,7 @@ function ForecastRoomApp() {
         const rulesRes = await window.storage.get(RULES_KEY, true);
         const blogVal = await readWithCache(BLOG_KEY);
         const voiceRes = await window.storage.get(VOICE_INDEX_KEY, true);
+        const cupRes = await window.storage.get(CUP_KEY, true);
         const revRes = await window.storage.get(REV_KEY, true);
         const parsedCore = JSON.parse(coreRes.value);
         markIfOutdated(parsedCore);
@@ -1408,7 +1460,8 @@ function ForecastRoomApp() {
           clubVal ? JSON.parse(clubVal) : { clubLibrary: null },
           rulesRes && rulesRes.value ? JSON.parse(rulesRes.value) : { rulesPage: null },
           blogVal ? JSON.parse(blogVal) : { blogPage: null },
-          voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null }
+          voiceRes && voiceRes.value ? JSON.parse(voiceRes.value) : { voiceNotes: null },
+          cupRes && cupRes.value ? JSON.parse(cupRes.value) : { cup: null }
         ));
         revRef.current = revRes && revRes.value ? revRes.value : null;
         setData(merged);
@@ -1554,6 +1607,59 @@ function ForecastRoomApp() {
     return run;
   }, []);
 
+  // CHECKED PREDICTION SUBMIT — like submitPredictions, but runs
+  // `validate(latestPredictions)` against freshly-read data immediately
+  // before writing, and refuses with its message if it returns one. Used by
+  // the cup knockouts, where a contestant may not copy their opponent's
+  // scoreline or first-goal minute: checking the page's own copy isn't
+  // enough, because the opponent may have submitted seconds ago. The write
+  // itself is a compare-and-swap where the database supports it, so two
+  // near-simultaneous submissions can't both slip past the check; if the
+  // swap keeps losing, it falls back to a normal write so nobody is ever
+  // blocked from saving. Returns { ok, error }.
+  const submitPredictionsChecked = useCallback((newEntries, validate) => {
+    const run = persistQueueRef.current.then(async () => {
+      try {
+        const currentRev = await readRevValue();
+        const wasFresh = (revRef.current ?? null) === (currentRev ?? null);
+        let mergedPredictions = null;
+        for (let attempt = 0; attempt < 3 && mergedPredictions === null; attempt++) {
+          const latest = await window.storage.get(PREDICTIONS_KEY, true);
+          const raw = latest && latest.value ? latest.value : null;
+          const latestPredictions = raw ? (JSON.parse(raw).predictions ?? {}) : {};
+          const problem = validate ? validate(latestPredictions) : null;
+          if (problem) {
+            setData((prev) => (prev ? { ...prev, predictions: latestPredictions } : prev)); // show the opponent's latest pick
+            return { ok: false, error: problem };
+          }
+          const merged = { ...latestPredictions, ...newEntries };
+          const json = JSON.stringify({ predictions: merged });
+          const canSwap = raw !== null && typeof window.storage.compareAndSwap === "function" && attempt < 2;
+          if (canSwap) {
+            const swapped = await window.storage.compareAndSwap(PREDICTIONS_KEY, raw, json);
+            if (!swapped) continue; // someone else saved in between — re-read and re-check
+          } else {
+            await window.storage.set(PREDICTIONS_KEY, json, true);
+          }
+          mergedPredictions = merged;
+        }
+        if (mergedPredictions === null) return { ok: false, error: "Your prediction didn't save — please try again." };
+        try {
+          const newRev = nextRevValue(currentRev);
+          const claimed = await claimRev(currentRev, newRev);
+          if (claimed && wasFresh) revRef.current = newRev;
+        } catch { /* best-effort — the prediction itself is already saved */ }
+        setSaveError(null);
+        setData((prev) => (prev ? { ...prev, predictions: mergedPredictions } : prev));
+        return { ok: true };
+      } catch {
+        return { ok: false, error: "Your prediction didn't save — check your connection and try again." };
+      }
+    });
+    persistQueueRef.current = run.catch(() => {});
+    return run;
+  }, []);
+
   const restoreSnapshot = useCallback(async (snapshotData) => {
     return persist(snapshotData);
   }, [persist]);
@@ -1578,6 +1684,7 @@ function ForecastRoomApp() {
         persist={persist}
         mergeProfileSave={mergeProfileSave}
         mergeMatchdayPatch={mergeMatchdayPatch}
+        mergeCupUpdate={mergeCupUpdate}
         registerAccount={registerAccount}
         reloadData={reloadFromStorage}
         onLogin={(user) => { setCurrentUser(user); setLeagueKey(user.leagueKey); }}
@@ -1666,10 +1773,19 @@ function ForecastRoomApp() {
           >
             <Newspaper size={13} /> Blog
           </button>
+          <button
+            onClick={() => setGlobalView(globalView === "cup" ? null : "cup")}
+            className={cx(
+              "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5 transition-colors",
+              globalView === "cup" ? "bg-slate-300 text-black border-slate-300" : "border-slate-300/50 text-slate-200 hover:border-slate-300"
+            )}
+          >
+            <Trophy size={13} /> FA Cup
+          </button>
         </div>
 
         {/* The current division's signature colour, as a strip under the banner. */}
-        <div style={{ height: 4, background: leagueAccent(safeLeagueKey) }} />
+        <div style={{ height: 4, background: globalView === "cup" ? CUP_ACCENT : leagueAccent(safeLeagueKey) }} />
       </div>
 
       {/* Voice-note stop ribbon: pinned bottom on every page while a note plays. */}
@@ -1708,6 +1824,10 @@ function ForecastRoomApp() {
         <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><RulesView data={data} adminMode={adminMode} persist={persist} /></main>
       ) : globalView === "blog" ? (
         <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8"><BlogView data={data} adminMode={adminMode} persist={persist} /></main>
+      ) : globalView === "cup" ? (
+        <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+          <CupView data={data} adminMode={adminMode} viewerId={currentUser.participantId} mergeCupUpdate={mergeCupUpdate} submitPredictions={submitPredictions} submitPredictionsChecked={submitPredictionsChecked} now={now} />
+        </main>
       ) : (
         <AppTabs
           league={league}
@@ -2525,6 +2645,28 @@ function HonoursView({ data, adminMode, persist }) {
                   </div>
                 );
               })}
+              {season.cup && (
+                <div className="border border-stone-200 rounded-2xl bg-white overflow-hidden">
+                  <div style={{ background: "#334155" }} className="px-4 py-2">
+                    <span className="font-display font-semibold text-sm text-slate-200">{season.cup.name}</span>
+                  </div>
+                  <div className="p-4 space-y-3">
+                    {!season.cup.completed && <p className="text-xs text-stone-400">The cup wasn't completed this season.</p>}
+                    {[[season.cup.champion, "Winner"], [season.cup.runnerUp, "Runner-up"]].map(([person, label], i) => person && (
+                      <div key={label} className="flex items-center gap-3">
+                        {i === 0 ? <Crown size={18} className="text-slate-500 shrink-0" /> : <Medal size={18} className="text-stone-400 shrink-0" />}
+                        {person.badge ? (
+                          <img src={person.badge} alt="" className="w-7 h-7 rounded-full border border-stone-200 object-contain shrink-0" />
+                        ) : (
+                          <div className="w-7 h-7 rounded-full bg-stone-100 border border-stone-200 shrink-0" />
+                        )}
+                        <span className="font-medium flex-1 truncate">{person.name}</span>
+                        <span className="text-xs text-stone-500">{label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         ))
@@ -2733,6 +2875,1651 @@ function VoiceNoteButton({ mdId, label }) {
       {playingThis ? <Square size={12} fill="currentColor" /> : <Mic size={13} />}
       {loadingThis ? "Loading…" : playingThis ? "Stop voice note" : "Play voice note"}
     </button>
+  );
+}
+
+
+// -----------------------------------------------------------------------------
+// THE FA CUP — a competition that runs across every division at once.
+//
+// Deliberately kept OUTSIDE the league objects (its own storage key, its own
+// top-level field) so cup rounds can never reach league standings, fixture
+// lists, head-to-head pairings or stats.
+//
+// Phase 1 (here): the group stage. Every entrant predicts ONE fixture per
+// round, drawn at random from a pool of that round's real FA Cup ties. More
+// entrants than fixtures simply means some fixtures are handed to more than
+// one contestant. Scoring is identical to the leagues (3 outcome, 1 per
+// team's goals, 1 margin = 6 max), but nobody plays anybody: a contestant's
+// raw score is added straight to the cup table.
+//
+// Phase 2 (below CupRoundCard): the 16th-place play-off and the knockout
+// bracket from the Round of 16, seeded 1v16, 2v15 and so on.
+// -----------------------------------------------------------------------------
+const CUP_SCORING = { resultPoints: 3, homeGoalPoints: 1, awayGoalPoints: 1, marginPoints: 1 };
+
+// The FA Cup's own colour identity — trophy silver — alongside the
+// divisions' amber / sky / green / rose. The cup page reuses the site's
+// amber styling throughout, so rather than restyle every element, the cup
+// page re-points the amber palette to silver within its own wrapper
+// (.cup-theme). Nothing outside the cup page is affected.
+const CUP_ACCENT = "#CBD5E1";
+const CUP_THEME_CSS = `.cup-theme {
+  --color-amber-50: #f8fafc; --color-amber-100: #f1f5f9; --color-amber-200: #e2e8f0;
+  --color-amber-300: #cbd5e1; --color-amber-400: #94a3b8; --color-amber-500: #64748b;
+  --color-amber-600: #475569; --color-amber-700: #334155; --color-amber-800: #1e293b; --color-amber-900: #0f172a;
+}`;
+
+function emptyCup() {
+  return { enabled: false, name: "FA Cup", entrants: [], groupRounds: [], knockout: null, playoff: null };
+}
+
+// Everyone in any enabled division, in one list. Taken as a snapshot when the
+// cup launches so later roster changes can't silently alter a running
+// competition — admin can re-take it deliberately.
+function cupEntrantSnapshot(data) {
+  const out = [];
+  Object.entries(data.leagues).forEach(([leagueKey, league]) => {
+    if (!league.enabled) return;
+    league.participants.forEach((p) => out.push({ id: p.id, leagueKey }));
+  });
+  return out;
+}
+
+// Resolves entrant ids to the live roster record, so names and badges stay
+// current even though the entrant list itself is frozen.
+function cupEntrantDetails(data) {
+  const cup = data.cup || emptyCup();
+  const byId = {};
+  Object.entries(data.leagues).forEach(([leagueKey, league]) => {
+    league.participants.forEach((p) => { byId[p.id] = { ...p, leagueKey, leagueName: league.name }; });
+  });
+  return cup.entrants
+    .map((e) => byId[e.id])
+    .filter(Boolean)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function cupPredictionsClosed(round, now = Date.now()) {
+  if (round.locked || round.resultsPublished) return true;
+  if (!round.predictionsCloseAt) return false;
+  return new Date(round.predictionsCloseAt).getTime() <= now;
+}
+
+function cupRoundStatus(round, adminMode, now) {
+  if (!round.drawPublished) return adminMode ? "draft" : "upcoming";
+  if (round.resultsPublished) return "completed";
+  if (cupPredictionsClosed(round, now)) return "locked";
+  return "open";
+}
+
+const CUP_STATUS_STYLES = {
+  draft: "bg-stone-100 text-stone-500 border-stone-300",
+  upcoming: "bg-stone-100 text-stone-500 border-stone-300",
+  open: "bg-emerald-50 text-emerald-700 border-emerald-300/40",
+  locked: "bg-amber-400/15 text-amber-700 border-amber-400/40",
+  completed: "bg-violet-700/10 text-violet-700 border-violet-700/30",
+};
+
+// Aggregate table across every published round. Raw scores only — no
+// head-to-head. Ties are resolved alphabetically, as the leagues do.
+function computeCupTable(data) {
+  const cup = data.cup || emptyCup();
+  const entrants = cupEntrantDetails(data);
+  const rows = entrants.map((p) => ({ id: p.id, name: p.name, badge: p.badge ?? null, leagueName: p.leagueName, points: 0, played: 0, perRound: {} }));
+  const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
+
+  cup.groupRounds.forEach((round) => {
+    if (!round.resultsPublished) return;
+    const fixtureById = Object.fromEntries((round.pool || []).map((f) => [f.id, f]));
+    Object.entries(round.assignments || {}).forEach(([pid, fixtureId]) => {
+      const row = byId[pid];
+      const fixture = fixtureById[fixtureId];
+      if (!row || !fixture) return;
+      const prediction = data.predictions[`${fixture.id}__${pid}`];
+      const { points, evaluated } = scoreMatch(fixture, prediction, CUP_SCORING);
+      row.points += points;
+      row.perRound[round.id] = points;
+      if (evaluated) row.played += 1;
+    });
+  });
+
+  rows.sort((a, b) => (b.points - a.points) || a.name.localeCompare(b.name));
+  rows.forEach((r, i) => { r.rank = i + 1; });
+  return rows;
+}
+
+function shuffled(list) {
+  const arr = [...list];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// Deals the round's fixtures across the entrants. Both sides are shuffled
+// first, so when there are more entrants than fixtures the duplicated ties
+// land on random contestants and are spread as evenly as possible.
+function drawCupAssignments(entrantIds, pool) {
+  if (pool.length === 0) return {};
+  const people = shuffled(entrantIds);
+  const fixtures = shuffled(pool.map((f) => f.id));
+  const assignments = {};
+  people.forEach((pid, i) => { assignments[pid] = fixtures[i % fixtures.length]; });
+  return assignments;
+}
+
+function CupView({ data, adminMode, viewerId, mergeCupUpdate, submitPredictions, submitPredictionsChecked, now }) {
+  const cup = data.cup || emptyCup();
+  const entrants = useMemo(() => cupEntrantDetails(data), [data]);
+  const table = useMemo(() => computeCupTable(data), [data]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // Every cup change goes through mergeCupUpdate: it's applied to the
+  // freshest stored cup, not this page's copy, so it can't be refused as
+  // stale while contestants are predicting. Returns { ok, error }.
+  const saveCup = async (updater) => {
+    setBusy(true);
+    const result = await mergeCupUpdate(updater);
+    setBusy(false);
+    if (!result.ok) { setError(result.error); return result; }
+    setError("");
+    return result;
+  };
+
+  const launchCup = () => saveCup((c) => ({ ...emptyCup(), ...c, enabled: true, entrants: cupEntrantSnapshot(data) }));
+  const refreshEntrants = () => saveCup((c) => ({ ...c, entrants: cupEntrantSnapshot(data) }));
+
+  const addRound = () => {
+    const n = cup.groupRounds.length + 1;
+    const round = {
+      id: `cupr_${Date.now()}`,
+      label: `Cup Round ${n}`,
+      scheduledDate: null,
+      predictionsCloseAt: null,
+      drawPublished: false,
+      locked: false,
+      resultsPublished: false,
+      pool: [],
+      assignments: {},
+    };
+    return saveCup((c) => ({ ...c, groupRounds: [...(c.groupRounds || []), round] }));
+  };
+
+  // `change` is either a plain patch, or a function (freshRound,
+  // freshPredictions) => patch | { error } for changes that must be checked
+  // against the latest stored state (draws, reallocations, removals).
+  const updateRound = (roundId, change) =>
+    saveCup((c, preds) => {
+      const fresh = (c.groupRounds || []).find((r) => r.id === roundId);
+      if (!fresh) return { error: "That cup round couldn't be found in the latest data — refresh the page and try again." };
+      const patch = typeof change === "function" ? change(fresh, preds) : change;
+      if (!patch || patch.error) return patch;
+      return { ...c, groupRounds: c.groupRounds.map((r) => (r.id === roundId ? { ...r, ...patch } : r)) };
+    });
+
+  // ---- Phase 2: deleting rounds, closing the group stage, play-off, knockouts
+  const playoff = cup.playoff || null;
+  const knockout = cup.knockout || null;
+  const stageClosed = !!playoff || !!knockout;
+  const cut = cupCutSize(entrants.length);
+  const groupComplete = cupGroupStageComplete(cup);
+  const qualification = useMemo(() => analyseCupQualification(table, cut), [table, cut]);
+  const byId = useMemo(() => Object.fromEntries(entrants.map((p) => [p.id, p])), [entrants]);
+
+  const deleteRound = (round) => {
+    const predCount = Object.entries(round.assignments || {}).filter(([pid, fid]) => data.predictions[`${fid}__${pid}`]).length;
+    const warning = predCount > 0
+      ? `Delete "${round.label}"? ${predCount} contestant${predCount === 1 ? " has" : "s have"} already predicted in it — their predictions will no longer count anywhere${round.resultsPublished ? ", and its points will be removed from the cup table" : ""}. This can't be undone.`
+      : `Delete "${round.label}"? This can't be undone.`;
+    if (!window.confirm(warning)) return;
+    saveCup((c) => {
+      if (c.playoff || c.knockout) return { error: "The group stage is closed — reset the knockout stage first if you really need to delete a group round." };
+      return { ...c, groupRounds: (c.groupRounds || []).filter((r) => r.id !== round.id) };
+    });
+  };
+
+  const closeGroupStage = () => {
+    if (!window.confirm("Close the group stage and lock in the final table? No more group rounds can be added after this.")) return;
+    saveCup((c, preds) => {
+      if (c.playoff || c.knockout) return { error: "The group stage has already been closed — refresh the page." };
+      if (!cupGroupStageComplete(c)) return { error: "Every group round's results must be published first." };
+      const freshData = { ...data, cup: c, predictions: preds };
+      const k = cupCutSize(cupEntrantDetails(freshData).length);
+      const q = analyseCupQualification(computeCupTable(freshData), k);
+      if (q.playoffIds.length > 0) {
+        return {
+          ...c,
+          playoff: {
+            id: `cuppo${Date.now()}`, cut: k, sureIds: q.sureIds, entrantIds: q.playoffIds, slots: q.slots, cutPoints: q.cutPoints,
+            fixture: cupNewFixture(), scheduledDate: null, predictionsCloseAt: null, locked: false, drawPublished: false, resultsPublished: false,
+          },
+        };
+      }
+      return { ...c, knockout: cupBuildKnockout(q.sureIds, k) };
+    });
+  };
+
+  const updatePlayoff = (change) =>
+    saveCup((c, preds) => {
+      if (!c.playoff) return { error: "The play-off couldn't be found in the latest data — refresh the page." };
+      if (c.knockout) return { error: "The knockout draw has already been made — the play-off is closed." };
+      const patch = change(c.playoff, preds);
+      if (!patch || patch.error) return patch;
+      return { ...c, playoff: { ...c.playoff, ...patch } };
+    });
+
+  const confirmPlayoff = () =>
+    saveCup((c, preds) => {
+      const po = c.playoff;
+      if (!po || !po.resultsPublished) return { error: "Publish the play-off results first." };
+      if (c.knockout) return { error: "The knockout draw has already been made — refresh the page." };
+      const ranked = rankCupPlayoff(po, preds);
+      if (!ranked) return { error: "The play-off result isn't complete yet." };
+      return { ...c, knockout: cupBuildKnockout([...po.sureIds, ...ranked.slice(0, po.slots).map((r) => r.id)], po.cut) };
+    });
+
+  const updateKoRound = (roundId, change) =>
+    saveCup((c, preds) => {
+      if (!c.knockout) return { error: "The knockout stage couldn't be found in the latest data — refresh the page." };
+      const fresh = c.knockout.rounds.find((r) => r.id === roundId);
+      if (!fresh) return { error: "That knockout round couldn't be found in the latest data — refresh the page." };
+      const patch = typeof change === "function" ? change(fresh, preds) : change;
+      if (!patch || patch.error) return patch;
+      return { ...c, knockout: { ...c.knockout, rounds: c.knockout.rounds.map((r) => (r.id === roundId ? { ...r, ...patch } : r)) } };
+    });
+
+  const updateTie = (roundId, tieId, change) =>
+    updateKoRound(roundId, (freshRound, preds) => {
+      if (freshRound.resultsPublished) return { error: "This round's results are published, so its ties can't be changed." };
+      const t = freshRound.ties.find((x) => x.id === tieId);
+      if (!t) return { error: "That tie couldn't be found in the latest data — refresh the page." };
+      const patch = change(t, preds);
+      if (!patch || patch.error) return patch;
+      return { ties: freshRound.ties.map((x) => (x.id === tieId ? { ...x, ...patch } : x)) };
+    });
+
+  const createNextRound = () =>
+    saveCup((c, preds) => {
+      const ko = c.knockout;
+      const last = ko ? ko.rounds[ko.rounds.length - 1] : null;
+      if (!last || !last.resultsPublished) return { error: "Publish this round's results first." };
+      if (last.ties.length === 1) return { error: "The final has already been played." };
+      const r = cupNextRound(ko, preds);
+      if (!r) return { error: "Every tie needs a result before the next round can be drawn." };
+      return { ...c, knockout: { ...ko, rounds: [...ko.rounds, r] } };
+    });
+
+  // Escape hatch: wipes the play-off and knockout stage and reopens the
+  // group stage. Meant for undoing a mistake (or clearing a test run) —
+  // any knockout predictions made stop counting.
+  const resetKnockout = () => {
+    if (!window.confirm("Reset the knockout stage? The play-off and every knockout round are removed and the group stage reopens. Any knockout or play-off predictions already made will no longer count. This can't be undone.")) return;
+    saveCup((c) => ({ ...c, playoff: null, knockout: null }));
+  };
+
+  const finalRound = knockout && knockout.rounds.length > 0 ? knockout.rounds[knockout.rounds.length - 1] : null;
+  const championDecision = finalRound && finalRound.ties.length === 1 && finalRound.resultsPublished ? decideKnockoutTie(finalRound.ties[0], data.predictions) : null;
+  const champion = championDecision ? byId[championDecision.winnerId] : null;
+  const qualifiedSet = new Set(knockout ? knockout.qualifiedIds : []);
+
+  if (!cup.enabled) {
+    return (
+      <div className="space-y-4 cup-theme">
+        <style>{CUP_THEME_CSS}</style>
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Trophy size={18} className="text-amber-400" /> {cup.name}</h2>
+        {adminMode ? (
+          <div className="border border-stone-200 rounded-2xl bg-white p-5 space-y-3">
+            <p className="text-sm text-stone-600">
+              The cup runs across every enabled division at once. Launching it takes a snapshot of everyone currently on a division roster
+              ({cupEntrantSnapshot(data).length} contestants) as the entrant list — you can re-take that snapshot later if the roster changes.
+            </p>
+            <button onClick={launchCup} disabled={busy} className="flex items-center gap-2 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+              <Trophy size={15} /> Launch the {cup.name}
+            </button>
+            {error && <p className="text-sm text-rose-600">{error}</p>}
+          </div>
+        ) : (
+          <p className="text-sm text-stone-500">The {cup.name} hasn't started yet — it'll appear here when your organiser launches it.</p>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 cup-theme">
+      <style>{CUP_THEME_CSS}</style>
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h2 className="font-display font-semibold text-lg flex items-center gap-2"><Trophy size={18} className="text-amber-400" /> {cup.name}</h2>
+        <span className="text-xs text-stone-500">{entrants.length} entrants across all divisions</span>
+      </div>
+
+      {error && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} className="shrink-0" /> {error}
+        </div>
+      )}
+
+      {adminMode && (
+        <div className="border border-stone-200 rounded-2xl bg-white p-4 flex flex-wrap items-center gap-2">
+          {!stageClosed ? (
+            <>
+              <button onClick={addRound} disabled={busy} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+                <Plus size={15} /> Add cup round
+              </button>
+              <button onClick={refreshEntrants} disabled={busy} className="text-xs bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 font-medium disabled:opacity-50">
+                Re-take entrant snapshot
+              </button>
+              <span className="text-[11px] text-stone-500">Rounds 1–4 make up the group stage (5 if under 16 entrants). Top {cut} qualify.</span>
+            </>
+          ) : (
+            <>
+              <span className="text-[11px] text-stone-500">The group stage is closed.</span>
+              <button onClick={resetKnockout} disabled={busy} className="ml-auto text-xs text-stone-500 hover:text-rose-600 border border-stone-300 rounded-lg px-3 py-2 disabled:opacity-50">
+                Reset knockout stage…
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {champion && (
+        <div className="border border-amber-400/60 bg-amber-400/10 rounded-2xl p-5 flex items-center gap-4">
+          <Crown size={30} className="text-amber-500 shrink-0" />
+          <BadgeAvatar participant={champion} name={champion.name} size={48} />
+          <div>
+            <div className="text-[11px] uppercase tracking-wide text-amber-700">{data.seasonLabel} {cup.name} winner</div>
+            <div className="font-display font-bold text-2xl">{champion.name}</div>
+          </div>
+        </div>
+      )}
+
+      {adminMode && groupComplete && !stageClosed && (
+        <div className="border border-emerald-300/50 bg-emerald-50 rounded-2xl p-4 space-y-2">
+          <h3 className="font-display font-semibold text-sm">Group stage complete</h3>
+          <p className="text-xs text-stone-700">
+            {qualification.playoffIds.length > 0
+              ? `${qualification.sureIds.length} contestants qualify outright. ${qualification.playoffIds.length} are level on ${qualification.cutPoints} points across the line, so they go to a play-off for the last ${qualification.slots} place${qualification.slots === 1 ? "" : "s"}: ${qualification.playoffIds.map((id) => byId[id]?.name ?? "?").join(", ")}.`
+              : `The top ${Math.min(cut, entrants.length)} qualify with no tie across the line, so the ${KO_ROUND_NAMES[cut / 2]} can be drawn straight away.`}
+          </p>
+          <button onClick={closeGroupStage} disabled={busy} className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+            <CheckCircle2 size={15} /> {qualification.playoffIds.length > 0 ? "Close group stage & set up the play-off" : `Close group stage & draw the ${KO_ROUND_NAMES[cut / 2]}`}
+          </button>
+        </div>
+      )}
+
+      {knockout && [...knockout.rounds].reverse().map((round, i) => (
+        <KnockoutRoundCard
+          key={round.id}
+          round={round}
+          isLast={i === 0}
+          isFinal={round.ties.length === 1}
+          data={data}
+          byId={byId}
+          viewerId={viewerId}
+          adminMode={adminMode}
+          now={now}
+          busy={busy}
+          onRoundUpdate={(change) => updateKoRound(round.id, change)}
+          onTieUpdate={(tieId, change) => updateTie(round.id, tieId, change)}
+          onNextRound={createNextRound}
+          submitPredictionsChecked={submitPredictionsChecked}
+        />
+      ))}
+
+      {playoff && (
+        <CupPlayoffCard
+          playoff={playoff}
+          data={data}
+          byId={byId}
+          viewerId={viewerId}
+          adminMode={adminMode}
+          now={now}
+          busy={busy}
+          onUpdate={updatePlayoff}
+          onConfirm={confirmPlayoff}
+          submitPredictionsChecked={submitPredictionsChecked}
+          knockoutStarted={!!knockout}
+        />
+      )}
+
+      {stageClosed && <h3 className="font-display font-semibold text-sm text-stone-600 pt-2">Group stage</h3>}
+
+      {cup.groupRounds.length === 0 ? (
+        <p className="text-sm text-stone-500">No cup rounds yet{adminMode ? " — add the first one above." : "."}</p>
+      ) : (
+        cup.groupRounds.map((round) => (
+          <CupRoundCard
+            key={round.id}
+            round={round}
+            cup={cup}
+            data={data}
+            entrants={entrants}
+            adminMode={adminMode}
+            viewerId={viewerId}
+            now={now}
+            busy={busy}
+            onUpdate={(patch) => updateRound(round.id, patch)}
+            onDelete={stageClosed ? null : () => deleteRound(round)}
+            submitPredictions={submitPredictions}
+          />
+        ))
+      )}
+
+      <section className="space-y-3">
+        <h3 className="font-display font-semibold flex items-center gap-2"><Trophy size={16} className="text-amber-400" /> Cup table</h3>
+        <div className="border border-stone-200 rounded-2xl bg-white overflow-hidden overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead className="bg-stone-900 text-white">
+              <tr>
+                <th className="px-2 sm:px-4 py-3 font-semibold w-9 sm:w-16 text-amber-300 text-left"><span className="sm:hidden">#</span><span className="hidden sm:inline">Rank</span></th>
+                <th className="px-2 sm:px-4 py-3 font-semibold text-amber-300 text-left">Contestant</th>
+                <th className="px-2 py-3 font-semibold text-amber-300 text-left hidden sm:table-cell">Division</th>
+                <th className="px-2 sm:px-4 py-3 font-semibold text-right text-amber-300">Played</th>
+                <th className="px-2.5 sm:px-4 py-3 font-display font-bold text-right text-amber-300 bg-white/10">Pts</th>
+              </tr>
+            </thead>
+            <tbody>
+              {table.map((row) => {
+                // Green = qualifying places; amber = in the play-off. Once
+                // the knockout draw is made, green shows who actually went
+                // through.
+                const inPlayoff = !knockout && playoff && playoff.entrantIds.includes(row.id);
+                const qualifies = knockout ? qualifiedSet.has(row.id) : playoff ? playoff.sureIds.includes(row.id) : row.rank <= cut;
+                return (
+                  <tr key={row.id} className={cx("border-t border-stone-100", qualifies && "bg-emerald-50", inPlayoff && "bg-amber-400/15", row.id === viewerId && "ring-1 ring-inset ring-amber-400/50")}>
+                    <td className="px-2 sm:px-4 py-3 font-mono-num text-stone-500">{row.rank}</td>
+                    <td className="px-2 sm:px-4 py-3 font-medium">
+                      <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
+                        <BadgeAvatar participant={row} name={row.name} size={22} />
+                        <span className="truncate">{row.name}</span>
+                      </div>
+                    </td>
+                    <td className="px-2 py-3 text-stone-500 text-xs hidden sm:table-cell">{row.leagueName}</td>
+                    <td className="px-2 sm:px-4 py-3 text-right font-mono-num text-stone-500">{row.played}</td>
+                    <td className="px-2.5 sm:px-4 py-3 text-right bg-amber-400/5">
+                      <span className="font-display font-bold text-lg text-amber-500">{row.points}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="text-[11px] text-stone-500">
+          Green rows are inside the qualifying places (top {cut}). Contestants level on points are separated alphabetically, which only affects
+          seeding for the knockout rounds. A tie across the qualifying line goes to a one-off play-off{playoff && !knockout ? " (silver rows)" : ""}.
+        </p>
+      </section>
+    </div>
+  );
+}
+
+
+// One cup round: the admin's pool and draw tools, the contestant's own
+// fixture and prediction, and — once the draw is published — every
+// entrant's allocated tie. Predictions stay hidden until the round's
+// deadline passes, exactly as they do in the leagues.
+function CupRoundCard({ round, cup, data, entrants, adminMode, viewerId, now, busy, onUpdate, onDelete, submitPredictions }) {
+  const status = cupRoundStatus(round, adminMode, now);
+  const fixtureById = Object.fromEntries((round.pool || []).map((f) => [f.id, f]));
+  const myFixtureId = round.assignments?.[viewerId];
+  const myFixture = myFixtureId ? fixtureById[myFixtureId] : null;
+  const closed = cupPredictionsClosed(round, now);
+  const canSeeOthers = adminMode || closed || round.resultsPublished;
+
+  const [newHome, setNewHome] = useState("");
+  const [newAway, setNewAway] = useState("");
+  const [expanded, setExpanded] = useState(!round.resultsPublished);
+  const [draft, setDraft] = useState({ home: "", away: "" });
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [localError, setLocalError] = useState("");
+  const [outcomes, setOutcomes] = useState(() =>
+    Object.fromEntries((round.pool || []).map((f) => [f.id, { home: f.outcome?.home ?? "", away: f.outcome?.away ?? "" }]))
+  );
+
+  // Round details are edited locally and saved together with one button —
+  // saving on every keystroke fired a full save per character, which could
+  // collide with itself and be refused part-way through typing.
+  const storedDetails = {
+    label: round.label ?? "",
+    scheduledDate: round.scheduledDate ? round.scheduledDate.slice(0, 10) : "",
+    predictionsCloseAt: toLocalInputValue(round.predictionsCloseAt),
+  };
+  const storedDetailsJson = JSON.stringify(storedDetails);
+  const [details, setDetails] = useState(storedDetails);
+  const [detailsLoadedJson, setDetailsLoadedJson] = useState(storedDetailsJson);
+  if (storedDetailsJson !== detailsLoadedJson) {
+    // The stored round changed (our own save landing, or a refresh) — resync.
+    setDetailsLoadedJson(storedDetailsJson);
+    setDetails(storedDetails);
+  }
+  const detailsDirty = JSON.stringify(details) !== storedDetailsJson;
+  const saveDetails = () => {
+    if (!details.label.trim()) { setLocalError("Give the round a name."); return; }
+    setLocalError("");
+    onUpdate({
+      label: details.label.trim(),
+      scheduledDate: details.scheduledDate || null,
+      predictionsCloseAt: details.predictionsCloseAt ? new Date(details.predictionsCloseAt).toISOString() : null,
+    });
+  };
+
+  // How many contestants have already predicted a given fixture (or any
+  // fixture in this round) — the safety checks below use this so that a
+  // draw, reallocation or removal can never silently orphan a prediction.
+  const predictionsOn = (fixtureId, preds = data.predictions) =>
+    Object.keys(round.assignments || {}).filter((pid) => preds[`${fixtureId}__${pid}`]).length;
+  const roundPredictionCount = (r, preds) =>
+    Object.entries(r.assignments || {}).filter(([pid, fid]) => preds[`${fid}__${pid}`]).length;
+
+  const myPrediction = myFixture ? data.predictions[`${myFixture.id}__${viewerId}`] : null;
+  useEffect(() => {
+    setDraft({ home: myPrediction?.home ?? "", away: myPrediction?.away ?? "" });
+  }, [myPrediction?.home, myPrediction?.away, myFixture?.id]);
+
+  const addFixture = () => {
+    if (!newHome.trim() || !newAway.trim()) { setLocalError("Enter both teams."); return; }
+    setLocalError("");
+    const fixture = { id: `cupfx${Date.now()}${Math.floor(Math.random() * 1000)}`, home: newHome.trim(), away: newAway.trim(), outcome: null };
+    onUpdate((fresh) => ({ pool: [...(fresh.pool || []), fixture] })).then((result) => {
+      if (result && result.ok) { setNewHome(""); setNewAway(""); }
+    });
+  };
+
+  const removeFixture = (id) => {
+    const already = predictionsOn(id);
+    if (already > 0 && !window.confirm(`${already} contestant${already === 1 ? " has" : "s have"} already predicted this fixture. Removing it unassigns them and their prediction will no longer count — they'd need a new tie and a new prediction. Remove it anyway?`)) return;
+    onUpdate((fresh) => {
+      const nextAssignments = { ...(fresh.assignments || {}) };
+      Object.entries(nextAssignments).forEach(([pid, fid]) => { if (fid === id) delete nextAssignments[pid]; });
+      return { pool: (fresh.pool || []).filter((f) => f.id !== id), assignments: nextAssignments };
+    });
+  };
+
+  // The draw is protected: it can't be re-run once published, and never
+  // once anyone has predicted against it — a re-draw would silently move
+  // those contestants onto new ties and orphan their predictions. Individual
+  // reallocations (below) remain available for one-off fixes.
+  const runDraw = () => {
+    if ((round.pool || []).length === 0) { setLocalError("Add this round's fixtures to the pool first."); return; }
+    if (round.drawPublished) { setLocalError("The draw is published — unpublish it first if you really need to re-draw, or reallocate individual contestants in the list below."); return; }
+    const redraw = Object.keys(round.assignments || {}).length > 0;
+    if (redraw && !window.confirm("Re-draw every contestant's tie? The current allocations will be replaced.")) return;
+    setLocalError("");
+    onUpdate((fresh, preds) => {
+      if (fresh.drawPublished) return { error: "The draw has been published since this page loaded — refresh the page before changing it." };
+      const already = roundPredictionCount(fresh, preds);
+      if (already > 0) return { error: `${already} contestant${already === 1 ? " has" : "s have"} already predicted this round, so it can't be re-drawn — that would wipe their predictions. Reallocate individual contestants in the list below instead.` };
+      if ((fresh.pool || []).length === 0) return { error: "This round's fixture pool is empty in the latest data — refresh the page." };
+      return { assignments: drawCupAssignments(entrants.map((p) => p.id), fresh.pool) };
+    });
+  };
+
+  const reallocate = (pid, fixtureId) => {
+    const current = round.assignments?.[pid];
+    if (current === fixtureId) return;
+    const name = entrants.find((p) => p.id === pid)?.name ?? "This contestant";
+    if (current && data.predictions[`${current}__${pid}`] && !window.confirm(`${name} has already predicted their current tie. Moving them to a different fixture means that prediction won't count and they'll need to predict the new one. Continue?`)) return;
+    onUpdate((fresh) => ({ assignments: { ...(fresh.assignments || {}), [pid]: fixtureId } }));
+  };
+
+  const saveOutcomes = () => {
+    onUpdate((fresh) => ({
+      pool: (fresh.pool || []).map((f) => {
+        const o = outcomes[f.id];
+        if (!o) return f; // a fixture added elsewhere since this page loaded — leave it as stored
+        const filled = o.home !== "" && o.away !== "";
+        return { ...f, outcome: filled ? { home: Number(o.home), away: Number(o.away) } : null };
+      }),
+    }));
+  };
+
+  const allScored = (round.pool || []).length > 0 && round.pool.every((f) => f.outcome);
+
+  const submitMyPrediction = async () => {
+    if (!myFixture) return;
+    if (draft.home === "" || draft.away === "") { setLocalError("Enter a score for both teams."); return; }
+    if (cupPredictionsClosed(round, Date.now())) { setLocalError("Predictions have closed for this round."); return; }
+    setLocalError("");
+    const ok = await submitPredictions({
+      [`${myFixture.id}__${viewerId}`]: { home: Number(draft.home), away: Number(draft.away), submittedAt: new Date().toISOString() },
+    });
+    if (!ok) { setLocalError("That didn't save — check your connection and try again."); return; }
+    setSavedFlash(true);
+    setTimeout(() => setSavedFlash(false), 1800);
+  };
+
+  const dirty = myFixture && (String(draft.home) !== String(myPrediction?.home ?? "") || String(draft.away) !== String(myPrediction?.away ?? ""));
+
+  // A completed round folds away, like the matrix and fixture list do.
+  if (round.resultsPublished && !expanded) {
+    const myPoints = (() => {
+      if (!myFixture) return null;
+      return scoreMatch(myFixture, myPrediction, CUP_SCORING).points;
+    })();
+    return (
+      <button onClick={() => setExpanded(true)} className="w-full flex items-center justify-between gap-2 border border-stone-200 rounded-xl px-3 py-2.5 bg-stone-50 hover:bg-stone-100 text-left">
+        <span className="flex items-center gap-2 min-w-0">
+          <span className="font-display font-semibold text-xs shrink-0">{round.label}</span>
+          {round.scheduledDate && <span className="text-[10px] text-stone-400 shrink-0">{fmtDateOnly(round.scheduledDate)}</span>}
+          {myPoints !== null && <span className="text-[11px] font-medium text-stone-600 truncate">{myPoints} pts — {myFixture.home} v {myFixture.away}</span>}
+        </span>
+        <span className="text-[10px] text-stone-400 shrink-0">expand ▾</span>
+      </button>
+    );
+  }
+
+  return (
+    <section className="border border-stone-200 rounded-2xl bg-white p-5 space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="flex items-center gap-2">
+          <h3 className="font-display font-semibold">{round.label}</h3>
+          {round.scheduledDate && <span className="text-xs text-stone-400">{fmtDateOnly(round.scheduledDate)}</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", CUP_STATUS_STYLES[status])}>{status}</span>
+          {round.resultsPublished && <button onClick={() => setExpanded(false)} className="text-[10px] text-stone-400 hover:text-stone-600">collapse ▴</button>}
+        </div>
+      </div>
+
+      {localError && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-sm rounded-lg px-3 py-2">
+          <AlertCircle size={16} className="shrink-0" /> {localError}
+        </div>
+      )}
+
+      {/* ---------------- Contestant: my tie and my prediction ---------------- */}
+      {!adminMode && (
+        round.drawPublished ? (
+          myFixture ? (
+            <div className="border border-amber-400/40 bg-amber-400/5 rounded-xl p-4 space-y-3">
+              <div className="text-[11px] uppercase tracking-wide text-amber-700">Your tie this round</div>
+              <div className="font-display font-semibold text-lg">
+                <ClubName name={myFixture.home} clubLibrary={data.clubLibrary} size={18} /> v <ClubName name={myFixture.away} clubLibrary={data.clubLibrary} size={18} />
+              </div>
+              {round.resultsPublished && myFixture.outcome && (
+                <div className="text-sm text-amber-700 font-mono-num">
+                  FT {myFixture.outcome.home}–{myFixture.outcome.away} · you scored {scoreMatch(myFixture, myPrediction, CUP_SCORING).points} pts
+                </div>
+              )}
+              {!closed ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <input type="number" min="0" value={draft.home} onChange={(e) => setDraft((d) => ({ ...d, home: e.target.value }))} className="w-16 bg-white border border-stone-300 rounded-lg px-2 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                  <span className="text-stone-400">–</span>
+                  <input type="number" min="0" value={draft.away} onChange={(e) => setDraft((d) => ({ ...d, away: e.target.value }))} className="w-16 bg-white border border-stone-300 rounded-lg px-2 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+                  <button
+                    onClick={submitMyPrediction}
+                    onMouseDown={(e) => e.preventDefault()}
+                    disabled={!dirty && !!myPrediction}
+                    className={cx("font-semibold rounded-lg px-4 py-2 text-sm flex items-center gap-1.5", (dirty || !myPrediction) ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default")}
+                  >
+                    {savedFlash ? <><CheckCircle2 size={15} /> Saved</> : (dirty || !myPrediction) ? "Submit prediction" : <><CheckCircle2 size={15} /> Submitted</>}
+                  </button>
+                </div>
+              ) : (
+                <div className="text-sm text-stone-600">
+                  {myPrediction ? `Your prediction: ${myPrediction.home}–${myPrediction.away}` : "You didn't predict this round."}
+                </div>
+              )}
+              <p className="text-[11px] text-stone-500">Predictions are for the score after 90 minutes.</p>
+            </div>
+          ) : (
+            <p className="text-sm text-stone-500">You haven't been allocated a tie for this round yet.</p>
+          )
+        ) : (
+          <p className="text-sm text-stone-500">The draw for this round hasn't been published yet.</p>
+        )
+      )}
+
+      {/* ---------------- Admin: pool, draw, deadlines, outcomes ---------------- */}
+      {adminMode && (
+        <div className="space-y-4">
+          <div className="grid sm:grid-cols-3 gap-3">
+            <label className="text-xs text-stone-500">Label
+              <input value={details.label} onChange={(e) => setDetails((d) => ({ ...d, label: e.target.value }))} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            </label>
+            <label className="text-xs text-stone-500">Round date
+              <input type="date" value={details.scheduledDate} onChange={(e) => setDetails((d) => ({ ...d, scheduledDate: e.target.value }))} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            </label>
+            <label className="text-xs text-stone-500">Predictions close
+              <input type="datetime-local" value={details.predictionsCloseAt} onChange={(e) => setDetails((d) => ({ ...d, predictionsCloseAt: e.target.value }))} className="w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+            </label>
+          </div>
+          <button
+            onClick={saveDetails}
+            disabled={!detailsDirty || busy}
+            className={cx(
+              "flex items-center gap-1.5 font-semibold rounded-lg px-4 py-2 text-sm",
+              detailsDirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default"
+            )}
+          >
+            {detailsDirty ? "Save round details" : <><CheckCircle2 size={14} /> Round details saved</>}
+          </button>
+
+          <div>
+            <h4 className="text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2">Fixture pool ({(round.pool || []).length}) · {entrants.length} entrants</h4>
+            {(round.pool || []).length > 0 && (
+              <div className="space-y-1.5 mb-3">
+                {round.pool.map((f) => {
+                  const holders = Object.values(round.assignments || {}).filter((fid) => fid === f.id).length;
+                  return (
+                    <div key={f.id} className="flex flex-wrap items-center gap-2 border border-stone-200 rounded-xl px-3 py-1.5 bg-stone-50">
+                      <span className="text-sm font-medium flex-1 min-w-[160px]">
+                        {/* Crest / colour pill from the club library, so spellings can be
+                            checked while setting up the round. A name with no library
+                            match gets a dashed underline (see the legend below). */}
+                        {[f.home, f.away].map((team, ti) => (
+                          <React.Fragment key={ti}>
+                            {ti === 1 && <span className="text-stone-400 font-normal"> v </span>}
+                            {clubIdentityFor(team, data.clubLibrary)
+                              ? <ClubName name={team} clubLibrary={data.clubLibrary} size={14} />
+                              : <span className="border-b border-dashed border-stone-400" title="Not found in the club library — check the spelling, or add this club (or this spelling as an alias)">{team}</span>}
+                          </React.Fragment>
+                        ))}
+                      </span>
+                      <span className="text-[10px] text-stone-500">{holders} contestant{holders === 1 ? "" : "s"}</span>
+                      <input type="number" min="0" placeholder="-" value={outcomes[f.id]?.home ?? ""} onChange={(e) => setOutcomes((o) => ({ ...o, [f.id]: { ...o[f.id], home: e.target.value } }))} className="w-12 bg-white border border-stone-300 rounded px-1 py-1 text-sm text-center" />
+                      <span className="text-stone-400 text-xs">–</span>
+                      <input type="number" min="0" placeholder="-" value={outcomes[f.id]?.away ?? ""} onChange={(e) => setOutcomes((o) => ({ ...o, [f.id]: { ...o[f.id], away: e.target.value } }))} className="w-12 bg-white border border-stone-300 rounded px-1 py-1 text-sm text-center" />
+                      <button onClick={() => removeFixture(f.id)} className="text-stone-400 hover:text-rose-600" title="Remove this fixture"><X size={14} /></button>
+                    </div>
+                  );
+                })}
+                {round.pool.some((f) => !clubIdentityFor(f.home, data.clubLibrary) || !clubIdentityFor(f.away, data.clubLibrary)) && (
+                  <p className="text-[11px] text-stone-500">
+                    <span className="border-b border-dashed border-stone-400">Dashed underline</span> = not found in the club library, so no crest or colours will show.
+                    Check the spelling, or add the club (or this spelling as an alias) in Admin → Club identity library.
+                  </p>
+                )}
+                <button onClick={saveOutcomes} disabled={busy} className="mt-1 flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50">
+                  Save scores
+                </button>
+              </div>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <input value={newHome} onChange={(e) => setNewHome(e.target.value)} placeholder="Home team" className="flex-1 min-w-[130px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+              <input value={newAway} onChange={(e) => setNewAway(e.target.value)} placeholder="Away team" className="flex-1 min-w-[130px] bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50" />
+              <button onClick={addFixture} disabled={busy} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+                <Plus size={15} /> Add to pool
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 pt-3">
+            <button
+              onClick={runDraw}
+              disabled={busy || round.drawPublished}
+              title={round.drawPublished ? "Locked while the draw is published — reallocate individual contestants below instead" : undefined}
+              className="flex items-center gap-1.5 bg-stone-200 hover:bg-stone-300 border border-stone-300 rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50"
+            >
+              {Object.keys(round.assignments || {}).length > 0 ? "Re-draw allocations" : "Draw allocations"}
+            </button>
+            <button
+              onClick={() => onUpdate({ drawPublished: !round.drawPublished })}
+              disabled={busy || Object.keys(round.assignments || {}).length === 0}
+              className={cx("rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50", round.drawPublished ? "bg-stone-200 hover:bg-stone-300 border border-stone-300" : "bg-violet-700 hover:bg-violet-600 text-white")}
+            >
+              {round.drawPublished ? "Unpublish draw" : "Publish draw to contestants"}
+            </button>
+            {allScored && !round.resultsPublished && (
+              <button onClick={() => onUpdate({ resultsPublished: true })} disabled={busy} className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+                <CheckCircle2 size={15} /> Publish results &amp; update the cup table
+              </button>
+            )}
+            {round.resultsPublished && <span className="text-xs text-emerald-700 inline-flex items-center gap-1"><CheckCircle2 size={13} /> results published</span>}
+            {onDelete && (
+              <button onClick={onDelete} disabled={busy} className="ml-auto flex items-center gap-1 text-xs text-stone-500 hover:text-rose-600 disabled:opacity-50" title="Delete this round (e.g. a test round)">
+                <Trash2 size={13} /> Delete round
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ---------------- Everyone: the allocated ties ---------------- */}
+      {round.drawPublished && Object.keys(round.assignments || {}).length > 0 && (
+        <div>
+          <h4 className="text-xs font-semibold text-stone-500 uppercase tracking-wide mb-2">
+            Allocated ties{!canSeeOthers && " — predictions hidden until the deadline"}
+          </h4>
+          {adminMode && (() => {
+            // With more entrants than fixtures some ties are doubled up; this
+            // shows how evenly, so a reshuffle can be judged at a glance.
+            const counts = {};
+            Object.values(round.assignments || {}).forEach((fid) => { counts[fid] = (counts[fid] || 0) + 1; });
+            const vals = Object.values(counts);
+            if (vals.length === 0) return null;
+            return (
+              <p className="text-[11px] text-stone-500 mb-2">
+                {entrants.length} contestants across {round.pool.length} ties · each tie held by {Math.min(...vals)}–{Math.max(...vals)} contestant{Math.max(...vals) === 1 ? "" : "s"}
+              </p>
+            );
+          })()}
+          <div className="border border-stone-200 rounded-xl overflow-hidden overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <tbody>
+                {entrants.map((p) => {
+                  const f = fixtureById[round.assignments[p.id]];
+                  if (!f) return null;
+                  const pred = data.predictions[`${f.id}__${p.id}`];
+                  return (
+                    <tr key={p.id} className={cx("border-t border-stone-100 first:border-t-0", p.id === viewerId && "bg-amber-400/5")}>
+                      <td className="px-3 py-2 font-medium">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <BadgeAvatar participant={p} name={p.name} size={20} />
+                          <span className="truncate">{p.name}</span>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 text-stone-600 text-xs">
+                        {adminMode && !round.resultsPublished ? (
+                          // Manual override: the random draw is the default,
+                          // but any individual tie can be reallocated without
+                          // disturbing anyone else's.
+                          <select
+                            value={round.assignments[p.id]}
+                            onChange={(e) => reallocate(p.id, e.target.value)}
+                            className="bg-white border border-stone-300 rounded px-1.5 py-1 text-xs max-w-[220px] focus:outline-none focus:ring-2 focus:ring-violet-600/50"
+                            title="Reallocate this contestant's tie"
+                          >
+                            {round.pool.map((opt) => (
+                              <option key={opt.id} value={opt.id}>{opt.home} v {opt.away}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <><ClubName name={f.home} clubLibrary={data.clubLibrary} size={12} /> v <ClubName name={f.away} clubLibrary={data.clubLibrary} size={12} /></>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right font-mono-num text-xs">
+                        {canSeeOthers || p.id === viewerId
+                          ? (pred ? `${pred.home}–${pred.away}` : <span className="text-stone-400 italic">no pick</span>)
+                          : (pred ? <span className="text-stone-400 inline-flex items-center gap-1"><EyeOff size={10} /> in</span> : <span className="text-stone-300">—</span>)}
+                      </td>
+                      {round.resultsPublished && (
+                        <td className="px-3 py-2 text-right font-mono-num text-xs text-amber-600 w-14">
+                          {scoreMatch(f, pred, CUP_SCORING).points} pts
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// -----------------------------------------------------------------------------
+// FA CUP PHASE 2 — the 16th-place play-off and the knockout bracket.
+//
+// QUALIFYING. Once every group round's results are published, admin closes
+// the group stage. The top 16 qualify (top 8 when there are fewer than 16
+// entrants). Ties INSIDE the qualifying places are settled alphabetically
+// and only affect seeding. A tie that STRADDLES the cut line (e.g. 15th–18th
+// all level) sends every contestant on that points total to a one-off
+// play-off for the remaining places; everyone above them qualifies outright.
+//
+// KNOCKOUTS. Round of 16 → Quarter-finals → Semi-finals → Final, seeded
+// 1v16, 2v15… on a fixed bracket (the 1v16 winner meets the 8v9 winner, and
+// so on, like a tennis draw). Each tie has one admin-set fixture. Both
+// contestants predict the 90-minute score AND the minute of the first goal
+// (not applicable on a 0-0 prediction). Knockout predictions are public the
+// moment they're submitted, and a contestant can't submit the same
+// scoreline — or the same first-goal minute — as their opponent's current
+// prediction (checked against freshly-read data at the moment of saving).
+//
+// WHO GOES THROUGH (also used to rank the play-off):
+//   1. more prediction points (same 6-point scoring as everywhere else)
+//   2. closer to the match's total goals
+//   3. closer to the first-goal time: a predicted minute N means N:00,
+//      compared to the second with the actual time admin enters. A match
+//      that ends 0-0 counts as a first goal at 90:00. A contestant with no
+//      minute (they predicted 0-0) loses this step to one who has a minute.
+//   4. if both are exactly equidistant from the first goal, the one whose
+//      minute is in the same HALF as the goal goes through. Minutes 1–45 are
+//      the first half, 46–90 the second; an actual time up to and including
+//      45:00 is the first half (admin enters any first-half stoppage-time
+//      goal as 45:00). So with a goal at 45:00, 44' beats 46' and 40' beats
+//      50'.
+//   5. backstop — only reachable if both are equidistant AND in the same
+//      half (e.g. 20' and 30' with the goal at 25:00): the higher seed
+//      progresses. In the play-off: the higher group-table place.
+// A contestant who made no prediction loses to one who did.
+// -----------------------------------------------------------------------------
+const KO_SEED_ORDER = {
+  16: [1, 16, 8, 9, 4, 13, 5, 12, 2, 15, 7, 10, 3, 14, 6, 11],
+  8: [1, 8, 4, 5, 2, 7, 3, 6],
+};
+const KO_ROUND_NAMES = { 8: "Round of 16", 4: "Quarter-finals", 2: "Semi-finals", 1: "Final" };
+const CUP_FULL_TIME_SEC = 90 * 60;
+
+function cupCutSize(entrantCount) {
+  return entrantCount < 16 ? 8 : 16;
+}
+
+function cupGroupStageComplete(cup) {
+  return (cup.groupRounds || []).length > 0 && cup.groupRounds.every((r) => r.resultsPublished);
+}
+
+function cupNewFixture() {
+  return { id: `cupko${Date.now()}${Math.floor(Math.random() * 100000)}`, home: "", away: "", outcome: null, firstGoalSec: null };
+}
+
+// Splits the final group table into: qualified outright, and (if a tie
+// straddles the cut line) the play-off contestants and how many places
+// they're playing for.
+function analyseCupQualification(table, cut) {
+  if (table.length <= cut) return { sureIds: table.map((r) => r.id), playoffIds: [], slots: 0, cutPoints: null };
+  const cutPoints = table[cut - 1].points;
+  const firstTied = table.findIndex((r) => r.points === cutPoints);
+  const tied = table.filter((r) => r.points === cutPoints);
+  const lastTied = firstTied + tied.length - 1;
+  if (lastTied < cut) return { sureIds: table.slice(0, cut).map((r) => r.id), playoffIds: [], slots: 0, cutPoints };
+  return {
+    sureIds: table.slice(0, firstTied).map((r) => r.id),
+    playoffIds: tied.map((r) => r.id), // table order (alphabetical within the tie)
+    slots: cut - firstTied,
+    cutPoints,
+  };
+}
+
+// The actual first-goal time in seconds: what admin entered, or 90:00 for a
+// goalless match. null = not entered yet.
+function cupActualFirstGoalSec(fixture) {
+  if (!fixture || !fixture.outcome) return null;
+  if (fixture.outcome.home + fixture.outcome.away === 0) return CUP_FULL_TIME_SEC;
+  return typeof fixture.firstGoalSec === "number" ? fixture.firstGoalSec : null;
+}
+
+function cupFixtureResolved(fixture) {
+  return !!fixture && !!fixture.outcome && cupActualFirstGoalSec(fixture) !== null;
+}
+
+function cupTiebreakProfile(fixture, pred) {
+  if (!pred) return { predicted: false, points: 0, goalGap: Infinity, minuteGap: Infinity, rightHalf: false };
+  const actual = fixture.outcome;
+  const points = scoreMatch(fixture, pred, CUP_SCORING).points;
+  const goalGap = Math.abs((pred.home + pred.away) - (actual.home + actual.away));
+  const fg = cupActualFirstGoalSec(fixture);
+  const hasMinute = typeof pred.firstGoalMin === "number";
+  const minuteGap = hasMinute && fg !== null ? Math.abs(pred.firstGoalMin * 60 - fg) : Infinity;
+  // Same half as the actual first goal? (1–45 / up to 45:00 = first half.)
+  const rightHalf = hasMinute && fg !== null && (pred.firstGoalMin <= 45) === (fg <= 45 * 60);
+  return { predicted: true, points, goalGap, minuteGap, rightHalf };
+}
+
+// Negative when a is ahead of b. `reason` names the step that separated them.
+function compareCupProfiles(a, b) {
+  if (a.predicted !== b.predicted) return { cmp: a.predicted ? -1 : 1, reason: "noprediction" };
+  if (a.points !== b.points) return { cmp: a.points > b.points ? -1 : 1, reason: "points" };
+  if (a.goalGap !== b.goalGap) return { cmp: a.goalGap < b.goalGap ? -1 : 1, reason: "goals" };
+  if (a.minuteGap !== b.minuteGap) return { cmp: a.minuteGap < b.minuteGap ? -1 : 1, reason: "minute" };
+  if (a.rightHalf !== b.rightHalf) return { cmp: a.rightHalf ? -1 : 1, reason: "half" };
+  return null;
+}
+
+const CUP_REASON_TEXT = {
+  points: "more prediction points",
+  goals: "closer to the total goals (1st tiebreak)",
+  minute: "closer to the first-goal time (2nd tiebreak)",
+  half: "equally close to the first-goal time, but in the right half (3rd tiebreak)",
+  seed: "level on every tiebreak — higher seed goes through",
+  table: "level on every tiebreak — higher group-stage place goes through",
+  noprediction: "opponent made no prediction",
+  bye: "bye",
+};
+
+function decideKnockoutTie(tie, predictions) {
+  if (tie.homeId && !tie.awayId) return { winnerId: tie.homeId, reason: "bye", profiles: {} };
+  if (!tie.homeId) return null;
+  if (!cupFixtureResolved(tie.fixture)) return null;
+  const ph = cupTiebreakProfile(tie.fixture, predictions[`${tie.fixture.id}__${tie.homeId}`]);
+  const pa = cupTiebreakProfile(tie.fixture, predictions[`${tie.fixture.id}__${tie.awayId}`]);
+  const profiles = { [tie.homeId]: ph, [tie.awayId]: pa };
+  const c = compareCupProfiles(ph, pa);
+  if (c) return { winnerId: c.cmp < 0 ? tie.homeId : tie.awayId, reason: c.reason, profiles };
+  // Home is always the higher seed (see cupMakeTie).
+  return { winnerId: tie.homeId, reason: "seed", profiles };
+}
+
+// Ranks everyone in the play-off; ties on every step fall back to their
+// order in the group table.
+function rankCupPlayoff(playoff, predictions) {
+  if (!cupFixtureResolved(playoff.fixture)) return null;
+  const rows = playoff.entrantIds.map((id, tableOrder) => ({
+    id,
+    tableOrder,
+    profile: cupTiebreakProfile(playoff.fixture, predictions[`${playoff.fixture.id}__${id}`]),
+  }));
+  rows.sort((a, b) => {
+    const c = compareCupProfiles(a.profile, b.profile);
+    return c ? c.cmp : a.tableOrder - b.tableOrder;
+  });
+  return rows;
+}
+
+function cupMakeTie(idA, seedA, idB, seedB) {
+  // Higher seed (lower number) is listed first ("home") — it's also the
+  // backstop winner if every tiebreak is level.
+  let [hId, hSeed, aId, aSeed] = [idA, seedA, idB, seedB];
+  if (!hId || (aId && aSeed < hSeed)) [hId, hSeed, aId, aSeed] = [aId, aSeed, hId, hSeed];
+  return { id: `cuptie${Date.now()}${Math.floor(Math.random() * 100000)}`, homeId: hId ?? null, homeSeed: hId ? hSeed : null, awayId: aId ?? null, awaySeed: aId ? aSeed : null, fixture: cupNewFixture() };
+}
+
+function cupMakeRound(ties) {
+  return {
+    id: `cupko_r${Date.now()}`,
+    name: KO_ROUND_NAMES[ties.length] ?? `Round of ${ties.length * 2}`,
+    ties,
+    scheduledDate: null,
+    predictionsCloseAt: null,
+    locked: false,
+    drawPublished: false,
+    resultsPublished: false,
+  };
+}
+
+// The opening knockout round from the final seeding (qualifiedIds[0] is
+// seed 1). Missing seeds — only if the field were ever smaller than the
+// bracket — become byes for the top seeds.
+function cupBuildKnockout(qualifiedIds, cut) {
+  const order = KO_SEED_ORDER[cut];
+  const seeds = {};
+  qualifiedIds.forEach((id, i) => { seeds[id] = i + 1; });
+  const ties = [];
+  for (let i = 0; i < order.length; i += 2) {
+    const s1 = order[i], s2 = order[i + 1];
+    ties.push(cupMakeTie(qualifiedIds[s1 - 1] ?? null, s1, qualifiedIds[s2 - 1] ?? null, s2));
+  }
+  return { cut, qualifiedIds, seeds, rounds: [cupMakeRound(ties)] };
+}
+
+function cupNextRound(knockout, predictions) {
+  const last = knockout.rounds[knockout.rounds.length - 1];
+  const winners = last.ties.map((t) => {
+    const d = decideKnockoutTie(t, predictions);
+    return d ? d.winnerId : null;
+  });
+  if (winners.some((w) => !w)) return null;
+  const ties = [];
+  for (let i = 0; i < winners.length; i += 2) {
+    ties.push(cupMakeTie(winners[i], knockout.seeds[winners[i]], winners[i + 1], knockout.seeds[winners[i + 1]]));
+  }
+  return cupMakeRound(ties);
+}
+
+// FA CUP — SEASON ARCHIVING (Phase 3). Every cup match id starts "cupfx"
+// (group stage) or "cupko" (play-off and knockouts), which lets season-end
+// clear ALL cup predictions — including ones orphaned by deleted rounds or
+// changed fixtures — so nothing accumulates in storage season after season.
+function isCupMatchId(matchId) {
+  return matchId.startsWith("cupfx") || matchId.startsWith("cupko");
+}
+
+function cupFixtureIds(cup) {
+  const ids = new Set();
+  (cup.groupRounds || []).forEach((r) => (r.pool || []).forEach((f) => ids.add(f.id)));
+  if (cup.playoff) ids.add(cup.playoff.fixture.id);
+  ((cup.knockout && cup.knockout.rounds) || []).forEach((r) => r.ties.forEach((t) => ids.add(t.fixture.id)));
+  return ids;
+}
+
+// The whole cup, frozen for the season archive: final group table, the
+// full bracket, every prediction made on a live cup fixture, and the
+// winner and runner-up (null if the cup didn't reach a published final).
+// Names and badges are copied in, so the record stands on its own even if
+// contestants later leave.
+function cupArchiveRecord(data) {
+  const cup = data.cup;
+  if (!cup || !cup.enabled) return null;
+  const people = {};
+  Object.values(data.leagues).forEach((l) => l.participants.forEach((p) => { people[p.id] = { id: p.id, name: p.name, badge: p.badge || null }; }));
+  const ids = cupFixtureIds(cup);
+  const predictions = {};
+  Object.entries(data.predictions).forEach(([k, v]) => { if (ids.has(matchIdFromPredictionKey(k))) predictions[k] = v; });
+  const ko = cup.knockout;
+  const final = ko && ko.rounds.length > 0 ? ko.rounds[ko.rounds.length - 1] : null;
+  let championId = null, runnerUpId = null;
+  if (final && final.ties.length === 1 && final.resultsPublished) {
+    const d = decideKnockoutTie(final.ties[0], data.predictions);
+    if (d) {
+      championId = d.winnerId;
+      const t = final.ties[0];
+      runnerUpId = t.homeId === d.winnerId ? t.awayId : t.homeId;
+    }
+  }
+  return {
+    name: cup.name,
+    completed: !!championId,
+    champion: championId ? (people[championId] ?? { id: championId, name: "?", badge: null }) : null,
+    runnerUp: runnerUpId ? (people[runnerUpId] ?? { id: runnerUpId, name: "?", badge: null }) : null,
+    participants: (cup.entrants || []).map((e) => people[e.id]).filter(Boolean),
+    finalTable: computeCupTable(data).map((r) => ({ id: r.id, name: r.name, rank: r.rank, points: r.points, played: r.played })),
+    groupRounds: JSON.parse(JSON.stringify(cup.groupRounds || [])),
+    playoff: cup.playoff ? JSON.parse(JSON.stringify(cup.playoff)) : null,
+    knockout: ko ? JSON.parse(JSON.stringify(ko)) : null,
+    predictions,
+  };
+}
+
+function fmtCupSec(sec) {
+  if (typeof sec !== "number") return "—";
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+}
+
+function fmtCupPrediction(pred, withMinute) {
+  if (!pred) return null;
+  const score = `${pred.home}–${pred.away}`;
+  if (!withMinute) return score;
+  return typeof pred.firstGoalMin === "number" ? `${score} · 1st goal ${pred.firstGoalMin}'` : `${score} · no goal`;
+}
+
+// The contestant's scoreline (+ optional first-goal minute) entry, with a
+// saved-state button. `clashCheck(entry)` gives instant feedback; the same
+// rule is re-checked against fresh data inside `onSubmit`.
+function CupPredictionForm({ existing, withMinute, onSubmit, clashCheck }) {
+  const fromExisting = () => ({
+    home: existing ? String(existing.home) : "",
+    away: existing ? String(existing.away) : "",
+    minute: existing && typeof existing.firstGoalMin === "number" ? String(existing.firstGoalMin) : "",
+  });
+  const existingJson = JSON.stringify(existing ?? null);
+  const [f, setF] = useState(fromExisting);
+  const [loadedJson, setLoadedJson] = useState(existingJson);
+  if (existingJson !== loadedJson) { setLoadedJson(existingJson); setF(fromExisting()); }
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const nil = f.home !== "" && f.away !== "" && Number(f.home) === 0 && Number(f.away) === 0;
+  const stored = fromExisting();
+  const dirty = !existing || f.home !== stored.home || f.away !== stored.away || (withMinute && !nil && f.minute !== stored.minute);
+
+  const submit = async () => {
+    const h = Number(f.home), a = Number(f.away), m = Number(f.minute);
+    if (f.home === "" || f.away === "" || !Number.isInteger(h) || !Number.isInteger(a) || h < 0 || a < 0) { setErr("Enter a whole-number score for both teams."); return; }
+    if (withMinute && !nil && (f.minute === "" || !Number.isInteger(m) || m < 1 || m > 90)) { setErr("Enter the minute of the first goal — a whole number from 1 to 90."); return; }
+    const entry = { home: h, away: a, submittedAt: new Date().toISOString() };
+    if (withMinute) entry.firstGoalMin = nil ? null : m;
+    const clash = clashCheck ? clashCheck(entry) : null;
+    if (clash) { setErr(clash); return; }
+    setErr("");
+    setBusy(true);
+    const result = await onSubmit(entry);
+    setBusy(false);
+    if (!result || !result.ok) setErr(result?.error ?? "That didn't save — check your connection and try again.");
+  };
+
+  const box = "w-14 bg-white border border-stone-300 rounded-lg px-2 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-violet-600/50 disabled:opacity-50";
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="text-[10px] text-stone-500">Home
+          <input type="number" min="0" value={f.home} onChange={(e) => setF((x) => ({ ...x, home: e.target.value }))} className={cx(box, "block")} />
+        </label>
+        <span className="text-stone-400 pb-2">–</span>
+        <label className="text-[10px] text-stone-500">Away
+          <input type="number" min="0" value={f.away} onChange={(e) => setF((x) => ({ ...x, away: e.target.value }))} className={cx(box, "block")} />
+        </label>
+        {withMinute && (
+          <label className="text-[10px] text-stone-500">1st goal (min)
+            <input
+              type="number" min="1" max="90"
+              value={nil ? "" : f.minute}
+              placeholder={nil ? "n/a" : ""}
+              disabled={nil}
+              onChange={(e) => setF((x) => ({ ...x, minute: e.target.value }))}
+              className={cx(box, "block w-20")}
+            />
+          </label>
+        )}
+        <button
+          onClick={submit}
+          onMouseDown={(e) => e.preventDefault()}
+          disabled={busy || !dirty}
+          className={cx("font-semibold rounded-lg px-4 py-2 text-sm flex items-center gap-1.5", dirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default")}
+        >
+          {busy ? "Saving…" : dirty ? "Submit prediction" : <><CheckCircle2 size={15} /> Submitted</>}
+        </button>
+      </div>
+      {err && (
+        <div className="flex items-center gap-2 bg-rose-50 border border-rose-300/30 text-rose-700 text-xs rounded-lg px-3 py-2">
+          <AlertCircle size={14} className="shrink-0" /> {err}
+        </div>
+      )}
+      <p className="text-[11px] text-stone-500">
+        Predict the score after 90 minutes.
+        {withMinute && " Also predict the minute of the first goal in normal time — minute 23 means 23:00 on the clock. Not needed if you predict 0-0."}
+      </p>
+    </div>
+  );
+}
+
+// Admin's fixture + result entry for one cup match (a knockout tie or the
+// play-off). Fixture teams and the result each save with their own button.
+// Changing the teams after anyone has predicted gives the fixture a new id
+// (with a warning), so an old prediction can never count against new teams.
+function CupFixtureAdmin({ fixture, predictionCount, busy, onSave, locked }) {
+  const storedTeams = { home: fixture.home || "", away: fixture.away || "" };
+  const storedResult = {
+    h: fixture.outcome ? String(fixture.outcome.home) : "",
+    a: fixture.outcome ? String(fixture.outcome.away) : "",
+    min: typeof fixture.firstGoalSec === "number" ? String(Math.floor(fixture.firstGoalSec / 60)) : "",
+    sec: typeof fixture.firstGoalSec === "number" ? String(fixture.firstGoalSec % 60) : "",
+  };
+  const storedJson = JSON.stringify([storedTeams, storedResult]);
+  const [teams, setTeams] = useState(storedTeams);
+  const [res, setRes] = useState(storedResult);
+  const [loadedJson, setLoadedJson] = useState(storedJson);
+  if (storedJson !== loadedJson) { setLoadedJson(storedJson); setTeams(storedTeams); setRes(storedResult); }
+  const [err, setErr] = useState("");
+
+  const teamsDirty = teams.home !== storedTeams.home || teams.away !== storedTeams.away;
+  const resDirty = JSON.stringify(res) !== JSON.stringify(storedResult);
+  const goalless = res.h !== "" && res.a !== "" && Number(res.h) + Number(res.a) === 0;
+
+  const saveTeams = () => {
+    if (!teams.home.trim() || !teams.away.trim()) { setErr("Enter both teams."); return; }
+    const changing = storedTeams.home && (teams.home.trim() !== storedTeams.home || teams.away.trim() !== storedTeams.away);
+    if (changing && predictionCount > 0 && !window.confirm(`${predictionCount} prediction${predictionCount === 1 ? " has" : "s have"} already been made on ${storedTeams.home} v ${storedTeams.away}. Changing the fixture means ${predictionCount === 1 ? "it" : "they"} won't count and the contestants must predict again. Continue?`)) return;
+    setErr("");
+    onSave((fresh) => ({
+      ...fresh,
+      id: changing && predictionCount > 0 ? cupNewFixture().id : fresh.id,
+      home: teams.home.trim(),
+      away: teams.away.trim(),
+      outcome: changing ? null : fresh.outcome,
+      firstGoalSec: changing ? null : fresh.firstGoalSec,
+    }));
+  };
+
+  const saveResult = () => {
+    if (res.h === "" && res.a === "") { setErr(""); onSave((fresh) => ({ ...fresh, outcome: null, firstGoalSec: null })); return; }
+    const h = Number(res.h), a = Number(res.a);
+    if (res.h === "" || res.a === "" || !Number.isInteger(h) || !Number.isInteger(a) || h < 0 || a < 0) { setErr("Enter the full-time (90-minute) score for both teams."); return; }
+    let firstGoalSec = null;
+    if (h + a > 0) {
+      const m = Number(res.min), s = res.sec === "" ? 0 : Number(res.sec);
+      if (res.min === "" || !Number.isInteger(m) || m < 0 || m > 90 || !Number.isInteger(s) || s < 0 || s > 59) { setErr("Enter when the first goal went in — minutes 0–90 and seconds 0–59. Stoppage-time goals go in as 45:00 or 90:00."); return; }
+      if (m * 60 + s > CUP_FULL_TIME_SEC) { setErr("The latest possible first-goal time is 90:00 — a second-half stoppage-time goal goes in as 90:00."); return; }
+      firstGoalSec = m * 60 + s;
+    }
+    setErr("");
+    onSave((fresh) => ({ ...fresh, outcome: { home: h, away: a }, firstGoalSec }));
+  };
+
+  const inp = "bg-white border border-stone-300 rounded px-1.5 py-1 text-sm text-center focus:outline-none focus:ring-2 focus:ring-violet-600/50";
+  return (
+    <div className="space-y-2 border-t border-stone-100 pt-2">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <input value={teams.home} onChange={(e) => setTeams((t) => ({ ...t, home: e.target.value }))} disabled={locked} placeholder="Home team" className={cx(inp, "flex-1 min-w-[110px] text-left px-2")} />
+        <span className="text-stone-400 text-xs">v</span>
+        <input value={teams.away} onChange={(e) => setTeams((t) => ({ ...t, away: e.target.value }))} disabled={locked} placeholder="Away team" className={cx(inp, "flex-1 min-w-[110px] text-left px-2")} />
+        <button onClick={saveTeams} disabled={busy || !teamsDirty || locked} className={cx("rounded-lg px-3 py-1.5 text-xs font-semibold", teamsDirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-200 text-stone-500")}>
+          {teamsDirty || !storedTeams.home ? "Save fixture" : "Fixture saved"}
+        </button>
+      </div>
+      {storedTeams.home && (
+        <div className="flex flex-wrap items-center gap-1.5 text-xs text-stone-500">
+          <span>FT</span>
+          <input type="number" min="0" value={res.h} onChange={(e) => setRes((r) => ({ ...r, h: e.target.value }))} disabled={locked} className={cx(inp, "w-12")} />
+          <span>–</span>
+          <input type="number" min="0" value={res.a} onChange={(e) => setRes((r) => ({ ...r, a: e.target.value }))} disabled={locked} className={cx(inp, "w-12")} />
+          <span className="ml-2">1st goal</span>
+          {goalless ? (
+            <span className="italic">none — counts as 90:00</span>
+          ) : (
+            <>
+              <input type="number" min="0" max="90" placeholder="mm" value={res.min} onChange={(e) => setRes((r) => ({ ...r, min: e.target.value }))} disabled={locked} className={cx(inp, "w-14")} />
+              <span>:</span>
+              <input type="number" min="0" max="59" placeholder="ss" value={res.sec} onChange={(e) => setRes((r) => ({ ...r, sec: e.target.value }))} disabled={locked} className={cx(inp, "w-14")} />
+            </>
+          )}
+          <button onClick={saveResult} disabled={busy || !resDirty || locked} className={cx("rounded-lg px-3 py-1.5 text-xs font-semibold ml-auto", resDirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-200 text-stone-500")}>
+            {resDirty || !fixture.outcome ? "Save result" : "Result saved"}
+          </button>
+        </div>
+      )}
+      {storedTeams.home && !goalless && (
+        <p className="text-[11px] text-stone-500">First goal in stoppage time? Enter 45:00 for first-half stoppage time and 90:00 for second-half stoppage time. Latest possible time: 90:00.</p>
+      )}
+      {err && <p className="text-xs text-rose-600">{err}</p>}
+    </div>
+  );
+}
+
+// Round date + prediction deadline for a knockout round or the play-off,
+// saved together with one button.
+function CupScheduleAdmin({ item, busy, onSave }) {
+  const stored = { scheduledDate: item.scheduledDate ? item.scheduledDate.slice(0, 10) : "", predictionsCloseAt: toLocalInputValue(item.predictionsCloseAt) };
+  const storedJson = JSON.stringify(stored);
+  const [d, setD] = useState(stored);
+  const [loadedJson, setLoadedJson] = useState(storedJson);
+  if (storedJson !== loadedJson) { setLoadedJson(storedJson); setD(stored); }
+  const dirty = JSON.stringify(d) !== storedJson;
+  const inp = "w-full mt-1 bg-white border border-stone-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-600/50";
+  return (
+    <div className="flex flex-wrap items-end gap-3">
+      <label className="text-xs text-stone-500">Date
+        <input type="date" value={d.scheduledDate} onChange={(e) => setD((x) => ({ ...x, scheduledDate: e.target.value }))} className={inp} />
+      </label>
+      <label className="text-xs text-stone-500">Predictions close
+        <input type="datetime-local" value={d.predictionsCloseAt} onChange={(e) => setD((x) => ({ ...x, predictionsCloseAt: e.target.value }))} className={inp} />
+      </label>
+      <button
+        onClick={() => onSave({ scheduledDate: d.scheduledDate || null, predictionsCloseAt: d.predictionsCloseAt ? new Date(d.predictionsCloseAt).toISOString() : null })}
+        disabled={busy || !dirty}
+        className={cx("rounded-lg px-4 py-2 text-sm font-semibold", dirty ? "bg-violet-700 hover:bg-violet-600 text-white" : "bg-stone-300 text-stone-600 cursor-default")}
+      >
+        {dirty ? "Save dates" : "Dates saved"}
+      </button>
+    </div>
+  );
+}
+
+function CupPlayerLine({ person, seed, pred, withMinute, visible, closed, profile, winner, showPoints }) {
+  return (
+    <div className={cx("flex items-center gap-2 px-3 py-2", winner && "bg-emerald-50")}>
+      <BadgeAvatar participant={person} name={person?.name ?? "?"} size={22} />
+      <span className={cx("font-medium text-sm truncate flex-1 min-w-0", winner && "text-emerald-700")}>
+        {person?.name ?? "?"}
+        {seed && <span className="text-[10px] text-stone-400 font-mono-num ml-1">({seed})</span>}
+      </span>
+      <span className="text-xs font-mono-num text-stone-600 shrink-0 text-right">
+        {pred
+          ? (visible ? fmtCupPrediction(pred, withMinute) : <span className="text-stone-400 inline-flex items-center gap-1"><EyeOff size={10} /> submitted</span>)
+          : <span className="text-stone-400 italic">{closed ? "no prediction" : "awaiting prediction"}</span>}
+      </span>
+      {showPoints && profile && <span className="text-[11px] font-mono-num text-amber-600 w-12 text-right shrink-0">{profile.points} pts</span>}
+      {winner && <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />}
+    </div>
+  );
+}
+
+function KnockoutTieCard({ tie, round, data, byId, viewerId, adminMode, now, busy, onTieUpdate, submitPredictionsChecked }) {
+  const closed = cupPredictionsClosed(round, now);
+  if (!tie.awayId) {
+    return (
+      <div className="border border-stone-200 rounded-xl bg-white px-3 py-3 text-sm flex items-center gap-2">
+        <BadgeAvatar participant={byId[tie.homeId]} name={byId[tie.homeId]?.name ?? "?"} size={22} />
+        <span className="font-medium">{byId[tie.homeId]?.name ?? "?"}</span>
+        <span className="text-xs text-stone-500">— bye to the next round</span>
+      </div>
+    );
+  }
+  const f = tie.fixture;
+  const keyOf = (pid) => `${f.id}__${pid}`;
+  const homePred = data.predictions[keyOf(tie.homeId)];
+  const awayPred = data.predictions[keyOf(tie.awayId)];
+  const showResult = adminMode || round.resultsPublished;
+  const decision = showResult ? decideKnockoutTie(tie, data.predictions) : null;
+  const mine = viewerId === tie.homeId || viewerId === tie.awayId;
+  const oppId = viewerId === tie.homeId ? tie.awayId : tie.homeId;
+  const predCount = (homePred ? 1 : 0) + (awayPred ? 1 : 0);
+
+  // The uniqueness rule: nobody may copy their opponent's current
+  // scoreline or first-goal minute. Used for instant feedback AND re-run
+  // against freshly-read predictions at the moment of saving.
+  const clashWith = (opp, entry) => {
+    if (!opp) return null;
+    if (opp.home === entry.home && opp.away === entry.away) return `${byId[oppId]?.name ?? "Your opponent"} has already taken ${opp.home}–${opp.away}. Please choose a different scoreline.`;
+    if (typeof entry.firstGoalMin === "number" && opp.firstGoalMin === entry.firstGoalMin) return `${byId[oppId]?.name ?? "Your opponent"} has already taken minute ${opp.firstGoalMin} for the first goal. Please choose a different minute.`;
+    return null;
+  };
+
+  return (
+    <div className={cx("border rounded-2xl bg-white overflow-hidden", mine ? "border-amber-400/60" : "border-stone-200")}>
+      <div className="px-3 py-2 bg-stone-50 text-xs text-stone-600 flex items-center justify-between gap-2">
+        <span className="font-medium truncate">
+          {f.home ? <><ClubName name={f.home} clubLibrary={data.clubLibrary} size={12} /> v <ClubName name={f.away} clubLibrary={data.clubLibrary} size={12} /></> : <span className="italic text-stone-400">Fixture to be confirmed</span>}
+        </span>
+        {showResult && f.outcome && (
+          <span className="font-mono-num text-amber-600 shrink-0">
+            FT {f.outcome.home}–{f.outcome.away}
+            {cupActualFirstGoalSec(f) !== null && <span className="text-stone-500"> · 1st goal {f.outcome.home + f.outcome.away === 0 ? "none (90:00)" : fmtCupSec(f.firstGoalSec)}</span>}
+          </span>
+        )}
+      </div>
+      {[[tie.homeId, tie.homeSeed, homePred], [tie.awayId, tie.awaySeed, awayPred]].map(([pid, seed, pred]) => (
+        <CupPlayerLine
+          key={pid}
+          person={byId[pid]}
+          seed={seed}
+          pred={pred}
+          withMinute
+          visible // knockout predictions are public as soon as they're submitted
+          closed={closed}
+          profile={decision?.profiles?.[pid]}
+          winner={decision && decision.winnerId === pid}
+          showPoints={!!decision}
+        />
+      ))}
+      {decision && (
+        <div className="px-3 py-1.5 border-t border-stone-100 text-[11px] text-emerald-700 bg-emerald-50/50">
+          {byId[decision.winnerId]?.name ?? "?"} goes through — {CUP_REASON_TEXT[decision.reason]}{!round.resultsPublished && adminMode ? " (provisional until you publish results)" : ""}
+        </div>
+      )}
+      {mine && round.drawPublished && !closed && f.home && (
+        <div className="px-3 py-3 border-t border-stone-100 bg-amber-400/5">
+          <div className="text-[11px] uppercase tracking-wide text-amber-700 mb-2">Your prediction</div>
+          <CupPredictionForm
+            existing={data.predictions[keyOf(viewerId)]}
+            withMinute
+            clashCheck={(entry) => clashWith(data.predictions[keyOf(oppId)], entry)}
+            onSubmit={(entry) =>
+              submitPredictionsChecked({ [keyOf(viewerId)]: entry }, (latest) => {
+                if (cupPredictionsClosed(round, Date.now())) return "Predictions have closed for this round.";
+                return clashWith(latest[keyOf(oppId)], entry);
+              })
+            }
+          />
+        </div>
+      )}
+      {adminMode && (
+        <div className="px-3 pb-3">
+          <CupFixtureAdmin
+            fixture={f}
+            predictionCount={predCount}
+            busy={busy}
+            locked={round.resultsPublished}
+            onSave={(fixtureFn) => onTieUpdate(tie.id, (freshTie) => ({ fixture: fixtureFn(freshTie.fixture) }))}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KnockoutRoundCard({ round, isLast, isFinal, data, byId, viewerId, adminMode, now, busy, onRoundUpdate, onTieUpdate, onNextRound, submitPredictionsChecked }) {
+  const status = cupRoundStatus(round, adminMode, now);
+  const [expanded, setExpanded] = useState(!round.resultsPublished || isLast);
+  const realTies = round.ties.filter((t) => t.awayId);
+  const allFixtures = realTies.every((t) => t.fixture.home && t.fixture.away);
+  const allResolved = realTies.every((t) => cupFixtureResolved(t.fixture));
+
+  if (!expanded) {
+    return (
+      <button onClick={() => setExpanded(true)} className="w-full flex items-center justify-between gap-2 border border-stone-200 rounded-xl px-3 py-2.5 bg-stone-50 hover:bg-stone-100 text-left">
+        <span className="font-display font-semibold text-xs">{round.name}</span>
+        <span className="text-[10px] text-stone-400">completed · expand ▾</span>
+      </button>
+    );
+  }
+
+  return (
+    <section className="border border-stone-200 rounded-2xl bg-white p-4 sm:p-5 space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="flex items-center gap-2">
+          <h3 className="font-display font-semibold">{round.name}</h3>
+          {round.scheduledDate && <span className="text-xs text-stone-400">{fmtDateOnly(round.scheduledDate)}</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          {round.predictionsCloseAt && round.drawPublished && !round.resultsPublished && <DeadlineCountdown closeAt={round.predictionsCloseAt} />}
+          <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", CUP_STATUS_STYLES[status])}>{status}</span>
+          {round.resultsPublished && <button onClick={() => setExpanded(false)} className="text-[10px] text-stone-400 hover:text-stone-600">collapse ▴</button>}
+        </div>
+      </div>
+
+      {!adminMode && !round.drawPublished && (
+        <p className="text-sm text-stone-500">The ties are set — the matches you'll predict haven't been published yet.</p>
+      )}
+      {round.drawPublished && !round.resultsPublished && (
+        <p className="text-[11px] text-stone-500">
+          Knockout predictions are visible to everyone as soon as they're submitted — and you can't pick the same scoreline or first-goal minute as your opponent.
+          Ties are decided on points, then closest to the total goals, then closest to the first-goal time (and if that's level, the minute in the right half).
+        </p>
+      )}
+
+      {adminMode && (
+        <div className="space-y-3 border border-stone-200 rounded-xl p-3 bg-stone-50">
+          <CupScheduleAdmin item={round} busy={busy} onSave={(patch) => onRoundUpdate(patch)} />
+          <div className="flex flex-wrap items-center gap-2">
+            {!round.resultsPublished && (
+              <button
+                onClick={() => onRoundUpdate({ drawPublished: !round.drawPublished })}
+                disabled={busy || (!round.drawPublished && !allFixtures)}
+                className={cx("rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50", round.drawPublished ? "bg-stone-200 hover:bg-stone-300 border border-stone-300" : "bg-violet-700 hover:bg-violet-600 text-white")}
+              >
+                {round.drawPublished ? "Unpublish matches" : "Publish matches to contestants"}
+              </button>
+            )}
+            {!round.drawPublished && !allFixtures && <span className="text-[11px] text-stone-500">Enter a fixture for every tie before publishing.</span>}
+            {round.drawPublished && allResolved && !round.resultsPublished && (
+              <button onClick={() => { if (window.confirm(`Publish the ${round.name} results? This confirms who goes through.`)) onRoundUpdate({ resultsPublished: true }); }} disabled={busy} className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+                <CheckCircle2 size={15} /> Publish results
+              </button>
+            )}
+            {round.resultsPublished && isLast && !isFinal && (
+              <button onClick={onNextRound} disabled={busy} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+                <Plus size={15} /> Create the {KO_ROUND_NAMES[round.ties.length / 2] ?? "next round"}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        {round.ties.map((tie) => (
+          <KnockoutTieCard
+            key={tie.id}
+            tie={tie}
+            round={round}
+            data={data}
+            byId={byId}
+            viewerId={viewerId}
+            adminMode={adminMode}
+            now={now}
+            busy={busy}
+            onTieUpdate={onTieUpdate}
+            submitPredictionsChecked={submitPredictionsChecked}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function CupPlayoffCard({ playoff, data, byId, viewerId, adminMode, now, busy, onUpdate, onConfirm, submitPredictionsChecked, knockoutStarted }) {
+  const closed = cupPredictionsClosed(playoff, now);
+  const status = cupRoundStatus(playoff, adminMode, now);
+  const f = playoff.fixture;
+  const ranking = (adminMode || playoff.resultsPublished) ? rankCupPlayoff(playoff, data.predictions) : null;
+  const mine = playoff.entrantIds.includes(viewerId);
+  const predCount = playoff.entrantIds.filter((id) => data.predictions[`${f.id}__${id}`]).length;
+  const visible = adminMode || closed;
+
+  return (
+    <section className="border border-amber-400/40 rounded-2xl bg-white p-4 sm:p-5 space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <h3 className="font-display font-semibold">Qualifying play-off</h3>
+        <div className="flex items-center gap-2">
+          {playoff.predictionsCloseAt && playoff.drawPublished && !playoff.resultsPublished && <DeadlineCountdown closeAt={playoff.predictionsCloseAt} />}
+          <span className={cx("text-[10px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wide", CUP_STATUS_STYLES[status])}>{status}</span>
+        </div>
+      </div>
+      <p className="text-xs text-stone-600">
+        {playoff.entrantIds.length} contestants finished level on {playoff.cutPoints} points across the qualifying line, playing for {playoff.slots} place{playoff.slots === 1 ? "" : "s"}.
+        Everyone predicts the same match — score and first-goal minute. Places go on points, then closest to the total goals, then closest to the first-goal time (and if that's level, the minute in the right half).
+        Predictions stay hidden until the deadline.
+      </p>
+      <div className="text-sm font-medium">
+        {f.home && (playoff.drawPublished || adminMode) ? <><ClubName name={f.home} clubLibrary={data.clubLibrary} size={14} /> v <ClubName name={f.away} clubLibrary={data.clubLibrary} size={14} /></> : <span className="italic text-stone-400">Match to be confirmed</span>}
+        {(adminMode || playoff.resultsPublished) && f.outcome && (
+          <span className="ml-2 text-xs font-mono-num text-amber-600">FT {f.outcome.home}–{f.outcome.away}{cupActualFirstGoalSec(f) !== null && ` · 1st goal ${f.outcome.home + f.outcome.away === 0 ? "none (90:00)" : fmtCupSec(f.firstGoalSec)}`}</span>
+        )}
+      </div>
+
+      {mine && playoff.drawPublished && !closed && f.home && (
+        <div className="border border-amber-400/40 bg-amber-400/5 rounded-xl p-3">
+          <div className="text-[11px] uppercase tracking-wide text-amber-700 mb-2">Your prediction</div>
+          <CupPredictionForm
+            existing={data.predictions[`${f.id}__${viewerId}`]}
+            withMinute
+            onSubmit={(entry) =>
+              submitPredictionsChecked({ [`${f.id}__${viewerId}`]: entry }, () =>
+                cupPredictionsClosed(playoff, Date.now()) ? "Predictions have closed for the play-off." : null
+              )
+            }
+          />
+        </div>
+      )}
+
+      <div className="border border-stone-200 rounded-xl overflow-hidden divide-y divide-stone-100">
+        {(ranking ? ranking.map((r) => r.id) : playoff.entrantIds).map((id, i) => (
+          <CupPlayerLine
+            key={id}
+            person={byId[id]}
+            seed={null}
+            pred={data.predictions[`${f.id}__${id}`]}
+            withMinute
+            visible={visible || id === viewerId}
+            closed={closed}
+            profile={ranking ? ranking[i].profile : null}
+            winner={ranking && i < playoff.slots}
+            showPoints={!!ranking}
+          />
+        ))}
+      </div>
+      {ranking && <p className="text-[11px] text-emerald-700">Ticked contestants take the qualifying place{playoff.slots === 1 ? "" : "s"}{!playoff.resultsPublished ? " (provisional until results are published)" : ""}.</p>}
+
+      {adminMode && !knockoutStarted && (
+        <div className="space-y-3 border border-stone-200 rounded-xl p-3 bg-stone-50">
+          <CupScheduleAdmin item={playoff} busy={busy} onSave={(patch) => onUpdate(() => patch)} />
+          <CupFixtureAdmin
+            fixture={f}
+            predictionCount={predCount}
+            busy={busy}
+            locked={playoff.resultsPublished}
+            onSave={(fixtureFn) => onUpdate((fresh) => ({ fixture: fixtureFn(fresh.fixture) }))}
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            {!playoff.resultsPublished && (
+              <button
+                onClick={() => onUpdate(() => ({ drawPublished: !playoff.drawPublished }))}
+                disabled={busy || (!playoff.drawPublished && !f.home)}
+                className={cx("rounded-lg px-3 py-2 text-sm font-medium disabled:opacity-50", playoff.drawPublished ? "bg-stone-200 hover:bg-stone-300 border border-stone-300" : "bg-violet-700 hover:bg-violet-600 text-white")}
+              >
+                {playoff.drawPublished ? "Unpublish match" : "Publish match to the play-off contestants"}
+              </button>
+            )}
+            {playoff.drawPublished && cupFixtureResolved(f) && !playoff.resultsPublished && (
+              <button onClick={() => onUpdate(() => ({ resultsPublished: true }))} disabled={busy} className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+                <CheckCircle2 size={15} /> Publish play-off results
+              </button>
+            )}
+            {playoff.resultsPublished && (
+              <button onClick={onConfirm} disabled={busy} className="flex items-center gap-1.5 bg-violet-700 hover:bg-violet-600 text-white font-semibold rounded-lg px-4 py-2 text-sm disabled:opacity-50">
+                <Trophy size={15} /> Confirm qualifiers &amp; draw the {KO_ROUND_NAMES[playoff.cut / 2]}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -3733,6 +5520,11 @@ function StorageUsageCard({ data }) {
     ["Season archives", split.archivesBlob],
     ["Badges", split.badgesBlob],
     ["History page", split.historyBlob],
+    ["Club library", split.clubBlob],
+    ["Rules page", split.rulesBlob],
+    ["Blog", split.blogBlob],
+    ["Voice note index", split.voiceBlob],
+    ["FA Cup", split.cupBlob],
   ].map(([label, blob]) => {
     const bytes = new Blob([JSON.stringify(blob)]).size;
     return { label, bytes, pct: Math.min(100, (bytes / STORAGE_KEY_LIMIT_BYTES) * 100) };
@@ -3992,6 +5784,14 @@ function SeasonCard({ data, persist }) {
           <p className="text-xs text-stone-700">
             Archives every active division's full history from <strong>{data.seasonLabel}</strong> permanently, then resets live matchdays and standings to zero for the new season. Roster, logins and profiles carry over unchanged. Worth grabbing a manual backup above first, just in case.
           </p>
+          {data.cup && data.cup.enabled && !(cupArchiveRecord(data)?.completed) && (
+            <p className="text-xs text-rose-700 bg-rose-50 border border-rose-300/40 rounded-lg px-3 py-2">
+              The {data.cup.name} hasn't reached a published final yet. Ending the season now archives it as <strong>not completed</strong> (no winner in Honours) and resets it for next season.
+            </p>
+          )}
+          {data.cup && data.cup.enabled && (
+            <p className="text-xs text-stone-500">The {data.cup.name} is archived too — its table, bracket, predictions and winner — and reset ready for next season.</p>
+          )}
           <p className="text-xs text-stone-500">
             Starting a new season is also a good moment to check the <strong>Divisions</strong> section below — turn on League One or League Two there if you need them for the season ahead, or adjust any division's contestant cap.
           </p>
@@ -4030,6 +5830,12 @@ function SeasonCard({ data, persist }) {
                   </button>
                   {expanded && (
                     <div className="px-3 pb-3 grid sm:grid-cols-2 gap-3">
+                      {season.cup && (
+                        <div className="sm:col-span-2 text-xs border border-stone-200 rounded-lg bg-white px-3 py-2">
+                          <span className="font-semibold">{season.cup.name}:</span>{" "}
+                          {season.cup.completed ? `won by ${season.cup.champion.name}${season.cup.runnerUp ? ` (runner-up ${season.cup.runnerUp.name})` : ""}` : "not completed"}
+                        </div>
+                      )}
                       {Object.values(season.leagues).map((leagueArchive) => (
                         <div key={leagueArchive.name} className="border border-stone-200 rounded-lg overflow-hidden">
                           <div className="bg-white px-3 py-1.5 text-xs font-semibold">{leagueArchive.name}</div>
@@ -5909,9 +7715,14 @@ function endSeason(data, newSeasonLabel) {
     nextLeagues[key] = { ...league, matchdays: [], fixturePool: [], adjustments: [] };
   });
 
+  // The FA Cup is archived alongside the divisions (if it ran this season)
+  // and reset, so its bracket never carries into the next season.
+  const cupArchive = cupArchiveRecord(data);
+
   const remainingPredictions = {};
   Object.entries(data.predictions).forEach(([predKey, predVal]) => {
-    if (!archivedMatchIds.has(matchIdFromPredictionKey(predKey))) remainingPredictions[predKey] = predVal;
+    const matchId = matchIdFromPredictionKey(predKey);
+    if (!archivedMatchIds.has(matchId) && !isCupMatchId(matchId)) remainingPredictions[predKey] = predVal;
   });
 
   const archiveRecord = {
@@ -5919,6 +7730,7 @@ function endSeason(data, newSeasonLabel) {
     label: data.seasonLabel || "Previous season",
     endedAt: new Date().toISOString(),
     leagues: archivedLeagues,
+    cup: cupArchive,
   };
 
   return {
@@ -5927,6 +7739,7 @@ function endSeason(data, newSeasonLabel) {
     seasonArchives: [...(data.seasonArchives || []), archiveRecord],
     leagues: nextLeagues,
     predictions: remainingPredictions,
+    cup: { ...emptyCup(), name: (data.cup && data.cup.name) || "FA Cup" },
   };
 }
 
@@ -6700,7 +8513,7 @@ function ProfilesView({ league, leagueKey, data, viewerId, adminMode, persist, m
 // app, so submitting predictions and editing your profile always maps back
 // to the account you logged into rather than a free-form name picker.
 // -----------------------------------------------------------------------------
-function AuthScreen({ data, persist, mergeProfileSave, mergeMatchdayPatch, registerAccount, reloadData, onLogin, snapshots, onRestoreSnapshot, saveError, setSaveError }) {
+function AuthScreen({ data, persist, mergeProfileSave, mergeMatchdayPatch, mergeCupUpdate, registerAccount, reloadData, onLogin, snapshots, onRestoreSnapshot, saveError, setSaveError }) {
   const [mode, setMode] = useState("login");
   const [adminUnlocked, setAdminUnlocked] = useState(false);
   const [enteringPin, setEnteringPin] = useState(false);
@@ -6786,6 +8599,15 @@ function AuthScreen({ data, persist, mergeProfileSave, mergeMatchdayPatch, regis
                   >
                     <Newspaper size={13} /> Blog
                   </button>
+                  <button
+                    onClick={() => setAdminGlobalView(adminGlobalView === "cup" ? null : "cup")}
+                    className={cx(
+                      "px-3 py-1.5 rounded-lg border text-xs font-display font-semibold flex items-center gap-1.5",
+                      adminGlobalView === "cup" ? "bg-slate-300 text-black border-slate-300" : "border-slate-300/50 text-slate-200 hover:border-slate-300"
+                    )}
+                  >
+                    <Trophy size={13} /> FA Cup
+                  </button>
                 </div>
                 <button
                   onClick={() => setAdminUnlocked(false)}
@@ -6817,6 +8639,8 @@ function AuthScreen({ data, persist, mergeProfileSave, mergeMatchdayPatch, regis
             <RulesView data={data} adminMode persist={persist} />
           ) : adminGlobalView === "blog" ? (
             <BlogView data={data} adminMode persist={persist} />
+          ) : adminGlobalView === "cup" ? (
+            <CupView data={data} adminMode viewerId="" mergeCupUpdate={mergeCupUpdate} submitPredictions={null} now={Date.now()} />
           ) : (
             <AppTabs
               league={league}
